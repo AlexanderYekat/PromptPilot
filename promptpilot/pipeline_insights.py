@@ -5140,6 +5140,16 @@ def build_period_report(profile_id: str, series: list[dict], *, hours: int = 24,
     delivered_count = (
         len(delivery["merged_prs"]) + len(delivery["closed_issues"])
         if delivery.get("exact") else None)
+    live_series = [item for item in series
+                   if item.get("id") in series_ids and not item.get("ended")]
+    current_tasks = [{
+        "task_id": item.get("next_task_id"), "title": item.get("title"),
+        "status": item.get("next_status"),
+        "started_at": item.get("next_started_at"),
+        "scheduled_at": item.get("next_run_at"),
+        "paused": bool(item.get("paused")),
+    } for item in live_series]
+    diagnostics = cached.get("diagnostics") or {}
     report = {
         "profile_id": profile_id, "title": profile["title"],
         "repository": profile["repository"], "hours": hours,
@@ -5169,6 +5179,12 @@ def build_period_report(profile_id: str, series: list[dict], *, hours: int = 24,
         "bottleneck": bottleneck,
         "queues": queues, "runs": run_report,
         "attention": attention, "delivery": delivery, "cache": cache,
+        "current": {"observed_at": now.isoformat(), "tasks": current_tasks},
+        "decisions": {
+            "waiting_ship": copy.deepcopy(diagnostics.get("reviewed_waiting_ship") or []),
+            "human_waiting": copy.deepcopy(diagnostics.get("human_waiting") or []),
+            "available": bool(diagnostics) and not diagnostics.get("checker_failed"),
+        },
     }
     return report
 

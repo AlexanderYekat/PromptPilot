@@ -145,6 +145,10 @@ def test_period_report_uses_only_local_history_and_deduplicates_attention(
             ],
             "backlog_total": 100, "history": {},
             "health": {"state": "green", "label": "cached"},
+            "diagnostics": {
+                "reviewed_waiting_ship": [{"number": 99, "title": "Approve merge"}],
+                "human_waiting": [{"number": 21, "title": "Choose a plan"}],
+            },
             "bottleneck": "review", "generated_at": now.timestamp(),
         })
 
@@ -172,6 +176,10 @@ def test_period_report_uses_only_local_history_and_deduplicates_attention(
     assert report["coverage"]["complete"] is True
     assert report["coverage"]["membership_complete"] is True
     assert report["delivery"]["status"] == "not_requested"
+    assert report["current"]["tasks"] == []  # Ended schedules are not running.
+    assert report["decisions"]["waiting_ship"][0]["number"] == 99
+    assert report["decisions"]["human_waiting"][0]["number"] == 21
+    assert report["decisions"]["available"] is True
     assert [item["key"] for item in report["attention"]] == [
         "pr:10", "issue:20"]
     decision = next(item for item in report["attention"]
