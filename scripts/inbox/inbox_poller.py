@@ -598,6 +598,11 @@ def run_once(env: dict, dry: bool, refresh: bool = False) -> None:
             client.select(card["folder"])
             client.store(card["num"], "+FLAGS", "\\Seen")
             full = fetch_full(client, card)
+            if full["subject"].strip().upper().startswith("[OS]"):
+                # Oneservice-конвейер: [OS]-письма ведёт os_intake (GitLab).
+                print(f"→ [OS] задача oneservice: {full['subject']}")
+                state["processed"].append(full["message_id"])
+                continue
             game_mode = is_kt(full["subject"])
             reason = None if game_mode else bulk_reason(full, full["from"])
             if reason:

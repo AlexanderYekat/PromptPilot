@@ -38,6 +38,8 @@ NOISE_SENDER_DOMAINS = (
     "e.mail.ru", "id.mail.ru", "notify.mail.ru", "agent.mail.ru",
 )
 GAME_MARKER = "[KT]"
+OS_MARKER = "[OS]"  # задачи oneservice помечаются темой; [KT] — игра;
+# всё остальное остаётся в общем бэклоге (inbox_poller: каталог проектов)
 
 
 def load_env(path: Path) -> dict:
@@ -214,8 +216,15 @@ def process_email_mode(env: dict, dry: bool) -> None:
                 subject = decode_mime(msg.get("Subject")) or "(без темы)"
                 sender = decode_mime(msg.get("From"))
                 client.select(folder)  # fetch HEADER переключил папку
-                if subject.strip().upper().startswith("[KT]"):
+                if subject.strip().upper().startswith(GAME_MARKER):
                     state["processed"].append(message_id)  # игровой конвейер
+                    continue
+                if not subject.strip().upper().startswith(OS_MARKER):
+                    # Не помечено [OS] — это не задача oneservice: письмо
+                    # остаётся в общем бэклоге (inbox_poller сам определит
+                    # проект по каталогу). OS-конвейер его не трогает.
+                    state["processed"].append(message_id)
+                    mark_seen(client, folder, num)
                     continue
                 noise = bulk_or_noise(msg, sender)
                 if noise:
