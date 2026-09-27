@@ -2152,6 +2152,16 @@ def _pipeline_blocker_details(
     identity = normalized
     if kind == "human" and len(targets) == 1:
         identity = "human-target:#" + next(iter(targets))
+    elif kind == "human" and len(targets) > 1:
+        # An explicit semicolon-separated list has a diagnosis for each exact
+        # target. Correlate its unordered target set, not paraphrased prose.
+        # Joint/ambiguous reports ("#1 and #2: ...") remain text-sensitive.
+        entries = display_reason.split(";")
+        named = [re.match(r"^\s*#([1-9][0-9]*)\s+[—–-]\s+\S", entry)
+                 for entry in entries]
+        if (len(entries) == len(targets) and all(named)
+                and {match.group(1) for match in named} == targets):
+            identity = "human-target-set:" + ",".join(sorted(targets, key=int))
     return {
         "fingerprint": hashlib.sha256(
             f"{kind}\0{identity}".encode("utf-8")).hexdigest(),

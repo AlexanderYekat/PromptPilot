@@ -28,6 +28,13 @@ its contract, transport and cache flags. This prevents a stage from silently
 running an older checker from its clean working checkout. Global owner/allowlist
 checks and local mutation gates remain mandatory.
 
+Targeted fallback leases with base synchronization enabled also sign the
+absolute election checkout. The fresh fallback gate synchronizes and runs
+health there, even when the provider moved to a detached audit worktree. The
+audit checkout is not switched or modified; dirty/base/config/identity and
+exact-target fences still fail closed. Older leases retain their previous
+behavior until their running task finishes.
+
 Procedures taken from an unmerged PR are an explicitly installed operator hotfix,
 **not** evidence that the PR is approved, shipped or merged. Relative skill
 references are resolved inside the paired snapshot. Its CLAUDE.md is paired too,
@@ -64,6 +71,17 @@ priority and resource floors remain in place; only the fairness age restarts.
 The ordinary retry delay is respected and cheaper eligible delivery work can
 proceed. A future starvation window provides another opportunity. Priority,
 scan-lease and fairness deferrals do not themselves reset the baton.
+
+## Repeated human handoffs
+
+Two consecutive human-required reports for an explicitly enumerated identical
+target set pause only that schedule, preserving its actionable reason. Order
+and paraphrasing do not restart the same expensive diagnosis. Multi-target
+lists must give a separate diagnosis for every `#N`, separated by semicolons;
+ambiguous joint reports remain text-sensitive. Existing single-target and
+execution-error behavior is unchanged. This is an admission pause, not a
+resolution of the blockers: after repair, explicitly resume the schedule.
+Other stages continue and no mutation authorization is inferred from prose.
 
 ## Outcome and maintenance budget (#1545)
 

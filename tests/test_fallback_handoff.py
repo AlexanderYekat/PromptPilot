@@ -152,6 +152,60 @@ def test_documented_scan_budget_uses_local_productive_wake_up():
     assert "Профиль без\nлокального графа сохраняет совместимый третий scan" in readme
 
 
+def test_cli_gate_uses_signed_election_checkout_after_detached_audit(
+        config, monkeypatch, tmp_path):
+    base = tmp_path / "base"
+    audit = tmp_path / "detached-audit"
+    base.mkdir()
+    audit.mkdir()
+    config["sync_base_before_health"] = True
+    config["health_command"] = ["fixture-health"]
+    snapshot = health()
+    monkeypatch.setattr(pp, "load_config", lambda _: dict(config))
+    monkeypatch.setattr(pp, "GitHub", ReadOnlyGitHub)
+    calls = []
+
+    def subprocess_run(command, **kwargs):
+        location = Path(kwargs.get("cwd") or Path.cwd())
+        calls.append((command, location))
+        if command[-2:] == ["branch", "--show-current"]:
+            output = "main\n" if location == base else ""
+        elif command == ["fixture-health"]:
+            output = json.dumps(snapshot)
+        else:
+            output = ""
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+
+    monkeypatch.setattr(pp.subprocess, "run", subprocess_run)
+    monkeypatch.chdir(base)
+    code, elected = invoke(["--config", str(tmp_path / "config.json"), "next", "review"])
+    assert code == 0 and elected["action"] == "fallback"
+    lease = pp.decode_signed_lease(elected["handoff"]["lease"])
+    assert lease["health_checkout"] == str(base.resolve())
+    calls.clear()
+    monkeypatch.chdir(audit)
+    code, gated = invoke(["--config", str(tmp_path / "config.json"),
+                          "gate-fallback", "review", "--lease", elected["handoff"]["lease"]])
+    assert code == 0 and gated["action"] == "validated"
+    assert gated["mutation_authorized"] is False
+    assert len(calls) == 5 and all(location == base for _, location in calls)
+    assert Path.cwd() == audit
+
+
+def test_cli_gate_still_rejects_dirty_pinned_checkout(config, monkeypatch, tmp_path):
+    config["sync_base_before_health"] = True
+    monkeypatch.chdir(tmp_path)
+    elected = handoff.create(config, health(), "review", health()["integration_owner"], "audit")
+    monkeypatch.setattr(pp, "load_config", lambda _: dict(config))
+    monkeypatch.setattr(pp, "GitHub", ReadOnlyGitHub)
+    def subprocess_run(command, **kwargs):
+        output = "main\n" if command[-2:] == ["branch", "--show-current"] else " M file.go\n"
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+    monkeypatch.setattr(pp.subprocess, "run", subprocess_run)
+    code, error = invoke(["gate-fallback", "review", "--lease", elected["handoff"]["lease"]])
+    assert code == 2 and "tracked changes" in error["error"]
+
+
 @pytest.mark.parametrize("field,value", [
     ("number", 43), ("number", True), ("head", "b" * 40), ("head", "short"),
     ("stage", "legacy-integration-merge-ready"), ("stage", "review"),

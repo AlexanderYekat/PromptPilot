@@ -353,7 +353,7 @@ def queue_priority(item: dict, config: dict, now: datetime | None = None) -> int
     return base - boost
 
 
-def sync_base_before_health(config: dict) -> bool:
+def sync_base_before_health(config: dict, *, working_dir: str | None = None) -> bool:
     """Fast-forward a clean base checkout before running repository health.
 
     Repository-owned health tools are versioned with the project. Running one
@@ -374,6 +374,7 @@ def sync_base_before_health(config: dict) -> bool:
             result = subprocess.run(
                 command, capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=timeout,
+                **({"cwd": working_dir} if working_dir is not None else {}),
             )
         except subprocess.TimeoutExpired as exc:
             raise PipelineError(
@@ -405,11 +406,15 @@ def sync_base_before_health(config: dict) -> bool:
     return True
 
 
-def run_health(config: dict, *, config_path: str | None = None) -> dict:
+def run_health(config: dict, *, config_path: str | None = None,
+               working_dir: str | None = None) -> dict:
     synced_base = str(config.get("base_branch") or "main")
-    synchronized = sync_base_before_health(config)
+    synchronized = sync_base_before_health(config, working_dir=working_dir)
     if synchronized and config_path is not None:
-        refreshed = load_config(config_path)
+        source_path = (str(Path(working_dir) / config_path)
+                       if working_dir is not None and not Path(config_path).is_absolute()
+                       else config_path)
+        refreshed = load_config(source_path)
         refreshed_base = str(refreshed.get("base_branch") or "main")
         if refreshed_base != synced_base:
             raise PipelineError(
@@ -437,6 +442,7 @@ def run_health(config: dict, *, config_path: str | None = None) -> dict:
         result = subprocess.run(
             command, capture_output=True, text=True, encoding="utf-8",
             errors="strict", env=env, timeout=timeout,
+            **({"cwd": working_dir} if working_dir is not None else {}),
         )
     except subprocess.TimeoutExpired as exc:
         raise PipelineError(
