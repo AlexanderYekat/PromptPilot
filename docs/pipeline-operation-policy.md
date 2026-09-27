@@ -72,7 +72,25 @@ The ordinary retry delay is respected and cheaper eligible delivery work can
 proceed. A future starvation window provides another opportunity. Priority,
 scan-lease and fairness deferrals do not themselves reset the baton.
 
-## Repeated human handoffs
+## Item-level human handoffs
+
+The operator release enables `item_blockers` for TRIAGE, REVIEW and MERGE.
+Before launch a fresh complete cached snapshot records the target's Search
+metadata (including updated_at) and matching checker witnesses. An explicit,
+unambiguous HUMAN handoff parks only measured targets for at most 24 hours.
+Unchanged targets are excluded from future admission; changed state, expiry,
+Resume or Run now permits a new attempt. New targets remain eligible. A held
+integration owner is never skipped to begin another integration: the owner
+barrier remains intact. A stale/partial snapshot does not authorize exclusion.
+Search timestamps are change hints, not mutation authority; every actual
+mutation still requires canonical fresh project checks.
+
+This local ledger does not mutate GitHub labels or resolve a blocker. Holds
+without measured state, ambiguous handoffs and execution errors retain the
+series-level fallback described below. Turning this opt-in off restores that
+fallback. Repeated warnings are not permission to erase checks.
+
+## Repeated human handoffs (fallback)
 
 Two consecutive human-required reports for an explicitly enumerated identical
 target set pause only that schedule, preserving its actionable reason. Order
@@ -106,7 +124,31 @@ fixes. With incomplete classification, publish coverage and do not call the
 budget met. Compare run/token trends and actual shipped product outcomes after
 one month before making further architectural changes.
 
-This first increment implements release pairing, intake backpressure and watch
-delivery ratios. Automatic monthly classification, target/HEAD churn accounting
-and their dashboard presentation remain separate work; this document does not
-claim those metrics already exist or that #1545 is fully implemented.
+The report now separates running work, decisions, diagnostic warnings and
+confirmed delivery. Delivery categories use explicit operator-owned
+`delivery_classifications` entries keyed by PR number, each with `category`
+(`product`, `pipeline`, `docs_plans`) and an `evidence` explanation. Unclassified
+PRs remain explicit; titles and DONE verdicts never establish product delivery.
+No additional GitHub requests are needed for this presentation. Missing CI
+observations remain unknown, not falsely all-green. Closed issues and merged
+PRs are different event counts, not independent completed-task counts.
+
+Automatic monthly classification and target/HEAD churn accounting remain
+separate work; this document does not claim #1545 is fully implemented.
+
+## Ready integration owners
+
+`ready_owner_merge` is distinct from the historical `base_sync_merge` switch.
+It never updates a branch and never infers old ship carry. It admits a CLEAN
+owner with canonical reviewed proof of its exact current HEAD, a trusted ship
+event in that current epoch, all required CI checks, and an unchanged exact
+owner/HEAD/stage/allowlist. These are checked again at completion and after the
+cleanup intent before SHA compare-and-merge. Pending CI waits without a model.
+Historical carry without current-epoch ship, conflicts and ambiguous recovery
+remain in the full canonical lineage procedure. `base_sync_merge` is not enabled
+by the installer. Direct completion also recovers a pending cleanup intent only
+after the same owner checks.
+
+REVIEW and MERGE now use the existing adaptive cadence (30-minute idle,
+10-minute busy, two empty runs before idle, event wake enabled). Replica target
+reservations still prevent a second REVIEW from auditing an occupied target.

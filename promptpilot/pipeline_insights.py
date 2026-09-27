@@ -2322,6 +2322,14 @@ def dispatch_gate(task) -> dict | None:
                 return {**pressure, "profile_id": profile_id, "queue_id": queue_config["id"]}
             queue = next((item for item in data["queues"]
                           if item["id"] == queue_config["id"]), None)
+            from .pipeline_item_holds import prepare
+            exclusions = prepare(task, queue_config, data)
+            if exclusions and queue and queue.get("membership_complete") is True:
+                members = {item.get("number") for item in queue.get("items") or []}
+                if members and members.issubset(set(exclusions)):
+                    return {"action": "defer", "defer_for": "30m",
+                            "reason": "неизменные задачи ожидают решения: " + ", ".join(f"#{n}" for n in exclusions),
+                            "profile_id": profile_id, "queue_id": queue_config["id"]}
             if config.get("skip_when_empty") and queue and queue["backlog"] == 0:
                 return {
                     "action": "complete_empty",
@@ -2862,6 +2870,7 @@ def _tool_preflight(execution: dict, command: list[str], working_dir: str | None
     environment.pop("PP_PIPELINE_REPLICAS", None)
     environment.pop("PP_PROVIDER_OWNERSHIP_KIND", None)
     environment.pop("PP_PIPELINE_TARGET_TOKEN", None)
+    environment.pop("PP_PIPELINE_EXCLUDED_NUMBERS", None)
     if env_extra:
         environment.update(env_extra)
     try:
@@ -3012,6 +3021,14 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         _clear_budget_waiter_after_admission(task)
         return {"action": "prompt", "mode": "skill", "prompt": fallback_prompt}
     profile_id, profile, queue = matched
+    from .pipeline_item_holds import prepare
+    exclusions = prepare(task, queue, read_cached(profile_id, db.list_series())) if queue.get("item_blockers") is True else []
+    if exclusions:
+        fallback_prompt += ("\n\nЛокальное ограничение приёма: не брать неизменные "
+                            "задачи, ранее переданные человеку: "
+                            + ", ".join(f"#{number}" for number in exclusions)
+                            + ". Новые задачи обслуживать по прежней процедуре. "
+                            "Нельзя обходить интеграционного владельца или расширять полномочия.")
     try:
         replica_count = _queue_replica_count(queue)
     except ValueError as exc:
@@ -3190,10 +3207,13 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "PP_PROVIDER_OWNERSHIP_KIND": provider_ownership_kind,
                         "PP_DATA_DIR": scheduler_data_dir,
                         "PP_PIPELINE_LEASE_KEY_FILE": scheduler_lease_key,
+                        **({"PP_PIPELINE_EXCLUDED_NUMBERS": json.dumps(exclusions)} if exclusions else {}),
                     },
                 )
             else:
-                preflight = _tool_preflight(execution, command, working_dir)
+                preflight = (_tool_preflight(execution, command, working_dir,
+                    env_extra={"PP_PIPELINE_EXCLUDED_NUMBERS": json.dumps(exclusions)})
+                    if exclusions else _tool_preflight(execution, command, working_dir))
         except _GitHubScanLeaseFailure as exc:
             return _budget_defer_route(
                 _replace_admission_with_lease_failure(
@@ -5306,6 +5326,12 @@ def build_period_report(profile_id: str, series: list[dict], *, hours: int = 24,
         "paused": bool(item.get("paused")),
     } for item in live_series]
     diagnostics = cached.get("diagnostics") or {}
+    from .pipeline_board import build_board
+    board = build_board(
+        delivery, diagnostics, current_tasks,
+        available=(fresh and cache.get("complete") is True
+                   and bool(diagnostics) and not diagnostics.get("checker_failed")),
+        classifications=profile.get("delivery_classifications"))
     report = {
         "profile_id": profile_id, "title": profile["title"],
         "repository": profile["repository"], "hours": hours,
@@ -5335,6 +5361,7 @@ def build_period_report(profile_id: str, series: list[dict], *, hours: int = 24,
         "bottleneck": bottleneck,
         "queues": queues, "runs": run_report,
         "attention": attention, "delivery": delivery, "cache": cache,
+        "board": board,
         "current": {"observed_at": now.isoformat(), "tasks": current_tasks},
         "decisions": {
             "waiting_ship": copy.deepcopy(diagnostics.get("reviewed_waiting_ship") or []),

@@ -1027,8 +1027,11 @@ def _pipeline_repeat_guard(task) -> dict | None:
         return None
     try:
         from . import pipeline_insights
-        if pipeline_insights._matching_queue(task) is None:
+        matched = pipeline_insights._matching_queue(task)
+        if matched is None:
             return None
+        if matched[2].get("item_blockers") is not True:
+            db.set_setting(f"pipeline_item_hold_mode:v1:{task.series_id}", "0")
         state = db.pause_pipeline_series_on_repeated_blocker(
             task.series_id, task.id)
     except Exception as exc:

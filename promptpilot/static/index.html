@@ -2974,6 +2974,13 @@ async function loadPipelineReport(profile, hours=24, refresh=false) {
     const emptyRuns = summary.empty_or_no_change_runs == null
       ? Number(verdicts.empty || 0) + Number(verdicts.no_change || 0)
       : summary.empty_or_no_change_runs;
+    const board = data.board || {};
+    const categories = (board.delivery_groups || []).map(group =>
+      `<div class="pipeline-metric"><div class="pipeline-metric-label">${esc(group.title)}</div><div class="pipeline-metric-value">${pipelineReportNumber(group.count)}</div></div>`).join('');
+    const blockedRows = (board.blocked || []).map(item =>
+      `<li>${item.number == null ? '' : `#${pipelineReportNumber(item.number)} · `}${esc(item.message || item.code || 'Причина не указана')}</li>`).join('');
+    const ciRows = (board.waiting_ci || []).map(item =>
+      `<li>${pipelineReportItem(item)} · ${esc(item.message || 'Проверки ещё выполняются')}</li>`).join('');
 
     box.innerHTML = `<div class="pipeline-report-head">
       <div>
@@ -2992,7 +2999,9 @@ async function loadPipelineReport(profile, hours=24, refresh=false) {
     <div class="pipeline-report-section"><h3>Что сделано за ${esc(periodLabel)}</h3>
     <div class="pipeline-report-grid">
       <div class="pipeline-metric"><div class="pipeline-metric-label">Влито PR / закрыто issues</div><div class="pipeline-metric-value">${deliveryExact ? `${pipelineReportNumber(merged.length)} / ${pipelineReportNumber(closed.length)}` : 'Ещё не проверено'}</div><div class="pipeline-metric-note">${deliveryExact ? `всего событий: ${pipelineReportNumber(delivered)}` : 'Нажмите «Уточнить результат в GitHub». Это не ноль выполненных работ.'}</div></div>
+      ${categories}
     </div>
+    <div class="pipeline-report-meta">Закрытые issues и влитые PR — отдельные события, не сумма выполненных задач. Категории относятся только к влитым PR; без подтверждённой классификации результат не записывается в продукт.</div>
     ${pipelineReportDeliveryNotice(delivery, periodLabel)}
     <div class="pipeline-report-section"><h3>Результат в GitHub</h3>${deliveryRows ? `<ul class="pipeline-report-list">${deliveryBody}</ul>` : deliveryBody}</div>
     </div>
@@ -3000,13 +3009,20 @@ async function loadPipelineReport(profile, hours=24, refresh=false) {
       <div class="pipeline-report-meta">По последней проверке GitHub${coverage.fresh === false ? ' (устаревшие данные)' : ''}. Перечислены решения, а не количество запусков.</div>
       ${decisions.available ? (decisionRows ? `<div>Ждут разрешения на слияние: ${(decisions.waiting_ship || []).length}. Другие решения: ${(decisions.human_waiting || []).length}.</div><ul class="pipeline-report-list">${decisionRows}</ul>${remainingDecisions ? `<details><summary>Ещё ${decisionItems.length - 5} решений</summary><ul class="pipeline-report-list">${remainingDecisions}</ul></details>` : ''}` : '<div>В последней диагностике нет ожидающих решений.</div>') : '<div>Список решений ещё не получен. Посмотрите вкладку «Состояние» и обновите диагностику.</div>'}
     </div>
+    <div class="pipeline-report-section"><h3>Ждём CI</h3>
+      ${ciRows ? `<ul class="pipeline-report-list">${ciRows}</ul>` : '<div>Нет подтверждённого списка ожиданий CI. Это не означает, что все проверки зелёные.</div>'}
+    </div>
+    <div class="pipeline-report-section"><h3>Почему задачи ждут</h3>
+      ${board.available ? (blockedRows ? `<ul class="pipeline-report-list">${blockedRows}</ul>` : '<div>В свежей диагностике нет дополнительных предупреждений.</div>') : '<div>Свежая полная диагностика недоступна; причины ожидания пока неизвестны.</div>'}
+      <div class="pipeline-report-meta">Предупреждение не означает остановку всего конвейера. Решения человека перечислены отдельно выше.</div>
+    </div>
     <details class="pipeline-report-section"><summary>Технические подробности: очереди, запуски и расход</summary>
     <div class="pipeline-report-meta">${esc(coverageText)}.${esc(tailText)}${esc(membershipText)}${esc(attentionText)}</div>
     ${coverage.complete ? '' : `<div class="pipeline-report-notice warn">Выводы предварительные: локальная история ещё не покрывает весь выбранный период.${movementPeriodText ? ` Движение посчитано только за ${esc(movementPeriodText)}.` : ''} Прочерк означает отсутствие данных, а не ноль.</div>`}
     <div class="pipeline-report-grid">
       <div class="pipeline-metric"><div class="pipeline-metric-label">Очередь сейчас / Δ</div><div class="pipeline-metric-value">${pipelineReportNumber(summary.backlog_current)} / ${pipelineReportSigned(summary.backlog_delta)}</div><div class="pipeline-metric-note">остаток и изменение за период</div></div>
       <div class="pipeline-metric"><div class="pipeline-metric-label">Вошло / вышло / перешло</div><div class="pipeline-metric-value">${pipelineReportNumber(summary.entered)} / ${pipelineReportNumber(summary.exited)} / ${pipelineReportNumber(summary.moved)}</div><div class="pipeline-metric-note">движение между снимками очередей</div></div>
-      <div class="pipeline-metric"><div class="pipeline-metric-label">Полезные прогоны</div><div class="pipeline-metric-value">${pipelineReportNumber(summary.useful_runs)} из ${pipelineReportNumber(summary.runs)}</div><div class="pipeline-metric-note">пусто или без изменений: ${pipelineReportNumber(emptyRuns)}</div></div>
+      <div class="pipeline-metric"><div class="pipeline-metric-label">Запуски с итогом «готово»</div><div class="pipeline-metric-value">${pipelineReportNumber(summary.useful_runs)} из ${pipelineReportNumber(summary.runs)}</div><div class="pipeline-metric-note">Это не число доставленных изменений. Пусто или без изменений: ${pipelineReportNumber(emptyRuns)}</div></div>
       <div class="pipeline-metric"><div class="pipeline-metric-label">Требуют внимания</div><div class="pipeline-metric-value">${pipelineReportNumber(summary.attention == null ? attention.length : summary.attention)}</div><div class="pipeline-metric-note">не восстановлено после прогонов: ${pipelineReportNumber(summary.errors)}</div></div>
       <div class="pipeline-metric"><div class="pipeline-metric-label">Токены</div><div class="pipeline-metric-value">${esc(tokenValue)}</div><div class="pipeline-metric-note">измерено запусков: ${pipelineReportNumber(tokens.known_runs)} из ${pipelineReportNumber(runs.total)}</div></div>
       <div class="pipeline-metric"><div class="pipeline-metric-label">Стоимость</div><div class="pipeline-metric-value">${esc(costValue)}</div><div class="pipeline-metric-note">измерено запусков: ${pipelineReportNumber(cost.known_runs)} из ${pipelineReportNumber(runs.total)}</div></div>

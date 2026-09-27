@@ -51,6 +51,9 @@ def test_configuration_preserves_other_profiles_gates_and_budget():
     for key in ["required_checks", "trusted_account", "review_completion_gate"]:
         assert cfg[key] == old_config[key]
     assert result["profiles"]["onebase"]["queues"][2]["execution"]["direct_complete"] is True
+    from promptpilot.pipeline_insights import _adaptive_cadence_policy
+    policy = _adaptive_cadence_policy(result["profiles"]["onebase"]["queues"][2])
+    assert policy is not None
     assert result["profiles"]["onebase"]["queues"][2]["execution"]["command"] == ["/r/pp", "pipelinectl", "next", "merge"]
     updated, _ = configure(result, cfg, PurePosixPath("/next/pp"), PurePosixPath("/next/health"),
                            PurePosixPath("/next/procedures"), "next")
@@ -62,6 +65,17 @@ def test_manifest_detects_changed_artifact_before_install(tmp_path):
     path.write_text("tampered", encoding="utf-8")
     with pytest.raises(ValueError, match="artifact changed"):
         validate_manifest({"artifacts": {str(path): "0" * 64}})
+
+
+def test_operator_classifications_are_repository_bound_and_preserve_overrides():
+    profile = {"repository": "ivanarama/onebase", "queues": [],
+               "health_check": {"command": ["old"]},
+               "delivery_classifications": {"1700": {"category": "unclassified", "evidence": "operator override"}}}
+    profiles = {"profiles": {"onebase": profile}}
+    configure(profiles, {"health_command": ["old"]}, PurePosixPath("/pp"),
+              PurePosixPath("/health"), PurePosixPath("/procedures"), "test")
+    assert profile["delivery_classifications"]["1700"]["category"] == "unclassified"
+    assert profile["delivery_classifications"]["1475"]["category"] == "docs_plans"
 
 
 @pytest.mark.parametrize("failure", [False, True])

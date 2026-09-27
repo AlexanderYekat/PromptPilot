@@ -2207,6 +2207,10 @@ def _pause_pipeline_series_on_repeated_blocker(
     ).fetchone()
     if not current or current["status"] != "completed":
         return _continue_pipeline_recurrence()
+    from .pipeline_item_holds import record
+    if record(conn, series_id, current_task_id, current["verdict"], current["result"]):
+        # Measured item handoffs park the target, not unrelated future work.
+        return _continue_pipeline_recurrence()
     current_details = _pipeline_blocker_details(
         current["verdict"], current["result"])
     if current_details is None:
@@ -2497,6 +2501,8 @@ def series_action(series_id: int, action: str) -> bool:
                 (_pipeline_series_wake_intent_key(series_id),),
             )
         elif action == "resume":
+            conn.execute("DELETE FROM settings WHERE key = ?",
+                         (f"pipeline_item_holds:v1:{series_id}",))
             resumed = conn.execute(
                 """UPDATE task_series SET paused = 0, updated_at = ?
                    WHERE id = ? AND paused = 1 AND ended_at IS NULL""",
@@ -2522,6 +2528,8 @@ def series_action(series_id: int, action: str) -> bool:
             # the run started; Resume is the only way out of this state.
             if row["paused"] or row["ended_at"]:
                 return False
+            conn.execute("DELETE FROM settings WHERE key = ?",
+                         (f"pipeline_item_holds:v1:{series_id}",))
             cur = conn.execute(
                 """UPDATE tasks
                    SET scheduled_at = ?, next_run_at = NULL,

@@ -51,4 +51,8 @@ def test_web_pipeline_report_labels_exact_and_incomplete_data_honestly():
     assert "Результат в GitHub" in html
     assert "ship, needs-decision или hold" in html
     assert "function pipelineReportUrl(value)" in html
+    assert "Почему задачи ждут" in html
+    assert "Ждём CI" in html
+    assert "board.delivery_groups" in html
+    assert "Запуски с итогом «готово»" in html
     assert "url.protocol === 'https:' || url.protocol === 'http:'" in html

@@ -75,7 +75,18 @@ def rewrite_prompt(prompt, stage, procedures, release_id, health_config=None):
 
 
 def configure(profiles, config, binary, health, procedures, release_id):
+    # Unlike the historical base_sync_merge switch, this cannot update a
+    # branch or inherit ship from an old HEAD without the full fallback.
+    config["ready_owner_merge"] = True
     profile = profiles["profiles"]["onebase"]
+    # These are reviewed observations, not an automatic title classifier.
+    classification_path = Path(__file__).resolve().parents[1] / "docs/onebase-delivery-classifications-20260927.json"
+    if classification_path.is_file():
+        classification = json.loads(classification_path.read_text(encoding="utf-8"))
+        if profile.get("repository") == classification["repository"]:
+            configured = profile.setdefault("delivery_classifications", {})
+            for number, item in classification["items"].items():
+                configured.setdefault(number, item)  # Preserve operator overrides.
     for command in [profile["health_check"]["command"], config["health_command"]]:
         command[0] = str(health)
         if "-contract" in command:
@@ -83,6 +94,15 @@ def configure(profiles, config, binary, health, procedures, release_id):
         else:
             command.extend(["-contract", str(procedures / ".claude/skills/review-queue/SKILL.md")])
     for queue in profile["queues"]:
+        if queue["id"] in {"triage", "review", "merge"}:
+            queue["item_blockers"] = True
+        if queue["id"] in {"review", "merge"}:
+            # Empty/unchanged queues need no provider. A fresh work fingerprint
+            # or successful predecessor still wakes the existing schedule.
+            queue.setdefault("adaptive_cadence", {}).update({
+                "idle_recurrence": "30m", "busy_recurrence": "10m",
+                "backlog_above": 0, "empty_runs_before_idle": 2,
+                "event_wake": True})
         if queue["id"] in {"fix", "plan"}:
             candidates = "fix_candidates" if queue["id"] == "fix" else "plan_candidates"
             exceptions = [{"key": "priority", "values": [0]}]
