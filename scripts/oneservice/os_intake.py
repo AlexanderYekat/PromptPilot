@@ -543,6 +543,16 @@ def keeper_pass(env: dict, state: dict, dry: bool) -> None:
             project_api(env, f"/issues/{iid}", "PUT", {"labels": "отклонено"})
         state["sent"].pop(iid)
         print(f"хранитель: issue #{iid} — {verdict}")
+        # TG-уведомление автору обращения
+        issue_full = project_api(env, f"/issues/{iid}")
+        tg_chat = re.search(r"TG чат (\d+)", issue_full.get("description") or "")
+        if tg_chat and env.get("TG_BOT_TOKEN"):
+            try:
+                tg("sendMessage", env["TG_BOT_TOKEN"], chat_id=int(tg_chat.group(1)),
+                   text=f"🧊 Суд концепции по «{issue_full['title'][:80]}»\n"
+                        f"Вердикт: {verdict}\n{result[:500]}")
+            except Exception as exc:
+                print(f"  !! TG notify: {exc}")
 
 
 def keeper_loop(env: dict, interval: int) -> None:
