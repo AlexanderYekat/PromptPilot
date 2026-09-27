@@ -2053,11 +2053,36 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
                                "single-flight/base-sync owner requires the full skill")
     queue = list_ship(gh, config)
     excluded = admission_exclusions()
-    queue = [item for item in queue if item.get("number") not in excluded]
-    if not queue:
-        return {"action": "empty", "verdict": "ПУСТО", "reason": "merge queue is empty"}
-    item = queue[0]
-    target = {"number": item["number"], "head": item["head"]["sha"], "stage": "merge"}
+    if config.get("fallback_handoff") == "target-v1":
+        # The health allowlist is the election authority. Independently
+        # sorting all REST ship labels can select a PR that is not first in
+        # merge_executable; the signed handoff then fails after an expensive
+        # provider attempt (or loops on preflight). Keep the REST read as an
+        # exact fresh-state cross-check, not a competing queue.
+        executable = health.get("merge_executable") or []
+        if not executable:
+            if not queue:
+                return {"action": "empty", "verdict": "ПУСТО",
+                        "reason": "merge queue is empty"}
+            return {"action": "wait", "reason": "no executable MERGE target in health snapshot"}
+        target = executable[0]
+        if target.get("stage") != "merge":
+            raise PipelineError("ordinary MERGE election contains an integration stage")
+        if target.get("number") in excluded:
+            return {"action": "wait", "number": target["number"],
+                    "reason": "first executable MERGE target awaits human resolution"}
+        item = next((value for value in queue
+                     if value.get("number") == target.get("number")
+                     and (value.get("head") or {}).get("sha") == target.get("head")), None)
+        if item is None:
+            return {"action": "wait", "number": target.get("number"),
+                    "reason": "MERGE allowlist and fresh REST state disagree"}
+    else:
+        queue = [item for item in queue if item.get("number") not in excluded]
+        if not queue:
+            return {"action": "empty", "verdict": "ПУСТО", "reason": "merge queue is empty"}
+        item = queue[0]
+        target = {"number": item["number"], "head": item["head"]["sha"], "stage": "merge"}
     snapshot = stable_timeline(gh, config, item["number"])
     validate_common(snapshot, config, {"head": item["head"]["sha"]})
     info = epoch(snapshot, config["trusted_account"])

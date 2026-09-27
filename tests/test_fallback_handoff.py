@@ -595,11 +595,44 @@ def test_gate_rejects_signed_review_token_and_forged_fallback_target(config):
         handoff.validate(preflight, "review")
 
 
-def test_fresh_ordinary_merge_priority_change_closes_target_gate(config):
+def test_fresh_ordinary_merge_priority_change_keeps_exact_target_gate(config):
     source = health("merge")
     target = source["merge_executable"][0]
     source["merge_executable"].insert(0, {"number": 9, "head": HEAD, "stage": "merge"})
+    handoff.health_gate(source, "merge", target, election=False)
     with pytest.raises(pp.PipelineError, match="exact executable"):
+        handoff.health_gate(source, "merge", target, election=True)
+
+
+def test_public_merge_gate_keeps_elected_target_after_unrelated_reorder(config, monkeypatch):
+    source = health("merge")
+    target = source["merge_executable"][0]
+    preflight = handoff.create(config, source, "merge", target, "needs full skill")
+    fresh = copy.deepcopy(source)
+    fresh["merge_executable"].insert(0, {"number": 9, "head": HEAD, "stage": "merge"})
+    monkeypatch.setattr(pp, "load_config", lambda _: dict(config))
+    monkeypatch.setattr(pp, "run_health", lambda *_args, **_kwargs: fresh)
+    monkeypatch.setattr(pp, "GitHub", ReadOnlyGitHub)
+    monkeypatch.setattr(pp, "pending_merge_intents", lambda *_: [])
+
+    code, result = invoke(["gate-fallback", "merge", "--lease", preflight["handoff"]["lease"]])
+    assert code == 0
+    assert result["action"] == "validated"
+    assert result["target"] == handoff.identity(target)
+    assert result["mutation_authorized"] is False
+
+
+def test_fresh_ordinary_merge_still_closes_when_owner_or_target_changes():
+    source = health("merge")
+    target = source["merge_executable"][0]
+    source["merge_executable"] = [{"number": 9, "head": HEAD, "stage": "merge"}]
+    with pytest.raises(pp.PipelineError, match="exact executable"):
+        handoff.health_gate(source, "merge", target, election=False)
+
+    source = health("integration-merge-ready")
+    target = source["integration_owner"]
+    source["merge_executable"].insert(0, {"number": 9, "head": HEAD, "stage": "merge"})
+    with pytest.raises(pp.PipelineError):
         handoff.health_gate(source, "merge", target, election=False)
 
 
