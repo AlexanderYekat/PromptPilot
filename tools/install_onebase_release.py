@@ -41,7 +41,7 @@ def api(path, payload=None):
         return json.load(response)
 
 
-def rewrite_prompt(prompt, stage, procedures, release_id):
+def rewrite_prompt(prompt, stage, procedures, release_id, health_config=None):
     # Replace the canonical occurrence only, not the Codex adapter path. Old
     # operator hotfix annotations are ours, bounded by their exact prefix.
     prompt = prompt.split("\n\nОператорский runtime hotfix:", 1)[0]
@@ -57,13 +57,21 @@ def rewrite_prompt(prompt, stage, procedures, release_id):
                            lambda _match: str(procedures / "CLAUDE.md"), prompt, count=1)
     if count != 1:
         raise ValueError("expected paired project policy path")
-    return prompt + (
+    result = prompt + (
         f"\n\nОператорский релиз: {release_id}. Процедуры и CLAUDE установлены как "
         "единый неизменяемый снимок. Относительные ссылки разрешай от указанного "
         "файла. Адаптер меняет только синтаксис и атрибуцию; каноническую логику "
         "бери из этого снимка. Все проверки identity/proof/ship/CI/HEAD/CAS "
         "сохраняются. Установка не является независимым ревью или разрешением "
         "на merge какого-либо PR.")
+    if health_config is not None:
+        result += (
+            f" Проверку очереди `go run ./tools/pipelinehealth -json` выполняй "
+            f"эквивалентной полной командой health_command из {health_config}: "
+            "это закреплённый checker данного релиза с его -contract/transport/cache "
+            "параметрами. Не подменяй его устаревшей сборкой из рабочего checkout. "
+            "Все глобальные owner/allowlist и локальные mutation-гейты обязательны.")
+    return result
 
 
 def configure(profiles, config, binary, health, procedures, release_id):
@@ -144,7 +152,7 @@ def install(args):
         raise ValueError("the expected seven active OneBase series are not present")
     (backups / "series.json").write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
     patches = [(row["id"], row["prompt"], rewrite_prompt(row["prompt"], STAGES[row["id"]],
-               procedures, manifest["release_id"])) for row in rows]
+               procedures, manifest["release_id"], args.data / "pipelinectl-onebase.json")) for row in rows]
     profiles, config = configure(json.loads(old_files[paths[0]]), json.loads(old_files[paths[1]]),
                                  binary, health, procedures, manifest["release_id"])
     new_files = {paths[0]: json.dumps(profiles, ensure_ascii=False, indent=2).encode("utf-8"),

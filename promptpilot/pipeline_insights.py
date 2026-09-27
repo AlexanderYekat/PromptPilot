@@ -825,7 +825,7 @@ def _priority_waiter_decision(
     return decision
 
 
-def _arm_budget_waiter(task, decision: dict) -> dict:
+def _arm_budget_waiter(task, decision: dict, *, starvation_timeout_seconds: int = 0) -> dict:
     """Persist a budget handoff before the serial admission lease is released."""
     state = decision.get("state")
     if state not in {
@@ -846,6 +846,8 @@ def _arm_budget_waiter(task, decision: dict) -> dict:
             "for GitHub budget wait")
     armed = db.arm_pipeline_github_budget_waiter(
         scope, task_id=task_id, task_started_at=started_at,
+        yield_aged_baton_seconds=(starvation_timeout_seconds
+                                 if state == "budget_in_flight" else 0),
         expected_revision=(revision if revision_valid else None))
     if not armed.get("armed"):
         raise ValueError(
@@ -854,6 +856,8 @@ def _arm_budget_waiter(task, decision: dict) -> dict:
     if type(current_revision) is not int or current_revision < 0:
         raise ValueError("GitHub budget waiter returned an invalid revision")
     decision["_budget_reservation_revision"] = current_revision
+    if armed.get("fairness_yielded"):
+        decision["reason"] += "; ожидающая задача не помещается в бюджет и уступила старшинство"
     if armed.get("revision_changed"):
         # A release may race the budget observation, but cannot race a lower
         # admission while this scan lease is held. Keep the priority marker and
@@ -929,7 +933,7 @@ def _github_scan_admission(profile: dict, purpose: str,
                              if isinstance(status_revision, int) else None))
         if task is not None:
             try:
-                decision = _arm_budget_waiter(task, decision)
+                decision = _arm_budget_waiter(task, decision, starvation_timeout_seconds=policy.get("starvation_timeout_seconds", 0))
             except (TypeError, ValueError, sqlite3.Error) as exc:
                 decision = _budget_denied(
                     policy, state="lease_unavailable",
@@ -1000,7 +1004,7 @@ def _github_scan_admission(profile: dict, purpose: str,
                         decision["_budget_reservation_revision"] = \
                             reservations["revision"]
                     if task is not None:
-                        decision = _arm_budget_waiter(task, decision)
+                        decision = _arm_budget_waiter(task, decision, starvation_timeout_seconds=policy.get("starvation_timeout_seconds", 0))
         except _GitHubScanLeaseFailure as exc:
             decision = _lease_exception_decision(
                 profile, exc, status_revision=lease.status_revision)
@@ -1252,7 +1256,7 @@ def _reserve_execution_admission(
                     _execution_budget_context.reservation = \
                         _GitHubBudgetReservation(
                             policy["lease_scope"], token, task_id, started_at)
-        decision = _arm_budget_waiter(task, decision)
+        decision = _arm_budget_waiter(task, decision, starvation_timeout_seconds=policy.get("starvation_timeout_seconds", 0))
         if decision.get("allowed") and not retain_budget:
             _clear_budget_waiter_after_admission(task)
     except _GitHubScanLeaseFailure as exc:

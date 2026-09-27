@@ -3542,6 +3542,7 @@ def _wake_pipeline_github_budget_waiters(conn, scope: str) -> dict:
 def arm_pipeline_github_budget_waiter(
         scope: str, *, task_id: int, task_started_at,
         expected_revision: int | None = None,
+        yield_aged_baton_seconds: int = 0,
         now: Optional[float] = None) -> dict:
     """Persist a priority handoff before releasing the admission scan lease.
 
@@ -3567,22 +3568,36 @@ def arm_pipeline_github_budget_waiter(
     if not math.isfinite(current):
         raise ValueError("pipeline budget waiter time must be finite")
     wait_started_at = datetime.fromtimestamp(current, timezone.utc).isoformat()
+    yield_aged_baton_seconds = _pipeline_budget_starvation_timeout(yield_aged_baton_seconds)
     with _connect(immediate=True) as conn:
         revision = _pipeline_github_budget_revision(conn, scope)
+        previous = conn.execute(
+            "SELECT budget_wait_scope, budget_wait_started_at FROM tasks "
+            "WHERE id=? AND status='running' AND started_at=?", (task_id, attempt)).fetchone()
+        yielded = False
+        if (yield_aged_baton_seconds and previous is not None
+                and previous["budget_wait_scope"] == scope
+                and previous["budget_wait_started_at"]):
+            started = datetime.fromisoformat(previous["budget_wait_started_at"])
+            if started.tzinfo is None:
+                raise ValueError("pipeline budget waiter timestamp is invalid")
+            yielded = current - started.timestamp() >= yield_aged_baton_seconds
         cur = conn.execute(
             """UPDATE tasks
                SET budget_wait_started_at = CASE
                      WHEN budget_wait_scope = ?
                        AND budget_wait_started_at IS NOT NULL
+                       AND ? = 0
                      THEN budget_wait_started_at
                      ELSE ?
                    END,
                    budget_wait_scope = ?
                WHERE id = ? AND status = 'running' AND started_at = ?""",
-            (scope, wait_started_at, scope, task_id, attempt),
+            (scope, int(yielded), wait_started_at, scope, task_id, attempt),
         )
         return {
             "armed": cur.rowcount > 0,
+            **({"fairness_yielded": True} if yielded and cur.rowcount > 0 else {}),
             "revision": revision,
             "revision_changed": (
                 expected_revision is not None

@@ -2145,6 +2145,47 @@ def test_starved_waiter_baton_blocks_early_and_atomic_new_reservations(
     }
 
 
+def test_unaffordable_aged_waiter_yields_baton_without_lowering_floor(isolated_db):
+    owner = _running_task(isolated_db, "existing owner")
+    assert _reserve(isolated_db, owner, "owner", core=500, remaining=2000)["allowed"]
+    created = isolated_db.create_task(TaskCreate(prompt="Example - TRIAGE", recurrence="4h", priority=4))
+    waiter = isolated_db.get_next_runnable()
+    assert waiter.id == created.id
+    _arm_and_defer_budget_waiter(isolated_db, waiter, wait_started_at=1000)
+    selected = isolated_db.get_next_runnable()
+    denied = _reserve(isolated_db, selected, "too-expensive", core=1200,
+                      remaining=2000, minimum=700, starvation_timeout_seconds=600, now=1600)
+    assert denied["state"] == "budget_in_flight"
+    yielded = isolated_db.arm_pipeline_github_budget_waiter(
+        "github-default", task_id=selected.id, task_started_at=selected.started_at,
+        expected_revision=denied["revision"], yield_aged_baton_seconds=600, now=1600)
+    assert yielded["fairness_yielded"] is True
+    assert _budget_wait_row(isolated_db, selected.id)["budget_wait_scope"] == "github-default"
+    assert isolated_db.pipeline_github_budget_reservations(
+        "github-default", starvation_timeout_seconds=600, now=1600).get("fairness_waiter") is None
+    isolated_db.defer_task(selected.id, datetime.now(timezone.utc) + timedelta(minutes=2),
+                          "budget busy", expected_started_at=selected.started_at,
+                          budget_wait_scope="github-default", budget_wait_revision=yielded["revision"])
+    assert isolated_db.get_next_runnable(budget_wait_scope="github-default",
+        budget_starvation_timeout_seconds=600, budget_fairness_now=1600) is None
+    isolated_db.create_task(TaskCreate(prompt="Example - MERGE", recurrence="4h", priority=1))
+    urgent = isolated_db.get_next_runnable()
+    admitted = _reserve(isolated_db, urgent, "cheap-merge", core=200,
+                        remaining=2000, minimum=100, starvation_timeout_seconds=600, now=1601)
+    assert admitted["allowed"]
+    assert denied["minimum_remaining"]["core"] == 700
+
+
+def test_yield_only_restarts_an_aged_exact_attempt(isolated_db):
+    task = _running_task(isolated_db, "Example - TRIAGE")
+    isolated_db.arm_pipeline_github_budget_waiter("github-default", task_id=task.id,
+        task_started_at=task.started_at, now=1000)
+    result = isolated_db.arm_pipeline_github_budget_waiter("github-default", task_id=task.id,
+        task_started_at=task.started_at, yield_aged_baton_seconds=600, now=1599)
+    assert not result.get("fairness_yielded")
+    assert _budget_wait_row(isolated_db, task.id)["budget_wait_started_at"] == datetime.fromtimestamp(1000, timezone.utc).isoformat()
+
+
 def test_starved_baton_keeps_floor_and_low_wait_releases_baton(isolated_db):
     created = isolated_db.create_task(TaskCreate(
         prompt="Example - PLAN", recurrence="4h", priority=4))

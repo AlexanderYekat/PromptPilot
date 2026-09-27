@@ -134,3 +134,6 @@ def test_public_installer_preserves_pauses_and_rolls_back_launch_failure(tmp_pat
             pending = connection.execute("SELECT prompt FROM tasks WHERE series_id=?", (row["id"],)).fetchone()[0]
             assert pending == prompt
             assert (prompt == row["prompt"]) is failure
+            if not failure:
+                assert str(data / "pipelinectl-onebase.json") in prompt
+                assert "Все глобальные owner/allowlist" in prompt
