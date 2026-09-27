@@ -2752,6 +2752,25 @@ def _tool_available(execution: dict, command: list[str], working_dir: str | None
     return True, "инструмент доступен"
 
 
+def _lease_argument(task, token: str, purpose: str) -> list[str]:
+    """Use scheduler-owned opaque files; all HMAC and fresh gates still apply."""
+    task_id = getattr(task, "id", None)
+    if type(task_id) is not int or task_id <= 0:
+        return ["--lease", token]
+    directory = Path(db.DB_PATH).resolve().parent / "pipelinectl-state" / "leases"
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    identity = hashlib.sha256(token.encode("ascii")).hexdigest()[:20]
+    path = directory / f"task-{task_id}-{purpose}-{identity}.lease"
+    try:
+        with path.open("x", encoding="ascii") as handle:
+            os.chmod(path, 0o600)
+            handle.write(token)
+    except FileExistsError:
+        if path.read_text(encoding="ascii") != token:
+            raise RuntimeError("stored pipeline lease changed")
+    return ["--lease-file", str(path)]
+
+
 def _tool_preflight(execution: dict, command: list[str], working_dir: str | None,
                     *, env_extra: dict[str, str] | None = None) -> dict:
     root = Path(working_dir or os.getcwd())
@@ -3306,11 +3325,21 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     }
             if mode == "auto":
                 gate_command = [*command[:-2], "gate-fallback", stage,
-                                "--lease", preflight["handoff"]["lease"]]
+                                *_lease_argument(task, preflight["handoff"]["lease"], "gate")]
                 envelope = {"protocol": "promptpilot-fallback-target-v1",
                             "next_already_run": True, "command": command,
                             "gate_command": gate_command, "preflight": preflight}
                 pre_review_guard = ""
+                if stage == "merge":
+                    pre_review_guard = (
+                        "После подтверждения неизменного блокера следуй разделу "
+                        "Ожидание и парковка канонического MERGE и разрешённой "
+                        "передаче legacy-протокола: stale ship снимается с проверкой, "
+                        "подтверждённый конфликт/провал CI паркуется через needs-decision. "
+                        "Не оставляй разрешённую передачу незавершённой ради одной "
+                        "диагностики. Отказ scheduling gate не разрешает никаких мутаций. "
+                        "Повторное ship не заменяет обязательный source proof.\n\n"
+                    )
                 if fallback_lease["target"]["stage"] == "pre-review-validation":
                     pre_review_guard = (
                         "Это специальный content-lane этап pre-review-validation, а не "
@@ -3332,7 +3361,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     "и его legacy-протокол. Используй только exact target из envelope. "
                     f"{pre_review_guard}"
                     "Непосредственно перед первой мутацией выполни gate_command ровно один "
-                    "раз: он заново "
+                    "раз. Если команда использует --lease-file, передай ровно этот путь: "
+                    "не копируй, не переписывай токен и не заменяй его на --lease. Она заново "
                     "запускает полный pipelinehealth и проверяет ту же цель. Требуется "
                     "action=validated и точное совпадение repository/stage/target. "
                     "У gate-fallback структурированный контракт: даже при ненулевом exit code "
@@ -3396,6 +3426,11 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         }
 
     rendered = subprocess.list2cmdline(command)
+    if command[-2:] == ["next", stage] and isinstance(preflight.get("lease"), str):
+        complete_stage = "merge-cleanup" if preflight_action == "cleanup" else stage
+        preflight = dict(preflight, complete_command=[
+            *command[:-2], "complete", complete_stage,
+            *_lease_argument(task, preflight["lease"], "complete")])
     prompt = execution.get("prompt")
     custom_prompt = isinstance(prompt, str) and bool(prompt.strip())
     if not custom_prompt:
@@ -3408,7 +3443,9 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
     if not custom_prompt:
         prompt = (
             f"PromptPilot уже выполнил `{rendered}` и зафиксировал цель и lease. "
-            "Не запускай next повторно. Проверь только код, diff и тесты, затем вызови complete "
+            "Не запускай next повторно. Если есть complete_command, выполни точную "
+            "команду с --lease-file (для review добавь --report), не копируй токен вручную. "
+            "Проверь только код, diff и тесты, затем вызови complete "
             "с lease из JSON ниже. Не заменяй отказ complete ручными GitHub-мутациями."
         )
     prompt = (

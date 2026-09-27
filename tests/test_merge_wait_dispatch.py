@@ -1,4 +1,4 @@
-"""REST-only integration waits must retain the full MERGE fallback."""
+"""A coherent integration REVIEW wait must not launch a MERGE provider."""
 
 import pytest
 
@@ -32,7 +32,7 @@ def rest_only_waiting_health(stage="integration-review", executable=None):
 
 @pytest.mark.parametrize("stage", ["integration-review", "legacy-integration-review"])
 @pytest.mark.parametrize("executable", [None, []])
-def test_rest_only_integration_wait_keeps_full_merge_fallback(
+def test_rest_only_integration_wait_does_not_bypass_owner(
         monkeypatch, stage, executable):
     calls = []
     health = rest_only_waiting_health(stage, executable)
@@ -52,14 +52,14 @@ def test_rest_only_integration_wait_keeps_full_merge_fallback(
 
     assert calls == [{"config_path": "pipelinectl.json"}]
     assert result == {
-        "action": "fallback",
-        "reason": "single-flight/base-sync owner requires the full skill",
+        "action": "wait", "number": 1232,
+        "reason": "single-flight owner is waiting for integration REVIEW",
     }
 
 
 @pytest.mark.parametrize("stage", ["integration-review", "legacy-integration-review"])
 @pytest.mark.parametrize("executable", [None, []])
-def test_signed_handoff_opt_in_keeps_rest_only_review_carry_on_full_merge_fallback(
+def test_signed_handoff_opt_in_waits_without_authorizing_merge(
         monkeypatch, stage, executable):
     health = rest_only_waiting_health(stage, executable)
     monkeypatch.setattr(pp, "pending_merge_intents", lambda *_: [])
@@ -72,13 +72,13 @@ def test_signed_handoff_opt_in_keeps_rest_only_review_carry_on_full_merge_fallba
     result = pp.next_merge(object(), {"fallback_handoff": "target-v1"})
 
     assert result == {
-        "action": "fallback",
-        "reason": "single-flight/base-sync owner requires the full skill",
+        "action": "wait", "number": 1232,
+        "reason": "single-flight owner is waiting for integration REVIEW",
     }
     assert "handoff" not in result
 
 
-def test_auto_execution_routes_rest_only_carry_to_skill(isolated_db, monkeypatch):
+def test_auto_execution_completes_review_wait_without_agent(isolated_db, monkeypatch):
     task = isolated_db.create_task(TaskCreate(
         prompt="OneBase - MERGE\n/merge-shepherd", recurrence="4h",
     ))
@@ -106,11 +106,9 @@ def test_auto_execution_routes_rest_only_carry_to_skill(isolated_db, monkeypatch
 
     route = pipeline_insights.execution_route(task, task.prompt)
 
-    assert route["action"] == "prompt"
-    assert route["mode"] == "skill"
-    assert route["prompt"] == task.prompt
-    assert route["fallback_reason"] == (
-        "single-flight/base-sync owner requires the full skill"
+    assert route["action"] == "complete_empty"
+    assert route["reason"] == (
+        "single-flight owner is waiting for integration REVIEW"
     )
 
 
