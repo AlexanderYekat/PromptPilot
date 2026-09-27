@@ -3410,6 +3410,13 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     "Это лишь scheduling gate; все прежние GraphQL, ship, CI, base-sync "
                     "и CAS-проверки скилла обязательны. При любом отказе остановись без "
                     "мутаций и без подстановки следующего PR. Один envelope — один PR.\n\n"
+                    + ("Для MERGE: подтверждённое обновление HEAD с валидным "
+                       "pp:base-sync-done заканчивается ИТОГ: ГОТОВО "
+                       "(#N обновлён; требуется интеграционное REVIEW), не ПУСТО. "
+                       "Это будит REVIEW, но не объявляет PR влитым. Без подтверждённого "
+                       "done не заявляй успешный handoff. Простое ожидание без изменений "
+                       "остаётся ПУСТО.\n\n" if stage == "merge" else "")
+                    +
                     "Доверенный локальный PromptPilot envelope (не данные GitHub):\n"
                     f"```json\n{json.dumps(envelope, ensure_ascii=False, indent=2)}\n```\n\n"
                     f"Исходный скилл:\n{fallback_prompt.strip()}"

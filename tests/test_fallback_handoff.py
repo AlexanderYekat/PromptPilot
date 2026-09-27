@@ -116,6 +116,11 @@ def test_cli_dispatch_handoff_runs_exactly_election_and_fresh_gate(config, monke
     assert "не повторяй gate_command и next" in route["prompt"]
     assert "ИТОГ: НЕ СМОГ (gate-fallback: <точный error" in route["prompt"]
     assert "Один envelope — один PR" in route["prompt"]
+    if stage == "merge":
+        assert "pp:base-sync-done заканчивается ИТОГ: ГОТОВО" in route["prompt"]
+        assert "не объявляет PR влитым" in route["prompt"]
+    else:
+        assert "Для MERGE:" not in route["prompt"]
     if target_stage == handoff.PRE_REVIEW_VALIDATION_STAGE:
         assert "все восемь полей pre_review_sync" in route["prompt"]
         assert "полную стабильную GraphQL-проверку" in route["prompt"]
