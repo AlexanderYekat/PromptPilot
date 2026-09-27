@@ -582,7 +582,15 @@ def main() -> int:
     mode = sys.argv[1] if len(sys.argv) > 1 else ""
     env = load_env(ROOT / ".env")
     if mode == "email":
-        process_email_mode(env, "--dry" in sys.argv)
+        interval = int(env.get("EMAIL_INTERVAL", "60"))
+        while True:
+            try:
+                process_email_mode(env, "--dry" in sys.argv)
+            except Exception as exc:
+                print(f"!! email: {type(exc).__name__}: {exc}", flush=True)
+            if "--once" in sys.argv:
+                return 0
+            time.sleep(interval)
         return 0
     if mode == "tg":
         tg_loop(env)
