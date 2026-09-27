@@ -67,6 +67,18 @@ def test_manifest_detects_changed_artifact_before_install(tmp_path):
         validate_manifest({"artifacts": {str(path): "0" * 64}})
 
 
+def test_release_enables_snapshot_recovery_without_changing_reserves():
+    budget = {"costs": {"insights": {"search": 10}},
+              "minimum_remaining": {"core": 250, "search": 2, "graphql": 100},
+              "priority_one_headroom": {"core": 1200, "search": 12, "graphql": 1000}}
+    original = copy.deepcopy(budget)
+    profiles = {"profiles": {"onebase": {"github_budget": budget,
+                "health_check": {"command": ["old"]}, "queues": []}}}
+    configure(profiles, {"health_command": ["old"]}, PurePosixPath("/pp"),
+              PurePosixPath("/health"), PurePosixPath("/procedures"), "test")
+    assert budget == {**original, "essential_snapshot_headroom": True}
+
+
 def test_operator_classifications_are_repository_bound_and_preserve_overrides():
     profile = {"repository": "ivanarama/onebase", "queues": [],
                "health_check": {"command": ["old"]},

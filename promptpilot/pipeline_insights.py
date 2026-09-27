@@ -352,11 +352,17 @@ def _github_budget_policy(profile: dict) -> dict | None:
     if any(priority_one_headroom.values()) and costs is None:
         raise ValueError(
             "github_budget.priority_one_headroom требует github_budget.costs")
+    essential_snapshot_headroom = raw.get("essential_snapshot_headroom", False)
+    if not isinstance(essential_snapshot_headroom, bool):
+        raise ValueError("github_budget.essential_snapshot_headroom must be a boolean")
+    if essential_snapshot_headroom and costs is None:
+        raise ValueError("github_budget.essential_snapshot_headroom requires costs")
 
     return {
         "minimum_remaining": minimum_remaining,
         "priority_one_headroom": priority_one_headroom,
         "costs": costs,
+        "essential_snapshot_headroom": essential_snapshot_headroom,
         "reset_grace_seconds": _bounded_int(
             raw, "reset_grace_seconds", 60, 0, 3600),
         "lease_seconds": _bounded_int(raw, "lease_seconds", 900, 30, 3600),
@@ -872,17 +878,21 @@ def _github_scan_admission(profile: dict, purpose: str,
                            budget_route: str | None = None, task=None):
     """Admit one expensive scan and hold its cross-process reservation."""
     now = time.time()
+    admission_priority = getattr(
+        task, "priority", 10 if budget_route == "insights" else None)
+    route_policy = None
     try:
         policy = _github_budget_policy(profile)
         if policy is not None:
             policy = _with_shared_budget_floor(policy)
             policy = _budget_policy_for_route(policy, budget_route)
+            route_policy = policy
             if task is not None:
                 policy = _budget_policy_for_admission_priority(
                     policy, getattr(task, "priority", None))
             elif budget_route == "insights":
-                # Full queue refreshes are useful but never more urgent than
-                # an already queued P1 integration task.
+                # Optional/fresh scans preserve urgent-task headroom. Essential
+                # snapshot recovery is checked again under the shared lease.
                 policy = _budget_policy_for_admission_priority(policy, 10)
     except (TypeError, ValueError) as exc:
         fallback = {
@@ -960,6 +970,17 @@ def _github_scan_admission(profile: dict, purpose: str,
     try:
         try:
             lease.start()
+            if (task is None and profile_id is not None
+                    and budget_route == "insights"
+                    and policy.get("essential_snapshot_headroom")):
+                # Only full queue recovery may borrow soft P1 headroom. Check
+                # *after* acquiring the account-wide scan lease so concurrent
+                # refreshes cannot all observe a cold cache and borrow it.
+                cached, _source, epoch = _cached_entry(profile_id, profile)
+                if (cached is None or int(cached[2]) != epoch
+                        or time.time() - float(cached[0]) >= _CACHE_TTL_SECONDS):
+                    admission_priority = 1
+                    policy = _budget_policy_for_admission_priority(route_policy, 1)
             try:
                 limits = _github_rate_limits()
             except _GitHubScanLeaseFailure:
@@ -987,9 +1008,6 @@ def _github_scan_admission(profile: dict, purpose: str,
                         now=time.time(), limits=limits,
                         status_revision=lease.status_revision)
                 else:
-                    admission_priority = getattr(
-                        task, "priority",
-                        10 if budget_route == "insights" else None)
                     decision = _priority_waiter_decision(
                         policy, limits, reservations,
                         priority=admission_priority,

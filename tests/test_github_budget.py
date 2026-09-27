@@ -598,6 +598,128 @@ def test_insights_refresh_preserves_priority_one_headroom(
     assert isolated_db.list_pipeline_snapshots("example") == []
 
 
+@pytest.mark.parametrize("cache_state, expected_priority", [
+    ("missing", 1), ("expired", 1), ("invalidated", 1), ("fresh", 10),
+])
+def test_essential_snapshot_borrows_only_soft_headroom(
+        isolated_db, monkeypatch, cache_state, expected_priority):
+    profile = _profile(minimum={"core": 250, "search": 2, "graphql": 100})
+    profile["github_budget"].update({
+        "costs": _budget_costs(core=50, search=10),
+        "priority_one_headroom": {"core": 1200, "search": 12, "graphql": 1000},
+        "essential_snapshot_headroom": True,
+    })
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_rate_limits", lambda: _limits(core=2042))
+    task = _running_task(isolated_db, "MERGE reservation")
+    reserved = isolated_db.reserve_pipeline_github_budget(
+        "github-default", token="merge", task_id=task.id,
+        task_started_at=task.started_at, profile_id="example", queue_id="merge",
+        route="fallback_targeted", cost={"core": 1000, "search": 8, "graphql": 1000},
+        limits=_limits(core=2042),
+        minimum_remaining={"core": 250, "search": 2, "graphql": 100})
+    assert reserved["allowed"] is True
+    cached = None if cache_state == "missing" else (
+        time.time() - (600 if cache_state == "expired" else 0), {},
+        0 if cache_state == "invalidated" else 1, "hash", 1)
+    monkeypatch.setattr(pipeline_insights, "_cached_entry", lambda *_: (cached, "memory", 1))
+    with pipeline_insights._github_scan_admission(
+            profile, "queues", profile_id="example", budget_route="insights") as decision:
+        assert decision["admission_priority"] == expected_priority
+        assert decision["allowed"] is (expected_priority == 1)
+        assert decision["reserved_other"] == {"core": 1000, "search": 8, "graphql": 1000}
+        if expected_priority == 1:
+            assert decision["minimum_remaining"] == {"core": 250, "search": 2, "graphql": 100}
+            assert decision["effective_after"]["search"] == 12
+    assert isolated_db.pipeline_github_budget_reservations("github-default")["count"] == 1
+
+
+def test_public_essential_snapshot_refresh_then_optional_refresh(isolated_db, monkeypatch):
+    profile = _profile_with_costs(core=500)
+    profile["github_budget"].update({
+        "essential_snapshot_headroom": True,
+        "priority_one_headroom": {"core": 600, "search": 0, "graphql": 0},
+    })
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_rate_limits", lambda: _limits(core=1100))
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda *_: {"state": "green", "review_candidates": []})
+    monkeypatch.setattr(pipeline_insights, "_github_search", lambda *_: {
+        "count": 0, "items": [], "membership_complete": True})
+    pipeline_insights._cache.clear()
+    result = pipeline_insights.analyze("example", [], use_cache=False)
+    assert result["cache"]["complete"] is True
+    assert len(isolated_db.list_pipeline_snapshots("example")) == 1
+    result = pipeline_insights.analyze("example", [], use_cache=False)
+    assert result["github_budget"]["admission_priority"] == 10
+    assert result["cache"]["refresh_blocked"] == "low"
+    # An explicit delivery-report scan never becomes operational recovery.
+    with pipeline_insights._github_scan_admission(
+            profile, "report delivery", budget_route="insights") as decision:
+        assert decision["allowed"] is False
+        assert decision["admission_priority"] == 10
+
+
+@pytest.mark.parametrize("core, search", [(299, 30), (5000, 11)])
+def test_essential_snapshot_still_respects_hard_floor(isolated_db, monkeypatch, core, search):
+    profile = _profile(minimum={"core": 250, "search": 2, "graphql": 100})
+    profile["github_budget"].update({
+        "costs": _budget_costs(core=50, search=10), "essential_snapshot_headroom": True})
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_rate_limits", lambda: _limits(core=core, search=search))
+    monkeypatch.setattr(pipeline_insights, "_cached_entry", lambda *_: (None, None, 0))
+    with pipeline_insights._github_scan_admission(
+            profile, "queues", profile_id="example", budget_route="insights") as decision:
+        assert decision["allowed"] is False
+        assert decision["state"] == "low"
+
+
+@pytest.mark.parametrize("invalid", ["true", 1, None])
+def test_essential_snapshot_opt_in_requires_boolean(invalid):
+    profile = _profile_with_costs()
+    profile["github_budget"]["essential_snapshot_headroom"] = invalid
+    with pytest.raises(ValueError, match="must be a boolean"):
+        pipeline_insights._github_budget_policy(profile)
+
+
+def test_essential_snapshot_yields_to_aged_waiter(isolated_db, monkeypatch):
+    profile = _profile_with_costs(core=50)
+    profile["github_budget"]["essential_snapshot_headroom"] = True
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_rate_limits", _limits)
+    monkeypatch.setattr(pipeline_insights, "_cached_entry", lambda *_: (None, None, 0))
+    monkeypatch.setattr(pipeline_insights, "_budget_reservation_ledger", lambda *_: {
+        "totals": {"core": 0, "search": 0, "graphql": 0}, "count": 0, "revision": 0,
+        "fairness_waiter": {"task_id": 123, "wait_seconds": 900}})
+    with pipeline_insights._github_scan_admission(
+            profile, "queues", profile_id="example", budget_route="insights") as decision:
+        assert decision["allowed"] is False
+        assert decision["state"] == "fairness_waiter"
+
+
+def test_essential_snapshot_cache_check_is_inside_shared_lease(isolated_db, monkeypatch):
+    profile = _profile_with_costs(core=500)
+    profile["github_budget"].update({
+        "essential_snapshot_headroom": True,
+        "priority_one_headroom": {"core": 600, "search": 0, "graphql": 0}})
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "_github_rate_limits", lambda: _limits(core=1100))
+    acquired = []
+    original = isolated_db.acquire_pipeline_scan_lease
+    def acquire(*args, **kwargs):
+        result = original(*args, **kwargs)
+        acquired.append(result["acquired"])
+        return result
+    def cached(*args):
+        assert acquired == [True]
+        return (time.time(), {}, 0, "hash", 1), "durable", 0
+    monkeypatch.setattr(isolated_db, "acquire_pipeline_scan_lease", acquire)
+    monkeypatch.setattr(pipeline_insights, "_cached_entry", cached)
+    with pipeline_insights._github_scan_admission(
+            profile, "queues", profile_id="example", budget_route="insights") as decision:
+        assert decision["admission_priority"] == 10
+        assert decision["allowed"] is False
+
+
 def test_unavailable_rate_limit_fails_closed_without_scan(
         isolated_db, monkeypatch):
     profile = _profile()

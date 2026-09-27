@@ -79,6 +79,10 @@ def configure(profiles, config, binary, health, procedures, release_id):
     # branch or inherit ship from an old HEAD without the full fallback.
     config["ready_owner_merge"] = True
     profile = profiles["profiles"]["onebase"]
+    # Queue recovery is a prerequisite of safe dispatch, not an optional
+    # dashboard refresh. Keep hard floors and outstanding promises unchanged.
+    if profile.get("github_budget", {}).get("costs"):
+        profile["github_budget"]["essential_snapshot_headroom"] = True
     # These are reviewed observations, not an automatic title classifier.
     classification_path = Path(__file__).resolve().parents[1] / "docs/onebase-delivery-classifications-20260927.json"
     if classification_path.is_file():
