@@ -126,7 +126,9 @@ def configure(profiles, config, binary, health, procedures, release_id):
 
 
 def prepare(args):
-    artifacts = [args.binary, args.health, *sorted(args.procedures.rglob("*"))]
+    artifacts = [args.binary, args.health, Path(__file__).resolve(),
+                 Path(__file__).resolve().parents[1] / "docs/onebase-delivery-classifications-20260927.json",
+                 *sorted(args.procedures.rglob("*"))]
     artifacts = [path for path in artifacts if path.is_file()]
     manifest = {"release_id": args.root.name, "prepared_at": datetime.now(timezone.utc).isoformat(),
                 "pp_commit": args.pp_commit, "procedures_commit": args.procedures_commit,
