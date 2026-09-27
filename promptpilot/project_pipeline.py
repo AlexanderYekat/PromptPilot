@@ -1986,7 +1986,7 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
                                f"merge state {status.get('mergeStateStatus')}/{status.get('mergeable')} requires the full skill")
     ready, reason = checks_ready(config, checks)
     if not ready:
-        return {"action": "wait", "reason": reason, "number": item["number"]}
+        return fallback_target(config, health, "merge", target, reason)
     lease = {"version": 1, "stage": "merge", "repository": config["repository"],
              "number": item["number"], "head": snapshot["headRefOid"],
              "snapshot": digest(snapshot), "proof": established}
