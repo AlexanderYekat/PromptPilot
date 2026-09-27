@@ -40,3 +40,15 @@ def test_public_next_merge_ready_owner_never_updates_or_infers_carry(monkeypatch
         changed = health()
         changed["integration_owner"]["head"] = "b" * 40
         assert pp._barrier_blocks_merge(changed, lease)
+
+
+def test_public_completion_refuses_changed_owner_before_any_write(monkeypatch):
+    lease = {"stage": "merge", "repository": "owner/repo", "number": 42,
+             "head": HEAD, "ready_owner": True, "owner_stage": "integration-merge-ready"}
+    changed = health()
+    changed["integration_owner"]["head"] = "b" * 40
+    monkeypatch.setattr(pp, "ensure_identity", lambda *_: None)
+    monkeypatch.setattr(pp, "run_health", lambda *_a, **_kw: changed)
+    with pytest.raises(pp.PipelineError, match="single-flight owner appeared"):
+        pp.complete_merge(object(), {"repository": "owner/repo", "trusted_account": "owner"},
+                          pp.encode_lease(lease))

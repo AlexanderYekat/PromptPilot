@@ -1,6 +1,24 @@
 from pathlib import Path
+import re
+import shutil
+import subprocess
+
+import pytest
 
 from promptpilot import api
+
+
+def test_embedded_dashboard_javascript_parses():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is unavailable; web syntax checked on the Windows host")
+    html = (Path(__file__).parents[1] / "promptpilot/static/index.html").read_text(encoding="utf-8")
+    scripts = re.findall(r"<script(?:\s[^>]*)?>(.*?)</script>", html, re.S)
+    assert scripts
+    for script in scripts:
+        if script.strip():
+            subprocess.run([node, "-e", "new Function(require('fs').readFileSync(0, 'utf8'));"],
+                           input=script, text=True, encoding="utf-8", capture_output=True, check=True)
 
 
 def test_web_index_is_kept_in_memory_after_startup(monkeypatch, tmp_path):
