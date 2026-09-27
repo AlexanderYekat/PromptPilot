@@ -413,7 +413,19 @@ def handle_update(env: dict, state: dict, update: dict) -> None:
     print(f"TГ -> issue #{issue['iid']} от {person}")
 
 
+import msvcrt
+
+TG_LOCK_FILE = ROOT / ".tg_lock"
+
+
 def tg_loop(env: dict) -> None:
+    # Единственный экземпляр: lock-файл блокирует повторный запуск
+    lock = open(ROOT / ".tg_lock", "w")
+    try:
+        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+    except (IOError, OSError):
+        print("!! os_intake tg УЖЕ запущен — второй экземпляр блокирован")
+        return
     token = env["TG_BOT_TOKEN"]
     global TG_ALLOWED
     TG_ALLOWED = load_state(ALLOWED_FILE)
