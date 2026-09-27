@@ -25,8 +25,9 @@ directory rather than overwriting a running binary.
 
 REVIEW series 3/13 were subsequently promoted from priority 2 to priority 1 via
 the public schedule API. They now share the delivery priority class with MERGE,
-so secondary TAIL activity cannot reserve the primary class's headroom against
-REVIEW. All resource safety minima, reservations and scan leases remain active;
+so REVIEW is no longer charged the extra headroom reserved for primary work.
+Real resource contention can still defer REVIEW; this is not unlimited admission.
+All resource safety minima, reservations and scan leases remain active;
 existing series pause flags were not changed.
 
 ## Verification and observation
