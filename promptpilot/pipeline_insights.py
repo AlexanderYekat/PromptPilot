@@ -4315,6 +4315,14 @@ def _with_persisted_refresh_status(result: dict, profile_id: str,
     status = event.get("status")
     if not isinstance(status, dict):
         return result
+    # An execution admission denial is not a failed queue refresh. TAIL/FIX
+    # budget contention must not poison a fresh shared snapshot for every
+    # other stage. Unknown legacy routes remain conservative.
+    route = (status.get("github_budget") or {}).get("budget_route")
+    cache = result.get("cache") or {}
+    if (route in {"skill", "tool_preflight", "tool", "fallback_targeted"}
+            and cache.get("complete") is True and cache.get("stale") is False):
+        return result
     raw_defer_until = status.get("refresh_deferred_until")
     defer_until = _parse_time(raw_defer_until)
     if defer_until is None or defer_until <= datetime.now(timezone.utc):
@@ -5526,7 +5534,15 @@ def sample_active_profiles(series: list[dict]) -> dict[str, str]:
         if not _profile_active(profile, series):
             continue
         try:
-            data = analyze(profile_id, series, use_cache=False)
+            data = None
+            if (profile.get("github_budget") or {}).get("essential_snapshot_headroom") is True:
+                candidate = read_cached(profile_id, series)
+                cache = candidate.get("cache") or {}
+                if (cache.get("complete") is True and cache.get("stale") is False
+                        and not cache.get("refresh_blocked")):
+                    data = candidate
+            if data is None:
+                data = analyze(profile_id, series, use_cache=False)
             if db.is_paused():
                 outcomes[profile_id] = "paused"
                 break

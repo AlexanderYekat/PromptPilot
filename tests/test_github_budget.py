@@ -3459,6 +3459,53 @@ def test_refresh_revision_order_survives_wall_clock_rollback(
         "github-default", "successor") is True
 
 
+@pytest.mark.parametrize("route, blocked", [
+    ("skill", False), ("tool_preflight", False), ("tool", False),
+    ("fallback_targeted", False), ("insights", True), (None, True),
+])
+def test_execution_denial_cannot_poison_fresh_snapshot(isolated_db, monkeypatch, route, blocked):
+    profile = _profile_with_costs()
+    profile["queues"][0]["dispatch_gate"] = {
+        "backpressure": {"max_active": 1, "active_fields": ["merge_candidates"],
+                         "candidate_field": "fix_candidates"}}
+    data = {"cache": {"complete": True, "stale": False}, "queues": [],
+            "diagnostics": {"merge_candidates": [{"number": 123, "head": "abc"}],
+                            "fix_candidates": []}}
+    monkeypatch.setattr(isolated_db, "get_pipeline_refresh_status", lambda *_: {
+        "repository": profile["repository"], "status": {
+            "refresh_blocked": "budget_in_flight",
+            "refresh_blocked_reason": "TAIL budget denied",
+            "refresh_deferred_until": (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat(),
+            "github_budget": {"budget_route": route}}})
+    result = pipeline_insights._with_persisted_refresh_status(data, "example", profile)
+    assert bool(result["cache"].get("refresh_blocked")) is blocked
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(isolated_db, "list_series", lambda: [])
+    monkeypatch.setattr(pipeline_insights, "read_cached", lambda *_: result)
+    decision = pipeline_insights.dispatch_gate(SimpleNamespace(
+        series_id=1, series_title="Example - REVIEW", prompt="Example - REVIEW"))
+    assert decision["action"] == "defer"
+    if blocked:
+        assert "свежий полный снимок недоступен" in decision["reason"]
+    else:
+        assert "активных PR 1" in decision["reason"]
+        assert "сначала завершить" in decision["reason"]
+
+
+def test_essential_sampler_reuses_fresh_snapshot(isolated_db, monkeypatch):
+    profile = _profile_with_costs()
+    profile["github_budget"]["essential_snapshot_headroom"] = True
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "_profile_active", lambda *_: True)
+    monkeypatch.setattr(pipeline_insights, "read_cached", lambda *_: {
+        "cache": {"complete": True, "stale": False}})
+    monkeypatch.setattr(pipeline_insights, "_wake_ready_queues", lambda *_: [])
+    def forbidden(*args, **kwargs):
+        raise AssertionError("periodic sampler requested a redundant GitHub scan")
+    monkeypatch.setattr(pipeline_insights, "analyze", forbidden)
+    assert pipeline_insights.sample_active_profiles([]) == {"example": "ok"}
+
+
 def test_dispatch_gate_ignores_last_good_while_refresh_is_blocked(monkeypatch):
     profile = _profile()
     profile["queues"][0]["dispatch_gate"] = {"skip_when_empty": True}
