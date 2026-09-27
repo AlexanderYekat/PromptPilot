@@ -3281,6 +3281,36 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     mode=("tool" if provider_route == "tool" else "skill"),
                     phase="post_preflight", preflight=preflight)
 
+        # Explicit operator opt-in: an already-reviewed MERGE/cleanup has no
+        # content audit left for a model. The same adapter owns every fresh
+        # authorization/CI/CAS/recovery gate; never use this for REVIEW or a
+        # fallback. Keep completion inside the admitted GitHub scan scope.
+        if (stage == "merge" and execution.get("direct_complete") is True
+                and preflight_action in {"merge", "cleanup"}
+                and command[-2:] == ["next", stage]):
+            token = preflight.get("lease")
+            if not isinstance(token, str) or not token:
+                return {"action": "block", "mode": "tool",
+                        "reason": "direct MERGE has no opaque completion lease"}
+            complete_stage = "merge-cleanup" if preflight_action == "cleanup" else "merge"
+            complete_command = [*command[:-2], "complete", complete_stage,
+                                *_lease_argument(task, token, "complete")]
+            try:
+                completion = _tool_preflight(execution, complete_command, working_dir)
+            except RuntimeError as exc:
+                return {"action": "defer", "mode": "tool", "defer_for": "10m",
+                        "reason": f"direct MERGE completion unavailable: {exc}"}
+            if completion.get("action") != "completed":
+                return {"action": "defer", "mode": "tool", "defer_for": "10m",
+                        "reason": "direct MERGE refused: " + str(
+                            completion.get("error") or completion.get("reason")
+                            or completion.get("action")), "completion": completion}
+            return {"action": "complete_empty", "mode": "tool", "verdict": "ГОТОВО",
+                    "reason": f"pipelinectl {complete_stage} completed for PR #"
+                              f"{(preflight.get('target') or {}).get('number')}",
+                    "profile_id": profile_id, "queue_id": queue.get("id"),
+                    "preflight": preflight, "completion": completion}
+
     preflight_action = preflight["action"].lower()
     preflight_reason = str(
         preflight.get("reason") or preflight.get("error") or preflight_action

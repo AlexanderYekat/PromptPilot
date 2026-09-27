@@ -399,6 +399,31 @@ def test_cli_missing_lease_file_is_structured_refusal(tmp_path):
     assert code == 2 and result["action"] == "error"
 
 
+@pytest.mark.parametrize("action", ["merge", "cleanup"])
+@pytest.mark.parametrize("completion_action", ["completed", "error"])
+def test_opted_in_direct_merge_completion_never_launches_provider(
+        monkeypatch, action, completion_action):
+    queue = {"id": "merge", "execution": {"mode": "auto", "direct_complete": True,
+             "command": ["ctl", "next", "merge"]}}
+    monkeypatch.setattr(pipeline_insights, "_matching_queue", lambda _: ("example", {}, queue))
+    monkeypatch.setattr(pipeline_insights, "_tool_available", lambda *_: (True, ""))
+    commands = []
+    def preflight(_execution, command, _directory):
+        commands.append(command)
+        if len(commands) == 1:
+            return {"action": action, "lease": "opaque", "target": {"number": 42}}
+        assert command == ["ctl", "complete", "merge-cleanup" if action == "cleanup" else "merge",
+                           "--lease", "opaque"]
+        return {"action": completion_action, "error": "fresh gate refused"}
+    monkeypatch.setattr(pipeline_insights, "_tool_preflight", preflight)
+    route = pipeline_insights.execution_route(SimpleNamespace(), "/skill")
+    assert len(commands) == 2
+    if completion_action == "completed":
+        assert route["action"] == "complete_empty" and route["verdict"] == "ГОТОВО"
+    else:
+        assert route["action"] == "defer" and "fresh gate refused" in route["reason"]
+
+
 def test_cli_blocked_by_pending_ci_returns_wait_before_full_fallback(config, monkeypatch):
     config["required_checks"] = ["build", "lint"]
     monkeypatch.setattr(pp, "load_config", lambda _: dict(config))
