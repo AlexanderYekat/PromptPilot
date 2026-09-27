@@ -22,6 +22,12 @@ Installation failures restore touched files/prompts/services, unless a concurren
 edit makes rollback unsafe. Backups stay in the release's `before` directory.
 There is no destructive whole-database restore.
 
+Stage prompts bind the canonical `go run ./tools/pipelinehealth -json` check to
+the full `health_command` in the installed `pipelinectl-onebase.json`, including
+its contract, transport and cache flags. This prevents a stage from silently
+running an older checker from its clean working checkout. Global owner/allowlist
+checks and local mutation gates remain mandatory.
+
 Procedures taken from an unmerged PR are an explicitly installed operator hotfix,
 **not** evidence that the PR is approved, shipped or merged. Relative skill
 references are resolved inside the paired snapshot. Its CLAUDE.md is paired too,
@@ -48,6 +54,16 @@ stale or incomplete snapshots defer intake. An expired snapshot is refreshed
 through the existing shared GitHub scan lease and resource budget, not via a
 model or a new unbudgeted API route. The threshold is operator-owned and can be
 changed after observing delivery throughput.
+
+## GitHub budget fairness
+
+An aged waiter receives a scheduling opportunity, not an unlimited reservation.
+If its own admission still fails because another running task occupies the
+required GitHub budget, it yields its aging baton for that scope. Its waiter,
+priority and resource floors remain in place; only the fairness age restarts.
+The ordinary retry delay is respected and cheaper eligible delivery work can
+proceed. A future starvation window provides another opportunity. Priority,
+scan-lease and fairness deferrals do not themselves reset the baton.
 
 ## Outcome and maintenance budget (#1545)
 
