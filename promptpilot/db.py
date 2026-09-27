@@ -2144,9 +2144,17 @@ def _pipeline_blocker_details(
             or normalized in _PIPELINE_GENERIC_BLOCKER_REASONS
             or not any(character.isalnum() for character in normalized)):
         return None
+    # Human-required is a terminal handoff, not a retryable execution error.
+    # Two consecutive handoffs for the same unambiguous target must stop even
+    # when the agent paraphrases the diagnosis (incident: OneBase PR #1505).
+    # Keep UNABLE text-sensitive and ambiguous/multi-target reports separate.
+    targets = set(re.findall(r"(?<![\w#])#([1-9][0-9]*)\b", display_reason))
+    identity = normalized
+    if kind == "human" and len(targets) == 1:
+        identity = "human-target:#" + next(iter(targets))
     return {
         "fingerprint": hashlib.sha256(
-            f"{kind}\0{normalized}".encode("utf-8")).hexdigest(),
+            f"{kind}\0{identity}".encode("utf-8")).hexdigest(),
         "reason": display_reason[:1000],
     }
 
