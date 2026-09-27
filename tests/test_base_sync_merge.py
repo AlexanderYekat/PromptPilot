@@ -6,7 +6,7 @@ from promptpilot import project_pipeline as pp
 
 HEAD = "3e7be634fba4504b0a768662122d3cc12d5572d9"
 NEW_HEAD = "b" * 40
-OWNER = {"number": 1232, "head": HEAD, "stage": "integration-review"}
+OWNER = {"number": 1232, "head": HEAD, "stage": "integration-merge-ready"}
 FALLBACK = {"action": "fallback",
             "reason": "single-flight/base-sync owner requires the full skill"}
 
@@ -15,7 +15,7 @@ def owner_health(merge_executable=[]):
     return {
         "state": "yellow",
         "integration_owner": dict(OWNER),
-        "review_candidates": [dict(OWNER)],
+        "review_candidates": [],
         "content_review_candidates": [],
         "merge_executable": merge_executable,
         "findings": [{"code": "single_flight_barrier", "severity": "yellow",
@@ -81,14 +81,17 @@ def test_behind_owner_without_optin_keeps_full_skill_fallback(monkeypatch):
     assert result == FALLBACK
 
 
-def test_rest_only_owner_keeps_fallback_even_with_optin(monkeypatch):
-    install_common(monkeypatch, health=owner_health(merge_executable=None))
+def test_rest_only_review_owner_waits_even_with_merge_optin(monkeypatch):
+    health = owner_health(merge_executable=None)
+    health["integration_owner"]["stage"] = "integration-review"
+    health["review_candidates"] = [dict(health["integration_owner"])]
+    install_common(monkeypatch, health=health)
 
     result = pp.next_merge(object(), base_config(
         base_sync_merge=True, fallback_handoff="target-v1"))
 
-    assert result["action"] == "fallback"
-    assert "full skill" in result["reason"]
+    assert result["action"] == "wait"
+    assert "waiting for integration REVIEW" in result["reason"]
 
 
 def test_clean_owner_reserves_intent_and_issues_merge_lease(monkeypatch):

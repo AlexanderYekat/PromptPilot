@@ -116,6 +116,11 @@ def test_cli_dispatch_handoff_runs_exactly_election_and_fresh_gate(config, monke
     assert "не повторяй gate_command и next" in route["prompt"]
     assert "ИТОГ: НЕ СМОГ (gate-fallback: <точный error" in route["prompt"]
     assert "Один envelope — один PR" in route["prompt"]
+    if stage == "merge":
+        assert "pp:base-sync-done заканчивается ИТОГ: ГОТОВО" in route["prompt"]
+        assert "не объявляет PR влитым" in route["prompt"]
+    else:
+        assert "Для MERGE:" not in route["prompt"]
     if target_stage == handoff.PRE_REVIEW_VALIDATION_STAGE:
         assert "все восемь полей pre_review_sync" in route["prompt"]
         assert "полную стабильную GraphQL-проверку" in route["prompt"]
@@ -145,6 +150,60 @@ def test_documented_scan_budget_uses_local_productive_wake_up():
     assert "два scan вместо прежних четырёх" in readme
     assert "`4 → 2`" in readme
     assert "Профиль без\nлокального графа сохраняет совместимый третий scan" in readme
+
+
+def test_cli_gate_uses_signed_election_checkout_after_detached_audit(
+        config, monkeypatch, tmp_path):
+    base = tmp_path / "base"
+    audit = tmp_path / "detached-audit"
+    base.mkdir()
+    audit.mkdir()
+    config["sync_base_before_health"] = True
+    config["health_command"] = ["fixture-health"]
+    snapshot = health()
+    monkeypatch.setattr(pp, "load_config", lambda _: dict(config))
+    monkeypatch.setattr(pp, "GitHub", ReadOnlyGitHub)
+    calls = []
+
+    def subprocess_run(command, **kwargs):
+        location = Path(kwargs.get("cwd") or Path.cwd())
+        calls.append((command, location))
+        if command[-2:] == ["branch", "--show-current"]:
+            output = "main\n" if location == base else ""
+        elif command == ["fixture-health"]:
+            output = json.dumps(snapshot)
+        else:
+            output = ""
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+
+    monkeypatch.setattr(pp.subprocess, "run", subprocess_run)
+    monkeypatch.chdir(base)
+    code, elected = invoke(["--config", str(tmp_path / "config.json"), "next", "review"])
+    assert code == 0 and elected["action"] == "fallback"
+    lease = pp.decode_signed_lease(elected["handoff"]["lease"])
+    assert lease["health_checkout"] == str(base.resolve())
+    calls.clear()
+    monkeypatch.chdir(audit)
+    code, gated = invoke(["--config", str(tmp_path / "config.json"),
+                          "gate-fallback", "review", "--lease", elected["handoff"]["lease"]])
+    assert code == 0 and gated["action"] == "validated"
+    assert gated["mutation_authorized"] is False
+    assert len(calls) == 5 and all(location == base for _, location in calls)
+    assert Path.cwd() == audit
+
+
+def test_cli_gate_still_rejects_dirty_pinned_checkout(config, monkeypatch, tmp_path):
+    config["sync_base_before_health"] = True
+    monkeypatch.chdir(tmp_path)
+    elected = handoff.create(config, health(), "review", health()["integration_owner"], "audit")
+    monkeypatch.setattr(pp, "load_config", lambda _: dict(config))
+    monkeypatch.setattr(pp, "GitHub", ReadOnlyGitHub)
+    def subprocess_run(command, **kwargs):
+        output = "main\n" if command[-2:] == ["branch", "--show-current"] else " M file.go\n"
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+    monkeypatch.setattr(pp.subprocess, "run", subprocess_run)
+    code, error = invoke(["gate-fallback", "review", "--lease", elected["handoff"]["lease"]])
+    assert code == 2 and "tracked changes" in error["error"]
 
 
 @pytest.mark.parametrize("field,value", [
@@ -373,6 +432,111 @@ def test_merge_cleanup_still_precedes_opted_in_election(config, monkeypatch):
     monkeypatch.setattr(pp, "pending_merge_action", lambda *_: {"action": "cleanup"})
     monkeypatch.setattr(pp, "run_health", lambda *_, **__: pytest.fail("cleanup precedes election"))
     assert pp.next_merge(object(), config) == {"action": "cleanup"}
+
+
+def test_signed_fallback_cli_accepts_opaque_file_and_rejects_tampering(config, monkeypatch, tmp_path, isolated_db):
+    source = health("integration-merge-ready")
+    result = handoff.create(config, source, "merge", source["integration_owner"], "carry")
+    argument = pipeline_insights._lease_argument(SimpleNamespace(id=123), result["handoff"]["lease"], "gate")
+    assert argument[0] == "--lease-file"
+    monkeypatch.setattr(pp, "load_config", lambda _: dict(config))
+    monkeypatch.setattr(pp, "GitHub", ReadOnlyGitHub)
+    monkeypatch.setattr(pp, "run_health", lambda *_, **__: source)
+    monkeypatch.setattr(pp, "pending_merge_intents", lambda *_: [])
+    code, gated = invoke(["gate-fallback", "merge", *argument])
+    assert code == 0 and gated["action"] == "validated"
+    assert gated["mutation_authorized"] is False
+    path = Path(argument[1])
+    token = path.read_text(encoding="ascii")
+    path.write_text(("A" if token[0] != "A" else "B") + token[1:], encoding="ascii")
+    code, refused = invoke(["gate-fallback", "merge", *argument])
+    assert code == 2 and "signature" in refused["error"]
+
+
+def test_cli_missing_lease_file_is_structured_refusal(tmp_path):
+    code, result = invoke(["gate-fallback", "merge", "--lease-file", str(tmp_path / "missing.lease")])
+    assert code == 2 and result["action"] == "error"
+
+
+@pytest.mark.parametrize("action", ["merge", "cleanup"])
+@pytest.mark.parametrize("completion_action", ["completed", "error"])
+def test_opted_in_direct_merge_completion_never_launches_provider(
+        monkeypatch, action, completion_action):
+    queue = {"id": "merge", "execution": {"mode": "auto", "direct_complete": True,
+             "command": ["ctl", "next", "merge"]}}
+    monkeypatch.setattr(pipeline_insights, "_matching_queue", lambda _: ("example", {}, queue))
+    monkeypatch.setattr(pipeline_insights, "_tool_available", lambda *_: (True, ""))
+    commands = []
+    def preflight(_execution, command, _directory):
+        commands.append(command)
+        if len(commands) == 1:
+            return {"action": action, "lease": "opaque", "target": {"number": 42}}
+        assert command == ["ctl", "complete", "merge-cleanup" if action == "cleanup" else "merge",
+                           "--lease", "opaque"]
+        return {"action": completion_action, "error": "fresh gate refused"}
+    monkeypatch.setattr(pipeline_insights, "_tool_preflight", preflight)
+    route = pipeline_insights.execution_route(SimpleNamespace(), "/skill")
+    assert len(commands) == 2
+    if completion_action == "completed":
+        assert route["action"] == "complete_empty" and route["verdict"] == "ГОТОВО"
+    else:
+        assert route["action"] == "defer" and "fresh gate refused" in route["reason"]
+
+
+def test_cli_blocked_by_pending_ci_returns_wait_before_full_fallback(config, monkeypatch):
+    config["required_checks"] = ["build", "lint"]
+    monkeypatch.setattr(pp, "load_config", lambda _: dict(config))
+    monkeypatch.setattr(pp, "GitHub", ReadOnlyGitHub)
+    monkeypatch.setattr(pp, "pending_merge_intents", lambda *_: [])
+    monkeypatch.setattr(pp, "run_health", lambda *_, **__: health("merge"))
+    monkeypatch.setattr(pp, "list_ship", lambda *_: [{
+        "number": 42, "head": {"sha": HEAD}, "title": "pending CI"}])
+    monkeypatch.setattr(pp, "stable_timeline", lambda *_: {
+        "headRefOid": HEAD, "state": "OPEN", "isDraft": False,
+        "baseRefName": "main", "labelsComplete": True, "labels": ["ship"],
+        "edges": [{"cursor": "c1", "node": {"__typename": "PullRequestCommit",
+                   "id": "head-anchor", "commit": {"oid": HEAD}}}],
+    })
+    monkeypatch.setattr(pp, "proof", lambda *_: {"review": 1})
+    monkeypatch.setattr(pp, "trusted_ship_authorized", lambda *_: True)
+    monkeypatch.setattr(pp, "pr_checks", lambda *_: (
+        {"mergeStateStatus": "BLOCKED", "mergeable": "MERGEABLE"},
+        [{"name": "build", "status": "IN_PROGRESS"},
+         {"name": "lint", "conclusion": "SUCCESS"}]))
+    monkeypatch.setattr(pp, "fallback_target", lambda *_: pytest.fail("CI wait launched fallback"))
+    code, result = invoke(["next", "merge"])
+    assert code == 0
+    assert result == {"action": "wait", "number": 42,
+                      "reason": "required CI checks are still running"}
+
+
+@pytest.mark.parametrize("owner_stage", ["integration-review", "legacy-integration-review"])
+@pytest.mark.parametrize("legacy_null", [False, True])
+def test_merge_dispatch_waits_for_review_owner_without_provider(
+        config, monkeypatch, owner_stage, legacy_null):
+    source = health(owner_stage)
+    if legacy_null:
+        source["merge_executable"] = None
+    monkeypatch.setattr(pp, "run_health", lambda *_, **__: source)
+    monkeypatch.setattr(pp, "pending_merge_intents", lambda *_: [])
+    monkeypatch.setattr(pp, "list_ship", lambda *_: pytest.fail("must not bypass owner"))
+    monkeypatch.setattr(pp, "GitHub", ReadOnlyGitHub)
+    monkeypatch.setattr(pp, "load_config", lambda _: dict(config))
+    queue = {"id": "merge", "execution": {
+        "mode": "auto", "command": ["ctl", "next", "merge"]}}
+    monkeypatch.setattr(pipeline_insights, "_matching_queue", lambda _: ("example", {}, queue))
+    monkeypatch.setattr(pipeline_insights, "_tool_available", lambda *_: (True, ""))
+
+    def preflight(*_):
+        code, result = invoke(["next", "merge"])
+        assert code == 0
+        return result
+
+    monkeypatch.setattr(pipeline_insights, "_tool_preflight", preflight)
+    route = pipeline_insights.execution_route(SimpleNamespace(), "/skill")
+    assert route["action"] == "complete_empty"
+    assert route["preflight"]["number"] == 42
+    assert "waiting for integration REVIEW" in route["reason"]
 
 
 @pytest.mark.parametrize("stage", ["review", "merge"])

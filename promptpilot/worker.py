@@ -1027,8 +1027,11 @@ def _pipeline_repeat_guard(task) -> dict | None:
         return None
     try:
         from . import pipeline_insights
-        if pipeline_insights._matching_queue(task) is None:
+        matched = pipeline_insights._matching_queue(task)
+        if matched is None:
             return None
+        if matched[2].get("item_blockers") is not True:
+            db.set_setting(f"pipeline_item_hold_mode:v1:{task.series_id}", "0")
         state = db.pause_pipeline_series_on_repeated_blocker(
             task.series_id, task.id)
     except Exception as exc:
@@ -1463,6 +1466,7 @@ def _mark_cancelled(task, *args, **kwargs):
 
 def _execute_task_body(task, admission_complete=None):
     """Run CLI with the task's prompt."""
+    prompt_constraint = None
     if task.series_id:
         # Optional profile-owned gates are deterministic and token-free. They
         # stop empty stages before a provider is launched and defer dependent
@@ -1475,6 +1479,8 @@ def _execute_task_body(task, admission_complete=None):
             print(f"  !! pipeline dispatch gate unavailable for #{task.id}: {exc}", flush=True)
         if gate:
             reason = gate["reason"]
+            if gate["action"] == "restrict_prompt":
+                prompt_constraint = gate["prompt_constraint"]
             if gate["action"] == "defer":
                 next_run = _pipeline_defer_time(gate)
                 if next_run:
@@ -1500,6 +1506,8 @@ def _execute_task_body(task, admission_complete=None):
                 return
 
     agent_prompt = effective_prompt(task)
+    if prompt_constraint:
+        agent_prompt += "\n\n" + prompt_constraint
     require_closing_verdict = False
     allow_targeted_stale = False
     pipeline_replicas = None
@@ -1583,6 +1591,8 @@ def _execute_task_body(task, admission_complete=None):
             print(f"  -> Pipeline preflight completed without agent: {reason}")
             return
         agent_prompt = route["prompt"]
+        if prompt_constraint and prompt_constraint not in agent_prompt:
+            agent_prompt += "\n\n" + prompt_constraint
         raw_replicas = route.get("pipeline_replicas")
         if type(raw_replicas) is int and 2 <= raw_replicas <= 16:
             pipeline_replicas = str(raw_replicas)

@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import time
 from datetime import datetime
+from pathlib import Path
 
 
 PROTOCOL = "promptpilot-fallback-target-v1"
@@ -213,6 +214,10 @@ def create(config: dict, health: dict, stage: str, target: dict, reason: str,
              "repository": config["repository"], "target": target,
              "config_sha256": config_digest(config), "issued_at": issued,
              "expires_at": issued + TTL}
+    if config.get("sync_base_before_health", False):
+        # Sign the election checkout, not the agent's later audit worktree.
+        # This is execution context only: fresh health and every gate still run.
+        lease["health_checkout"] = str(Path.cwd().resolve())
     if target_reservation is not None:
         repository, target_stage, number, head, task_id, _token = \
             pp._reservation_identity(target_reservation)
@@ -260,6 +265,10 @@ def validate_lease(lease: dict, stage: str) -> None:
             or not re.fullmatch(r"[0-9a-f]{64}", lease["config_sha256"])):
         raise PipelineError("invalid fallback lease")
     target = identity(lease.get("target"))
+    checkout = lease.get("health_checkout")
+    if checkout is not None and (not isinstance(checkout, str)
+                                 or not Path(checkout).is_absolute()):
+        raise PipelineError("fallback health checkout must be an absolute path")
     if target["stage"] not in (REVIEW_STAGES if stage == "review" else MERGE_STAGES):
         raise PipelineError("fallback lease target belongs to another stage")
     issued, expires = lease.get("issued_at"), lease.get("expires_at")
@@ -298,7 +307,9 @@ def gate(gh, config: dict, stage: str, lease_value: str, *, config_path=None) ->
             raise pp.PipelineError("fallback configuration changed; start a new task")
 
     check_config()
-    health = pp.run_health(config, config_path=config_path)
+    checkout = lease.get("health_checkout")
+    health = pp.run_health(config, config_path=config_path,
+                          **({"working_dir": checkout} if checkout is not None else {}))
     check_config()  # run_health may fast-forward and reload the project config
     validate_lease(lease, stage)  # scan time counts toward expiry
     pp.ensure_identity(gh, config)

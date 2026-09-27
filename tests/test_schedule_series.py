@@ -220,6 +220,70 @@ def test_manual_pipeline_pause_keeps_hidden_successor_without_repeated_blocker(
     assert series["next_task_id"] != occurrence.id
 
 
+def test_pipeline_paraphrased_human_handoff_for_same_target_pauses(
+        isolated_db, monkeypatch):
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": PIPELINE_PROFILE})
+    created = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - MERGE", recurrence="10m"))
+    _complete_and_recur(
+        isolated_db, created.series_id, "НУЖЕН ЧЕЛОВЕК",
+        "ИТОГ: НУЖЕН ЧЕЛОВЕК (#1505 — недействительное доказательство "
+        "review исходного HEAD)",
+    )
+    _complete_and_recur(
+        isolated_db, created.series_id, "НУЖЕН ЧЕЛОВЕК",
+        "ИТОГ: НУЖЕН ЧЕЛОВЕК (#1505 — исходный proof base-sync не "
+        "совпадает с эпохой после pp:review-again)",
+    )
+    series = isolated_db.get_series(created.series_id)
+    assert series["paused"] is True
+    assert series["next_task_id"] is None
+    assert series["runs"] == 2
+    assert "pp:review-again" in series["auto_pause_reason"]
+
+
+def test_pipeline_ambiguous_human_handoffs_remain_text_sensitive():
+    from promptpilot import db
+
+    first = db._pipeline_blocker_fingerprint(
+        "НУЖЕН ЧЕЛОВЕК", "ИТОГ: НУЖЕН ЧЕЛОВЕК (#1505 и #1506: proof)")
+    second = db._pipeline_blocker_fingerprint(
+        "НУЖЕН ЧЕЛОВЕК", "ИТОГ: НУЖЕН ЧЕЛОВЕК (#1505 и #1506: conflict)")
+    assert first != second
+
+
+def test_pipeline_explicit_multi_target_handoff_pauses_despite_order_and_prose(
+        isolated_db, monkeypatch):
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": PIPELINE_PROFILE})
+    created = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="15m"))
+    _complete_and_recur(isolated_db, created.series_id, "НУЖЕН ЧЕЛОВЕК",
+                        "ИТОГ: НУЖЕН ЧЕЛОВЕК (#1683 — recovery-гейт закрыт; "
+                        "#1670 — повреждён маршрут)")
+    _complete_and_recur(isolated_db, created.series_id, "НУЖЕН ЧЕЛОВЕК",
+                        "ИТОГ: НУЖЕН ЧЕЛОВЕК (#1670 — пустой events-watermark; "
+                        "#1683 — незавершённый маршрут)")
+    series = isolated_db.get_series(created.series_id)
+    assert series["paused"] is True
+    assert series["next_task_id"] is None
+    assert "#1683" in series["auto_pause_reason"]
+
+
+def test_pipeline_multi_target_handoff_does_not_pause_changed_target_set(
+        isolated_db, monkeypatch):
+    monkeypatch.setattr(
+        pipeline_insights, "_profiles", lambda: {"example": PIPELINE_PROFILE})
+    created = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - REVIEW", recurrence="15m"))
+    _complete_and_recur(isolated_db, created.series_id, "НУЖЕН ЧЕЛОВЕК",
+                        "ИТОГ: НУЖЕН ЧЕЛОВЕК (#1683 — recovery; #1670 — record)")
+    _complete_and_recur(isolated_db, created.series_id, "НУЖЕН ЧЕЛОВЕК",
+                        "ИТОГ: НУЖЕН ЧЕЛОВЕК (#1683 — recovery; #1734 — решение)")
+    assert isolated_db.get_series(created.series_id)["paused"] is False
+
+
 def test_pipeline_repeat_guard_keeps_different_blockers_separate(
         isolated_db, monkeypatch):
     monkeypatch.setattr(

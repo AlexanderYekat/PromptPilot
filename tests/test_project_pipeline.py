@@ -47,6 +47,27 @@ def test_lease_round_trip_is_stable():
     assert pp.decode_lease(pp.encode_lease(value)) == value
 
 
+@pytest.mark.parametrize("states,expected", [
+    (["SUCCESS", "IN_PROGRESS"], True),
+    (["PENDING", "QUEUED"], True),
+    (["SUCCESS", "FAILURE"], False),
+    (["IN_PROGRESS", "FAILURE"], False),
+    (["SUCCESS", ""], False),
+    (["SUCCESS"], False),
+    ([], False),
+])
+def test_ci_wait_requires_complete_explicit_pending_set(states, expected):
+    checks = [{"name": name, "status": state}
+              for name, state in zip(["build", "lint"], states)]
+    assert pp.checks_in_progress({"required_checks": ["build", "lint"]}, checks) is expected
+
+
+def test_optional_pending_check_does_not_block_required_green_checks():
+    checks = [{"name": "build", "conclusion": "SUCCESS"},
+              {"name": "bench", "status": "IN_PROGRESS"}]
+    assert not pp.checks_in_progress({"required_checks": ["build"]}, checks)
+
+
 def test_epoch_uses_later_trusted_override_as_anchor():
     value = snapshot(
         trusted_comment("c2", 10, "pp:review-again"),

@@ -353,7 +353,7 @@ def queue_priority(item: dict, config: dict, now: datetime | None = None) -> int
     return base - boost
 
 
-def sync_base_before_health(config: dict) -> bool:
+def sync_base_before_health(config: dict, *, working_dir: str | None = None) -> bool:
     """Fast-forward a clean base checkout before running repository health.
 
     Repository-owned health tools are versioned with the project. Running one
@@ -374,6 +374,7 @@ def sync_base_before_health(config: dict) -> bool:
             result = subprocess.run(
                 command, capture_output=True, text=True,
                 encoding="utf-8", errors="replace", timeout=timeout,
+                **({"cwd": working_dir} if working_dir is not None else {}),
             )
         except subprocess.TimeoutExpired as exc:
             raise PipelineError(
@@ -405,11 +406,15 @@ def sync_base_before_health(config: dict) -> bool:
     return True
 
 
-def run_health(config: dict, *, config_path: str | None = None) -> dict:
+def run_health(config: dict, *, config_path: str | None = None,
+               working_dir: str | None = None) -> dict:
     synced_base = str(config.get("base_branch") or "main")
-    synchronized = sync_base_before_health(config)
+    synchronized = sync_base_before_health(config, working_dir=working_dir)
     if synchronized and config_path is not None:
-        refreshed = load_config(config_path)
+        source_path = (str(Path(working_dir) / config_path)
+                       if working_dir is not None and not Path(config_path).is_absolute()
+                       else config_path)
+        refreshed = load_config(source_path)
         refreshed_base = str(refreshed.get("base_branch") or "main")
         if refreshed_base != synced_base:
             raise PipelineError(
@@ -437,6 +442,7 @@ def run_health(config: dict, *, config_path: str | None = None) -> dict:
         result = subprocess.run(
             command, capture_output=True, text=True, encoding="utf-8",
             errors="strict", env=env, timeout=timeout,
+            **({"cwd": working_dir} if working_dir is not None else {}),
         )
     except subprocess.TimeoutExpired as exc:
         raise PipelineError(
@@ -1466,6 +1472,14 @@ def review_empty_reason(health: dict) -> str:
     return str(health.get("summary") or "содержательная очередь ревью пуста")
 
 
+def admission_exclusions() -> set[int]:
+    """Scheduler-owned opt-out only: never a proof or permission to mutate."""
+    raw = json.loads(os.environ.get("PP_PIPELINE_EXCLUDED_NUMBERS", "[]"))
+    if not isinstance(raw, list) or any(type(number) is not int or number <= 0 for number in raw):
+        raise PipelineError("invalid local target admission exclusions")
+    return set(raw)
+
+
 def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> dict:
     health = run_health(config, config_path=config_path)
     if config.get("fallback_handoff") == "target-v1":
@@ -1475,6 +1489,19 @@ def next_review(gh: GitHub, config: dict, *, config_path: str | None = None) -> 
     if health.get("state") == "red":
         return {"action": "fallback", "reason": "health check is red"}
     candidates = health.get("review_candidates") or []
+    excluded = admission_exclusions()
+    owner = health.get("integration_owner") or {}
+    if candidates and candidates[0].get("stage") != "review" and candidates[0].get("number") in excluded:
+        return {"action": "wait", "reason": "integration target awaits human resolution",
+                "number": candidates[0]["number"]}
+    # Ordinary content reviews are independent. Never skip an owner in order
+    # to begin the next integration target behind its single-flight barrier.
+    unavailable = {_target_key(item) for item in candidates
+                   if item.get("stage") == "review" and item.get("number") in excluded
+                   and item.get("number") != owner.get("number")}
+    if unavailable:
+        health = _review_health_without_targets(health, unavailable)
+        candidates = health.get("review_candidates") or []
     if not candidates:
         return {"action": "empty", "verdict": "ПУСТО", "reason": review_empty_reason(health)}
     item, reservation, election_health = _elect_review_candidate(
@@ -1746,6 +1773,25 @@ def checks_ready(config: dict, checks: list[dict]) -> tuple[bool, str]:
     return (not bad, "checks are green" if not bad else "checks not green: " + ", ".join(f"{k}={v}" for k, v in bad.items()))
 
 
+def checks_in_progress(config: dict, checks: list[dict]) -> bool:
+    """Only a complete, explicitly pending CI set permits token-free waiting.
+
+    Missing/unknown checks and terminal failures still need diagnosis. Optional
+    checks (such as bench) cannot hold a required-check queue indefinitely.
+    """
+    states = {(item.get("name") or item.get("context") or ""):
+              (item.get("conclusion") or item.get("state") or
+               item.get("status") or "").upper() for item in checks}
+    required = set(config.get("required_checks") or states)
+    pending = {"QUEUED", "IN_PROGRESS", "PENDING", "WAITING", "REQUESTED", "EXPECTED"}
+    if not required or not required <= states.keys():
+        return False
+    relevant = [states[name] for name in required]
+    return (any(state in pending for state in relevant)
+            and all(state in pending | {"SUCCESS", "NEUTRAL", "SKIPPED"}
+                    for state in relevant))
+
+
 def intent_body(head: str, established: dict, body: str, issues: list[int]) -> str:
     issues_value = ",".join(str(value) for value in issues) or "none"
     return (f"{MERGE_INTENT_MESSAGE}\n"
@@ -1896,6 +1942,16 @@ def _barrier_blocks_merge(health: dict, lease: dict) -> bool:
     """Whether a single-flight barrier forbids completing this merge lease."""
     barriers = [item for item in health.get("findings", [])
                 if item.get("code") == "single_flight_barrier"]
+    if lease.get("ready_owner"):
+        owner = health.get("integration_owner") or {}
+        return not (owner.get("number") == lease.get("number")
+                    and owner.get("head") == lease.get("head")
+                    and owner.get("stage") == lease.get("owner_stage")
+                    and any(item.get("number") == lease.get("number")
+                            and item.get("head") == lease.get("head")
+                            and item.get("stage") == lease.get("owner_stage")
+                            for item in health.get("merge_executable") or [])
+                    and all(item.get("pr") == lease.get("number") for item in barriers))
     if not barriers:
         return False
     # The base-sync owner merges through the owner lane itself (issue #42);
@@ -1904,22 +1960,91 @@ def _barrier_blocks_merge(health: dict, lease: dict) -> bool:
                 and all(item.get("pr") == lease.get("number") for item in barriers))
 
 
+def _ready_owner_action(gh: GitHub, config: dict, health: dict) -> dict | None:
+    """No branch update and no inferred carry: exact-HEAD ready owner only.
+
+    A fresh current-epoch trusted ship permits direct completion; historical
+    carry authorization still goes through the canonical full lineage gate.
+    """
+    from .fallback_handoff import validate_health
+    validate_health(health)
+    owner = health.get("integration_owner") or {}
+    if owner.get("stage") not in {"integration-merge-ready", "legacy-integration-merge-ready"}:
+        return None
+    if not any(item == owner for item in health.get("merge_executable") or []):
+        return None
+    number, head = int(owner["number"]), owner["head"]
+    snapshot = stable_timeline(gh, config, number)
+    validate_common(snapshot, config, owner)
+    if "ship" not in snapshot["labels"] or set(snapshot["labels"]) & {"hold", "needs-decision", "changes-requested"}:
+        return None
+    status, checks = pr_checks(gh, config, number)
+    if checks_in_progress(config, checks):
+        return {"action": "wait", "number": number, "reason": "required CI checks are still running"}
+    if status.get("mergeStateStatus") != "CLEAN" or status.get("mergeable") != "MERGEABLE":
+        return None
+    info = epoch(snapshot, config["trusted_account"])
+    validate_epoch_safety(info, config["trusted_account"])
+    established = proof(info, head, config["trusted_account"])
+    if (not established or established.get("outcome") != "reviewed"
+            or not trusted_ship_authorized(info, config["trusted_account"])
+            or not checks_ready(config, checks)[0]):
+        return None
+    lease = {"version": 1, "stage": "merge", "repository": config["repository"],
+             "number": number, "head": head, "snapshot": digest(snapshot),
+             "proof": established, "ready_owner": True, "owner_stage": owner["stage"]}
+    return {"action": "merge", "target": owner, "lease": encode_lease(lease)}
+
+
 def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> dict:
     pending = pending_merge_intents(gh, config)
     if pending:
-        return pending_merge_action(gh, config, pending[0])
+        action = pending_merge_action(gh, config, pending[0])
+        if action.get("action") == "merge" and config.get("ready_owner_merge") is True:
+            health = run_health(config, config_path=config_path)
+            owner = health.get("integration_owner") or {}
+            if owner.get("number") == pending[0].get("number") and health.get("state") != "red":
+                ready = _ready_owner_action(gh, config, health)
+                if ready and ready.get("action") == "merge":
+                    lease = decode_lease(ready["lease"])
+                    lease["intent"] = pending[0]
+                    ready["lease"] = encode_lease(lease)
+                    return ready
+        return action
     health = run_health(config, config_path=config_path)
     if config.get("fallback_handoff") == "target-v1":
         from .fallback_handoff import rest_only_review_owner, validate_health
 
         if rest_only_review_owner(health):
-            return {"action": "fallback",
-                    "reason": "single-flight/base-sync owner requires the full skill"}
+            owner = health["integration_owner"]
+            return {"action": "wait", "number": owner["number"],
+                    "reason": "single-flight owner is waiting for integration REVIEW"}
         validate_health(health)
     if health.get("state") == "red":
         return {"action": "fallback", "reason": "health check is red"}
     if any(item.get("code") == "single_flight_barrier" for item in health.get("findings", [])):
         owner = health.get("integration_owner")
+        if isinstance(owner, dict) and owner.get("number") in admission_exclusions():
+            return {"action": "wait", "reason": "single-flight owner awaits human resolution",
+                    "number": owner["number"]}
+        # A validated REVIEW owner is not executable by MERGE. Launching the
+        # full skill here only rediscovers the barrier and burns agent tokens.
+        # Never skip this owner or select another PR behind its barrier.
+        if (isinstance(owner, dict) and owner.get("stage") in {
+                "integration-review", "legacy-integration-review"}):
+            from .fallback_handoff import validate_health
+            try:
+                validate_health(dict(health, merge_executable=[])
+                                if health.get("merge_executable") is None else health)
+            except PipelineError:
+                return fallback_target(config, health, "merge", owner,
+                                       "incomplete integration REVIEW wait requires the full skill")
+            return {"action": "wait", "number": owner["number"],
+                    "reason": "single-flight owner is waiting for integration REVIEW"}
+        if config.get("ready_owner_merge") is True and isinstance(owner, dict) and owner.get("number"):
+            action = _ready_owner_action(gh, config, health)
+            if action is not None:
+                return action
         if config.get("base_sync_merge") and isinstance(owner, dict) and owner.get("number"):
             action = _base_sync_owner_action(gh, config, owner)
             if action is not None:
@@ -1927,6 +2052,8 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
         return fallback_target(config, health, "merge", health.get("integration_owner"),
                                "single-flight/base-sync owner requires the full skill")
     queue = list_ship(gh, config)
+    excluded = admission_exclusions()
+    queue = [item for item in queue if item.get("number") not in excluded]
     if not queue:
         return {"action": "empty", "verdict": "ПУСТО", "reason": "merge queue is empty"}
     item = queue[0]
@@ -1944,12 +2071,15 @@ def next_merge(gh: GitHub, config: dict, *, config_path: str | None = None) -> d
         return fallback_target(config, health, "merge", target,
                                "ship authorization is not a trusted current-HEAD event")
     status, checks = pr_checks(gh, config, item["number"])
+    if checks_in_progress(config, checks):
+        return {"action": "wait", "number": item["number"],
+                "reason": "required CI checks are still running"}
     if status.get("mergeStateStatus") != "CLEAN" or status.get("mergeable") != "MERGEABLE":
         return fallback_target(config, health, "merge", target,
                                f"merge state {status.get('mergeStateStatus')}/{status.get('mergeable')} requires the full skill")
     ready, reason = checks_ready(config, checks)
     if not ready:
-        return {"action": "wait", "reason": reason, "number": item["number"]}
+        return fallback_target(config, health, "merge", target, reason)
     lease = {"version": 1, "stage": "merge", "repository": config["repository"],
              "number": item["number"], "head": snapshot["headRefOid"],
              "snapshot": digest(snapshot), "proof": established}
@@ -1967,6 +2097,9 @@ def complete_merge(gh: GitHub, config: dict, lease_value: str,
     identity_contract = (config["repository"], config["trusted_account"])
     ensure_identity(gh, config)
     health = run_health(config, config_path=config_path)
+    if lease.get("ready_owner"):
+        from .fallback_handoff import validate_health
+        validate_health(health)
     if lease.get("stage") != "merge" or lease.get("repository") != config["repository"]:
         raise PipelineError("lease belongs to another stage or repository")
     if (config["repository"], config["trusted_account"]) != identity_contract:
@@ -2017,6 +2150,12 @@ def complete_merge(gh: GitHub, config: dict, lease_value: str,
         raise PipelineError("review proof changed after cleanup intent")
     if not trusted_ship_authorized(info, config["trusted_account"]):
         raise PipelineError("trusted ship changed after cleanup intent")
+    if lease.get("ready_owner"):
+        health = run_health(config, config_path=config_path)
+        from .fallback_handoff import validate_health
+        validate_health(health)
+        if health.get("state") == "red" or _barrier_blocks_merge(health, lease):
+            raise PipelineError("integration owner changed after cleanup intent")
     status, checks = pr_checks(gh, config, lease["number"])
     ready, reason = checks_ready(config, checks)
     if status.get("mergeStateStatus") != "CLEAN" or status.get("mergeable") != "MERGEABLE" or not ready:
@@ -2046,13 +2185,26 @@ def run(argv=None) -> int:
     next_parser.add_argument("stage", choices=("review", "merge"))
     gate_parser = sub.add_parser("gate-fallback")
     gate_parser.add_argument("stage", choices=("review", "merge"))
-    gate_parser.add_argument("--lease", required=True)
+    gate_lease = gate_parser.add_mutually_exclusive_group(required=True)
+    gate_lease.add_argument("--lease")
+    gate_lease.add_argument("--lease-file")
     complete_parser = sub.add_parser("complete")
     complete_parser.add_argument("stage", choices=("review", "merge", "merge-cleanup"))
-    complete_parser.add_argument("--lease", required=True)
+    complete_lease = complete_parser.add_mutually_exclusive_group(required=True)
+    complete_lease.add_argument("--lease")
+    complete_lease.add_argument("--lease-file")
     complete_parser.add_argument("--report")
     args = parser.parse_args(argv)
     try:
+        if getattr(args, "lease_file", None):
+            path = Path(args.lease_file)
+            if not path.is_absolute():
+                raise PipelineError("lease file must be an absolute path")
+            if path.stat().st_size > 131072:
+                raise PipelineError("lease file is too large")
+            args.lease = path.read_text(encoding="ascii").strip()
+            if not args.lease:
+                raise PipelineError("lease file is empty")
         config = load_config(args.config)
         if args.command == "capabilities":
             value = capabilities(config)

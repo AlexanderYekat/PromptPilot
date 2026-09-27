@@ -2144,9 +2144,27 @@ def _pipeline_blocker_details(
             or normalized in _PIPELINE_GENERIC_BLOCKER_REASONS
             or not any(character.isalnum() for character in normalized)):
         return None
+    # Human-required is a terminal handoff, not a retryable execution error.
+    # Two consecutive handoffs for the same unambiguous target must stop even
+    # when the agent paraphrases the diagnosis (incident: OneBase PR #1505).
+    # Keep UNABLE text-sensitive and ambiguous/multi-target reports separate.
+    targets = set(re.findall(r"(?<![\w#])#([1-9][0-9]*)\b", display_reason))
+    identity = normalized
+    if kind == "human" and len(targets) == 1:
+        identity = "human-target:#" + next(iter(targets))
+    elif kind == "human" and len(targets) > 1:
+        # An explicit semicolon-separated list has a diagnosis for each exact
+        # target. Correlate its unordered target set, not paraphrased prose.
+        # Joint/ambiguous reports ("#1 and #2: ...") remain text-sensitive.
+        entries = display_reason.split(";")
+        named = [re.match(r"^\s*#([1-9][0-9]*)\s+[—–-]\s+\S", entry)
+                 for entry in entries]
+        if (len(entries) == len(targets) and all(named)
+                and {match.group(1) for match in named} == targets):
+            identity = "human-target-set:" + ",".join(sorted(targets, key=int))
     return {
         "fingerprint": hashlib.sha256(
-            f"{kind}\0{normalized}".encode("utf-8")).hexdigest(),
+            f"{kind}\0{identity}".encode("utf-8")).hexdigest(),
         "reason": display_reason[:1000],
     }
 
@@ -2188,6 +2206,10 @@ def _pause_pipeline_series_on_repeated_blocker(
         (current_task_id, series_id, series_id),
     ).fetchone()
     if not current or current["status"] != "completed":
+        return _continue_pipeline_recurrence()
+    from .pipeline_item_holds import record
+    if record(conn, series_id, current_task_id, current["verdict"], current["result"]):
+        # Measured item handoffs park the target, not unrelated future work.
         return _continue_pipeline_recurrence()
     current_details = _pipeline_blocker_details(
         current["verdict"], current["result"])
@@ -2479,6 +2501,8 @@ def series_action(series_id: int, action: str) -> bool:
                 (_pipeline_series_wake_intent_key(series_id),),
             )
         elif action == "resume":
+            conn.execute("DELETE FROM settings WHERE key = ?",
+                         (f"pipeline_item_holds:v1:{series_id}",))
             resumed = conn.execute(
                 """UPDATE task_series SET paused = 0, updated_at = ?
                    WHERE id = ? AND paused = 1 AND ended_at IS NULL""",
@@ -2504,6 +2528,8 @@ def series_action(series_id: int, action: str) -> bool:
             # the run started; Resume is the only way out of this state.
             if row["paused"] or row["ended_at"]:
                 return False
+            conn.execute("DELETE FROM settings WHERE key = ?",
+                         (f"pipeline_item_holds:v1:{series_id}",))
             cur = conn.execute(
                 """UPDATE tasks
                    SET scheduled_at = ?, next_run_at = NULL,
@@ -3022,7 +3048,8 @@ def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
              "unresolved_unable": 0, "unresolved_failed": 0,
              "recovered_unable": 0, "recovered_failed": 0,
              "tokens_known_runs": 0, "input_tokens": 0,
-             "output_tokens": 0, "total_tokens": 0}
+             "output_tokens": 0, "total_tokens": 0,
+             "cost_known_runs": 0, "total_cost_usd": 0.0}
     if not ids:
         return empty
     marks = ",".join("?" for _ in ids)
@@ -3046,6 +3073,11 @@ def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
             result["input_tokens"] += input_tokens
             result["output_tokens"] += output_tokens
             result["total_tokens"] += input_tokens + output_tokens
+        cost = re.search(
+            r"(?mi)^Cost:\s*\$(\d+(?:\.\d+)?)\s*$", output)
+        if cost:
+            result["cost_known_runs"] += 1
+            result["total_cost_usd"] += float(cost.group(1))
         reported_no_change = any(pattern in output.lower() for pattern in (
             "github не изменялся", "очередь оставлена без изменений",
             "ничего не влито", "изменений не выполнялось",
@@ -3088,6 +3120,7 @@ def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
     result["unresolved_failed"] = sum(item["failed"] for item in unresolved.values())
     result["recovered_unable"] = result["unable"] - result["unresolved_unable"]
     result["recovered_failed"] = result["failed"] - result["unresolved_failed"]
+    result["total_cost_usd"] = round(result["total_cost_usd"], 6)
     return result
 
 
@@ -3527,6 +3560,7 @@ def _wake_pipeline_github_budget_waiters(conn, scope: str) -> dict:
 def arm_pipeline_github_budget_waiter(
         scope: str, *, task_id: int, task_started_at,
         expected_revision: int | None = None,
+        yield_aged_baton_seconds: int = 0,
         now: Optional[float] = None) -> dict:
     """Persist a priority handoff before releasing the admission scan lease.
 
@@ -3552,22 +3586,36 @@ def arm_pipeline_github_budget_waiter(
     if not math.isfinite(current):
         raise ValueError("pipeline budget waiter time must be finite")
     wait_started_at = datetime.fromtimestamp(current, timezone.utc).isoformat()
+    yield_aged_baton_seconds = _pipeline_budget_starvation_timeout(yield_aged_baton_seconds)
     with _connect(immediate=True) as conn:
         revision = _pipeline_github_budget_revision(conn, scope)
+        previous = conn.execute(
+            "SELECT budget_wait_scope, budget_wait_started_at FROM tasks "
+            "WHERE id=? AND status='running' AND started_at=?", (task_id, attempt)).fetchone()
+        yielded = False
+        if (yield_aged_baton_seconds and previous is not None
+                and previous["budget_wait_scope"] == scope
+                and previous["budget_wait_started_at"]):
+            started = datetime.fromisoformat(previous["budget_wait_started_at"])
+            if started.tzinfo is None:
+                raise ValueError("pipeline budget waiter timestamp is invalid")
+            yielded = current - started.timestamp() >= yield_aged_baton_seconds
         cur = conn.execute(
             """UPDATE tasks
                SET budget_wait_started_at = CASE
                      WHEN budget_wait_scope = ?
                        AND budget_wait_started_at IS NOT NULL
+                       AND ? = 0
                      THEN budget_wait_started_at
                      ELSE ?
                    END,
                    budget_wait_scope = ?
                WHERE id = ? AND status = 'running' AND started_at = ?""",
-            (scope, wait_started_at, scope, task_id, attempt),
+            (scope, int(yielded), wait_started_at, scope, task_id, attempt),
         )
         return {
             "armed": cur.rowcount > 0,
+            **({"fairness_yielded": True} if yielded and cur.rowcount > 0 else {}),
             "revision": revision,
             "revision_changed": (
                 expected_revision is not None
