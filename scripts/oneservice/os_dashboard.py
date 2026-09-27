@@ -8,6 +8,7 @@
 """
 
 import json
+import re
 import sys
 import time
 from pathlib import Path
@@ -23,6 +24,9 @@ def collect(env: dict) -> list[dict]:
     issues = project_api(env, "/issues")
     items = []
     for issue in issues:
+        desc = issue.get("description") or ""
+        images = ["https://gitlab.icecorp.ru" + m
+                  for m in re.findall(r"!\[[^\]]*\]\((/uploads/[^)]+)\)", desc)]
         items.append({
             "iid": issue["iid"],
             "title": issue["title"],
@@ -32,7 +36,8 @@ def collect(env: dict) -> list[dict]:
                        or (issue.get("author") or {}).get("username") or "аноним"),
             "assignee": ((issue.get("assignee") or {}).get("username") or "—"),
             "web_url": issue.get("web_url", "#"),
-            "description": (issue.get("description") or "")[:500],
+            "description": desc[:500],
+            "images": images,
             "updated": issue.get("updated_at", "")[:16],
         })
     return items
@@ -135,11 +140,14 @@ TEMPLATE = """<!DOCTYPE html>
     const chips = [];
     (item.labels || []).forEach(x => chips.push('<span class="chip">' + esc(x) + "</span>"));
     chips.push('<span class="chip author">✍ ' + esc(item.author) + "</span>");
+    const imgs = (item.images || []).map(u =>
+      '<img src="' + u + '" style="max-width:100%;border-radius:8px;margin:4px 0;">').join("");
     const open = 'window.open("' + item.web_url + '","_blank")';
     return `<div class="card" onclick="${open.replace(/"/g, "&quot;")}">
       <div class="t"><a href="${item.web_url}" target="_blank" rel="noopener">#${item.iid}</a> ${esc(item.title)}</div>
       <div class="chips">${chips.join("")}</div>
       ${item.description ? '<div class="d">' + esc(item.description) + "</div>" : ""}
+      ${imgs}
     </div>`;
   }
   function render() {

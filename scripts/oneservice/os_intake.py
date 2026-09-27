@@ -371,12 +371,31 @@ def handle_update(env: dict, state: dict, update: dict) -> None:
     for key in ("photo", "document"):
         media = message.get(key)
         if media:
-            file_id = (media[-1]["file_id"] if key == "photo" else media["file_id"])
             try:
+                file_id = (media[-1]["file_id"] if key == "photo"
+                           else media["file_id"])
                 filename, blob = tg_download(token, file_id)
+                # Валидация: файл должен быть изображением или документом,
+                # а не HTML-страницей ошибки от TG сервера
+                if blob[:2] == b'\xff\xd8':
+                    kind = "JPEG"
+                elif blob[:4] == b'\x89PNG':
+                    kind = "PNG"
+                elif blob[:5] == b'<html' or blob[:5] == b'<!DOC':
+                    raise ValueError("TG вернул HTML вместо файла")
+                elif blob[:2] == b'PK':
+                    kind = "ZIP"
+                elif blob[:3] == b'GIF':
+                    kind = "GIF"
+                elif blob[:4] == b'%PDF':
+                    kind = "PDF"
+                else:
+                    kind = "неизвестный формат"
+                print(f"  вложение: {filename} ({kind}, {len(blob)}b)")
                 attachments.append(upload_file(env, filename, blob))
             except Exception as exc:
-                attachments.append(f"(файл не прикрепился: {exc})")
+                print(f"  !! вложение пропущено: {exc}")
+                continue
     if attachments:
         # Картинки — inline (сразу видны в issue), остальные файлы — ссылками.
         rendered = []

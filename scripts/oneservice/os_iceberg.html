@@ -55,7 +55,7 @@
 <body>
   <header>
     <h1>🏔 Айсберг задач oneservice</h1>
-    <p class="sub">над водой — готовое для пользователей, глубина — работа и бэклог · обновлено 2026-09-27 19:20</p>
+    <p class="sub">над водой — готовое для пользователей, глубина — работа и бэклог · обновлено 2026-09-27 22:21</p>
     <div class="switch">
       <button id="btnKanban" class="active" onclick="setView('kanban')">📋 Канбан</button>
       <button id="btnIce" onclick="setView('iceberg')">🏔 Айсберг</button>
@@ -78,7 +78,7 @@
   <footer>oneservice-cc_v2 · конвейер: целесообразность → триаж → фикс → ревью → мерж ·
     <a href="https://gitlab.icecorp.ru/1c/oneservice-cc_v2/-/issues">GitLab</a></footer>
 <script>
-  const FEED = {"updated": "2026-09-27 19:20", "items": [{"iid": 6, "title": "(без текста)", "state": "opened", "labels": ["подано"], "author": "os-intake-dev", "assignee": "—", "web_url": "https://gitlab.icecorp.ru/1c/oneservice-cc_v2/-/issues/6", "description": "**Автор:** ibrogim66 (TG чат 1114994337)\n**Канал:** Telegram\n**Дата:** 2026-09-27 19:01\n\n---\n\n\n\n**Вложения:**\n[file_0.jpg](/-/project/444/uploads/7b508e4416186870684fb89b450c42ba/upload-1790524885164575800-file_0.jpg)", "updated": "2026-09-27T16:01"}, {"iid": 5, "title": "Тест конвейера: файл-маркер PIPELINE-TEST.md", "state": "opened", "labels": ["в работе", "ревью"], "author": "os-intake-dev", "assignee": "project_444_bot_ff93f585ca3e733d64ac6c93032d4ada", "web_url": "https://gitlab.icecorp.ru/1c/oneservice-cc_v2/-/issues/5", "description": "Тестировщик: Иван (проверка конвейера).\n\nТЗ: добавьте в папку docs/ файл PIPELINE-TEST.md, в котором одна строка: «Этот файл создан конвейером автоматически».", "updated": "2026-09-27T15:17"}, {"iid": 4, "title": "ТестоваяЗадача", "state": "opened", "labels": ["подано"], "author": "os-intake-dev", "assignee": "—", "web_url": "https://gitlab.icecorp.ru/1c/oneservice-cc_v2/-/issues/4", "description": "**Автор:** ibrogim66 (TG чат 1114994337)\n**Канал:** Telegram\n**Дата:** 2026-09-27 02:52\n\n---\n\nТестоваяЗадача", "updated": "2026-09-26T23:52"}, {"iid": 3, "title": "Тест хранителя: выгрузка справочника контрагентов не работает", "state": "opened", "labels": ["отклонено"], "author": "os-intake-dev", "assignee": "—", "web_url": "https://gitlab.icecorp.ru/1c/oneservice-cc_v2/-/issues/3", "description": "Тестировщик: После обновления кнопка «Выгрузить в Excel» в справочнике Контрагенты ничего не делает. В журнале регистрации ошибок нет. Ожидаю файл выгрузки.", "updated": "2026-09-26T23:18"}, {"iid": 1, "title": "bot smoke test by path", "state": "closed", "labels": [], "author": "api", "assignee": "—", "web_url": "https://gitlab.icecorp.ru/1c/oneservice-cc_v2/-/issues/1", "description": "", "updated": "2026-09-26T22:12"}]};
+  const FEED = {"updated": "2026-09-27 22:21", "items": [{"iid": 8, "title": "Необходимо создать звездолёт", "state": "opened", "labels": ["подано"], "author": "os-intake-dev", "assignee": "—", "web_url": "https://gitlab.icecorp.ru/1c/oneservice-cc_v2/-/issues/8", "description": "**Автор:** ibrogim66 (TG чат 1114994337)\n**Канал:** Telegram\n**Дата:** 2026-09-27 21:45\n\n---\n\nНеобходимо создать звездолёт\n\n**Вложения:**\n![file_2.jpg](/-/project/444/uploads/40e6c053e8cbb7c68b6779d81a2fd374/upload-1790534750954032200-file_2.jpg)", "images": [], "updated": "2026-09-27T18:45"}, {"iid": 5, "title": "Тест конвейера: файл-маркер PIPELINE-TEST.md", "state": "opened", "labels": ["в работе", "ревью"], "author": "os-intake-dev", "assignee": "project_444_bot_ff93f585ca3e733d64ac6c93032d4ada", "web_url": "https://gitlab.icecorp.ru/1c/oneservice-cc_v2/-/issues/5", "description": "Тестировщик: Иван (проверка конвейера).\n\nТЗ: добавьте в папку docs/ файл PIPELINE-TEST.md, в котором одна строка: «Этот файл создан конвейером автоматически».", "images": [], "updated": "2026-09-27T15:17"}, {"iid": 3, "title": "Тест хранителя: выгрузка справочника контрагентов не работает", "state": "opened", "labels": ["отклонено"], "author": "os-intake-dev", "assignee": "—", "web_url": "https://gitlab.icecorp.ru/1c/oneservice-cc_v2/-/issues/3", "description": "Тестировщик: После обновления кнопка «Выгрузить в Excel» в справочнике Контрагенты ничего не делает. В журнале регистрации ошибок нет. Ожидаю файл выгрузки.", "images": [], "updated": "2026-09-26T23:18"}, {"iid": 1, "title": "bot smoke test by path", "state": "closed", "labels": [], "author": "api", "assignee": "—", "web_url": "https://gitlab.icecorp.ru/1c/oneservice-cc_v2/-/issues/1", "description": "", "images": [], "updated": "2026-09-26T22:12"}]};
   const esc = x => (x || "").replace(/</g, "&lt;");
   const STAGE_OF = item => {
     const l = item.labels || [];
@@ -95,11 +95,14 @@
     const chips = [];
     (item.labels || []).forEach(x => chips.push('<span class="chip">' + esc(x) + "</span>"));
     chips.push('<span class="chip author">✍ ' + esc(item.author) + "</span>");
+    const imgs = (item.images || []).map(u =>
+      '<img src="' + u + '" style="max-width:100%;border-radius:8px;margin:4px 0;">').join("");
     const open = 'window.open("' + item.web_url + '","_blank")';
     return `<div class="card" onclick="${open.replace(/"/g, "&quot;")}">
       <div class="t"><a href="${item.web_url}" target="_blank" rel="noopener">#${item.iid}</a> ${esc(item.title)}</div>
       <div class="chips">${chips.join("")}</div>
       ${item.description ? '<div class="d">' + esc(item.description) + "</div>" : ""}
+      ${imgs}
     </div>`;
   }
   function render() {
