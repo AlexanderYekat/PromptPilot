@@ -2340,10 +2340,12 @@ def dispatch_gate(task) -> dict | None:
                 return {**pressure, "profile_id": profile_id, "queue_id": queue_config["id"]}
             queue = next((item for item in data["queues"]
                           if item["id"] == queue_config["id"]), None)
-            from .pipeline_item_holds import prepare
+            from .pipeline_item_holds import complete_members, prepare
             exclusions = prepare(task, queue_config, data)
-            if exclusions and queue and queue.get("membership_complete") is True:
-                members = {item.get("number") for item in queue.get("items") or []}
+            admission_members = complete_members(queue)
+            if exclusions and admission_members is not None:
+                members = {item.get("number") for item in admission_members
+                           if isinstance(item, dict)}
                 if members and members.issubset(set(exclusions)):
                     return {"action": "defer", "defer_for": "30m",
                             "reason": "неизменные задачи ожидают решения: " + ", ".join(f"#{n}" for n in exclusions),
@@ -4667,6 +4669,7 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
                 "task_status": matching.get("next_status") if matching else None,
                 **projection,
                 "membership_complete": membership_complete, "age": age,
+                "admission_items": ordered_members,
                 "items": ordered_members[:priority_settings["max_items"]]
                 if priority_settings else [],
                 "execution": _execution_status(item, matching.get("working_dir") if matching else None),

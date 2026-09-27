@@ -1,5 +1,6 @@
 import copy
 from types import SimpleNamespace
+import pytest
 
 from promptpilot import pipeline_item_holds as holds, pipeline_insights, project_pipeline as pp
 from promptpilot.models import TaskCreate
@@ -58,3 +59,60 @@ def test_excluded_integration_owner_is_not_skipped(monkeypatch):
     result = pp.next_merge(object(), {})
     assert result["action"] == "wait"
     assert result["number"] == 7
+
+
+@pytest.mark.parametrize("priority_ui", [False, True])
+@pytest.mark.parametrize("held_number", [1, 2])
+def test_public_scan_holds_use_full_membership_not_display_limit(
+        isolated_db, monkeypatch, priority_ui, held_number):
+    queue = {"id": "triage", "title": "Triage", "query": "is:issue",
+             "series_contains": "Example - TRIAGE", "item_blockers": True,
+             "dispatch_gate": {"skip_when_empty": True}}
+    profile = {"title": "Example", "repository": "owner/example", "queues": [queue]}
+    if priority_ui:
+        profile["priority_control"] = {"max_items": 1}
+    monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"example": profile})
+    monkeypatch.setattr(pipeline_insights, "_run_profile_health_check", lambda *_: None)
+    members = [{"number": n, "key": f"issue:{n}", "kind": "issue",
+                "title": f"Task {n}", "labels": [],
+                "created_at": f"2026-09-{20 + n:02}T00:00:00Z",
+                "updated_at": "2026-09-27T12:00:00Z"} for n in [1, 2]]
+    monkeypatch.setattr(pipeline_insights, "_github_search", lambda *_: {
+        "count": 2, "items": members, "membership_complete": True})
+    task = isolated_db.create_task(TaskCreate(prompt="Example - TRIAGE", recurrence="15m"))
+    observed = pipeline_insights.analyze("example", isolated_db.list_series(), use_cache=False)
+    visible = observed["queues"][0]
+    assert [item["number"] for item in visible["items"]] == ([1] if priority_ui else [])
+    assert [item["number"] for item in visible["admission_items"]] == [1, 2]
+    assert pipeline_insights.dispatch_gate(task) is None
+    isolated_db.mark_completed(task.id, f"ИТОГ: НУЖЕН ЧЕЛОВЕК (#{held_number} — route needs decision)",
+                               verdict="НУЖЕН ЧЕЛОВЕК")
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(task.series_id, task.id)["suppress_recurrence"]
+    successor = SimpleNamespace(id=task.id + 1, series_id=task.series_id, prompt=task.prompt)
+    assert holds.prepare(successor, queue, observed) == [held_number]
+    # Cross-process readers must use the same full admission projection.
+    pipeline_insights._cache.clear()
+    assert pipeline_insights.dispatch_gate(successor) is None
+
+
+@pytest.mark.parametrize("partial, admission", [
+    (False, False), (False, True), (True, True),
+])
+def test_unproven_legacy_or_partial_membership_cannot_exclude_items(
+        isolated_db, partial, admission):
+    task = isolated_db.create_task(TaskCreate(prompt="Example - TRIAGE", recurrence="15m"))
+    queue = {"item_blockers": True}
+    data = snapshot(1)
+    assert holds.prepare(task, queue, data) == []
+    isolated_db.mark_completed(task.id, "ИТОГ: НУЖЕН ЧЕЛОВЕК (#1 — blocked)", verdict="НУЖЕН ЧЕЛОВЕК")
+    isolated_db.pause_pipeline_series_on_repeated_blocker(task.series_id, task.id)
+    successor = SimpleNamespace(id=task.id + 1, series_id=task.series_id)
+    if partial:
+        data["queues"][0]["membership_complete"] = False
+    if admission:
+        data["queues"][0]["admission_items"] = data["queues"][0]["items"]
+    if not partial:
+        # An incomplete diagnostic projection or a deduplicated multi-query
+        # search cannot prove that every active member is held.
+        data["queues"][0]["backlog"] = 2
+    assert holds.prepare(successor, queue, data) == []

@@ -12,13 +12,32 @@ BASELINE = "pipeline_item_baseline:v1:"
 TTL = 24 * 3600
 
 
+def complete_members(queue):
+    """Admission must use full membership, never the dashboard's short list."""
+    if not isinstance(queue, dict) or queue.get("membership_complete") is not True:
+        return None
+    backlog = queue.get("backlog")
+    if type(backlog) is not int or backlog < 0:
+        return None
+    members = queue.get("admission_items")
+    if isinstance(members, list) and len(members) == backlog:
+        return members
+    # Older compatible caches have no admission projection. Accept the display
+    # list only when its size proves it was not truncated; otherwise fall back
+    # to the project's fresh target election without exclusions.
+    members = queue.get("items")
+    if isinstance(members, list) and len(members) == backlog:
+        return members
+    return None
+
+
 def fingerprints(data):
     cache = data.get("cache") or {}
     if cache.get("complete") is not True or cache.get("stale") or cache.get("refresh_blocked"):
         return None
     items = {}
     for queue in data.get("queues") or []:
-        for item in queue.get("items") or []:
+        for item in complete_members(queue) or []:
             if not isinstance(item, dict) or not item.get("updated_at"):
                 continue
             number = item.get("number")
