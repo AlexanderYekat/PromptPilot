@@ -176,7 +176,12 @@ def health_gate(health: dict, stage: str, target: dict, *, election: bool) -> No
     actual = [identity(item) for item in candidates]
     if len({item["number"] for item in actual}) != len(actual):
         raise PipelineError("fallback allowlist contains duplicate PRs")
-    if expected not in actual or ((election or stage == "merge") and actual[0] != expected):
+    # Priority selects a new ordinary target once. An unrelated PR taking the
+    # first slot while the elected task is running does not invalidate its
+    # exact HEAD/ship/proof gates. Integration targets still own a single-flight
+    # lane and must remain the sole first candidate.
+    if expected not in actual or ((election or expected["stage"] in INTEGRATION_STAGES)
+                              and actual[0] != expected):
         raise PipelineError("fallback target no longer matches the exact executable candidate")
     if expected["stage"] in INTEGRATION_STAGES:
         if owner != expected or actual != [expected]:
