@@ -43,7 +43,7 @@ def test_public_next_merge_ready_owner_never_updates_or_infers_carry(monkeypatch
 
 
 def test_public_completion_refuses_changed_owner_before_any_write(monkeypatch):
-    lease = {"stage": "merge", "repository": "owner/repo", "number": 42,
+    lease = {"version": 1, "stage": "merge", "repository": "owner/repo", "number": 42,
              "head": HEAD, "ready_owner": True, "owner_stage": "integration-merge-ready"}
     changed = health()
     changed["integration_owner"]["head"] = "b" * 40
