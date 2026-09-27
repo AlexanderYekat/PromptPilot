@@ -2214,6 +2214,57 @@ def _window_metrics(snapshots: list[dict], current: dict, series_ids: list[int],
     }
 
 
+def _backpressure_gate(config: dict, data: dict) -> dict | None:
+    """Profile-owned intake throttle, never an authorization to mutate GitHub.
+
+    A complete cached snapshot is an admission hint, not a hard transactional
+    WIP bound. Rework/critical exceptions constrain the executor's selection;
+    they must not accidentally reopen admission for ordinary new work.
+    """
+    policy = config.get("backpressure")
+    if not isinstance(policy, dict):
+        return None
+    limit = policy.get("max_active")
+    if type(limit) is not int or limit < 1:
+        raise ValueError("backpressure.max_active must be a positive integer")
+    diagnostics = data.get("diagnostics") or {}
+    fields = policy.get("active_fields", [])
+    candidate_field = policy.get("candidate_field")
+    if (not fields or any(not isinstance(diagnostics.get(field), list) for field in fields)
+            or not isinstance(diagnostics.get(candidate_field), list)):
+        return {"action": "defer", "defer_for": config.get("defer_for", "10m"),
+                "reason": "WIP: нет полного снимка активной очереди"}
+    active = {item["number"] for field in fields for item in diagnostics[field]
+              if isinstance(item, dict) and type(item.get("number")) is int
+              and item.get("head")}
+    if len(active) < limit:
+        return None
+    allowed = []
+    for item in diagnostics[candidate_field]:
+        if not isinstance(item, dict) or type(item.get("number")) is not int:
+            continue
+        if any(isinstance(rule, dict) and rule.get("key") in item
+               and item[rule["key"]] in rule.get("values", [])
+               for rule in policy.get("allow_when_match", [])):
+            allowed.append(item)
+    reason = f"WIP: активных PR {len(active)}, порог новых задач {limit}"
+    if not allowed:
+        return {"action": "defer", "defer_for": config.get("defer_for", "10m"),
+                "reason": reason + "; сначала завершить уже начатое"}
+    targets = ", ".join(str(item["number"]) for item in allowed)
+    return {
+        "action": "restrict_prompt", "reason": reason,
+        "prompt_constraint": (
+            "Операторское ограничение приёма новых задач (не разрешение на изменения): "
+            + reason + ". В этом запуске выбирай только номера " + targets
+            + ". Остальные новые задачи не начинай. Снимок — только подсказка выбора: "
+            "заново проверь актуальное состояние и все канонические гейты выбранной "
+            "задачи. Если эти кандидаты больше не допустимы, закончи без изменений; "
+            "не переключайся на другую обычную задачу."),
+        "allowed_numbers": sorted({item["number"] for item in allowed}),
+    }
+
+
 def dispatch_gate(task) -> dict | None:
     """Evaluate an optional user-owned, token-free gate for a series task.
 
@@ -2235,12 +2286,29 @@ def dispatch_gate(task) -> dict | None:
             # spend hundreds of GitHub requests on the same queue state.
             data = read_cached(profile_id, db.list_series())
             cache = data.get("cache") or {}
+            if (isinstance(config.get("backpressure"), dict)
+                    and (cache.get("stale") or not cache.get("complete"))):
+                # Intake cannot rely on stale state indefinitely. Refresh via
+                # the existing shared scan lease/budget and cache, never via an
+                # agent or an unbudgeted direct GitHub request.
+                data = analyze(profile_id, db.list_series(), use_cache=True,
+                               refresh_diagnostics=True)
+                cache = data.get("cache") or {}
             # A stale/partial empty snapshot must never complete a live stage as
             # empty, and stale diagnostics must not defer it. The project-owned
             # preflight remains the authoritative fallback.
             if (cache.get("refresh_blocked") or cache.get("stale")
                     or not cache.get("complete")):
+                if isinstance(config.get("backpressure"), dict):
+                    return {
+                        "action": "defer", "defer_for": config.get("defer_for", "10m"),
+                        "reason": "WIP: свежий полный снимок недоступен; приём новых задач отложен",
+                        "profile_id": profile_id, "queue_id": queue_config["id"],
+                    }
                 return None
+            pressure = _backpressure_gate(config, data)
+            if pressure:
+                return {**pressure, "profile_id": profile_id, "queue_id": queue_config["id"]}
             queue = next((item for item in data["queues"]
                           if item["id"] == queue_config["id"]), None)
             if config.get("skip_when_empty") and queue and queue["backlog"] == 0:

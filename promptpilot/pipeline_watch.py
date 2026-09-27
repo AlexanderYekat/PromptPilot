@@ -22,15 +22,22 @@ def read_api(base, path):
         return json.load(response)
 
 
+def timestamp(value):
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+
+
 def summarize(tasks, series, started_at, now):
     completed = [t for t in tasks if t.get("completed_at")
-                 and t["completed_at"] >= started_at]
+                 and timestamp(started_at) <= timestamp(t["completed_at"]) <= timestamp(now)]
     usage = {"input": 0, "cached_input": 0, "uncached_input": 0, "output": 0}
+    model_runs = 0
     for task in completed:
         result = task.get("result") or ""
         tokens = re.search(r"Tokens: (\d+) in / (\d+) out", result)
         cached = re.search(r"Cached input: (\d+)", result)
         if tokens:
+            model_runs += 1
             usage["input"] += int(tokens[1])
             usage["output"] += int(tokens[2])
         if cached:
@@ -38,11 +45,11 @@ def summarize(tasks, series, started_at, now):
     usage["uncached_input"] = usage["input"] - usage["cached_input"]
     alerts = []
     running = []
-    now_dt = datetime.fromisoformat(now)
+    now_dt = timestamp(now)
     for task in tasks:
         if task.get("status") != "running" or not task.get("started_at"):
             continue
-        age = (now_dt - datetime.fromisoformat(task["started_at"])).total_seconds()
+        age = (now_dt - timestamp(task["started_at"])).total_seconds()
         running.append({"id": task["id"], "series_id": task.get("series_id"),
                         "age_minutes": round(age / 60, 1)})
         timeout = task.get("task_timeout") or 3600
@@ -54,9 +61,65 @@ def summarize(tasks, series, started_at, now):
     return {
         "completed_runs": len(completed),
         "productive_runs": sum(t.get("verdict") == "ГОТОВО" for t in completed),
+        "reported_done_runs": sum(t.get("verdict") == "ГОТОВО" for t in completed),
+        "model_runs_with_usage": model_runs,
+        "runs_without_usage": len(completed) - model_runs,
         "human_handoffs": sum(t.get("verdict") == "НУЖЕН ЧЕЛОВЕК" for t in completed),
         "empty_runs": sum(t.get("verdict") == "ПУСТО" for t in completed),
         "completed_run_tokens": usage, "running": running, "alerts": alerts,
+    }
+
+
+def read_merges(gh, repository, started):
+    """Read every closed-PR page updated in the observation window.
+
+    A full first page is not evidence of complete coverage. Stop only after a
+    short page or crossing the window boundary in GitHub's updated ordering.
+    """
+    merges = {}
+    page = 1
+    while True:
+        result = subprocess.run([
+            gh, "api", f"repos/{repository}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}",
+        ], capture_output=True, text=True, encoding="utf-8", timeout=45)
+        if result.returncode:
+            raise RuntimeError(result.stderr.strip()[:400])
+        rows = json.loads(result.stdout)
+        if not isinstance(rows, list):
+            raise ValueError("GitHub pull response is not a list")
+        for pr in rows:
+            if pr.get("merged_at") and timestamp(pr["merged_at"]) >= timestamp(started):
+                merges[pr["number"]] = {
+                    "number": pr["number"], "merged_at": pr["merged_at"],
+                    "title": pr.get("title"), "url": pr.get("html_url"),
+                    "labels": [label["name"] for label in pr.get("labels", [])],
+                }
+        if (len(rows) < 100 or any(pr.get("updated_at")
+                and timestamp(pr["updated_at"]) < timestamp(started) for pr in rows)):
+            return merges
+        page += 1
+        if page > 100:
+            raise RuntimeError("GitHub observation exceeds 100 pages; coverage incomplete")
+
+
+def delivery_metrics(report, merges, github_current):
+    """Ratios describe the observed window, not causality, money or quota."""
+    count = len(merges)
+    usage = report.get("completed_run_tokens") or {}
+    return {
+        "confirmed_merges": count,
+        "github_current": github_current,
+        "reported_done_is_delivery": False,
+        "completed_runs_per_merge": (
+            round(report.get("completed_runs", 0) / count, 2)
+            if count and github_current else None),
+        "observed_uncached_input_per_merge": (
+            round(usage.get("uncached_input", 0) / count)
+            if count and github_current else None),
+        "observed_output_per_merge": (
+            round(usage.get("output", 0) / count)
+            if count and github_current else None),
+        "note": "Usage covers completed runs with token logs only; not a price, quota or per-PR attribution.",
     }
 
 
@@ -78,6 +141,7 @@ def main(argv=None):
     seen = {}
     merges = {}
     next_github_read = 0
+    github_current = False
     report = {"started_at": started, "repository": args.repository,
               "planned_seconds": args.duration, "read_only": True}
     args.report.parent.mkdir(parents=True, exist_ok=True)
@@ -85,7 +149,7 @@ def main(argv=None):
         now = utcnow()
         errors = []
         try:
-            tasks = read_api(args.url, "/api/tasks?limit=100")
+            tasks = read_api(args.url, "/api/tasks?limit=400")
             # Avoid reading the worker's real DB or executing project health.
             tasks = [t for t in tasks if (t.get("series_title") or "").lower().startswith(project_prefix)]
             seen.update({t["id"]: t for t in tasks})
@@ -95,23 +159,19 @@ def main(argv=None):
             report["worker"] = read_api(args.url, "/api/worker/status")
         except Exception as exc:
             errors.append(f"API read failed: {exc}")
-        if time.monotonic() >= next_github_read:
+        if time.monotonic() >= next_github_read or time.monotonic() >= deadline:
             try:
-                result = subprocess.run([
-                    args.gh, "api", f"repos/{args.repository}/pulls?state=closed&sort=updated&direction=desc&per_page=50",
-                ], capture_output=True, text=True, encoding="utf-8", timeout=45)
-                if result.returncode:
-                    raise RuntimeError(result.stderr.strip()[:400])
-                for pr in json.loads(result.stdout):
-                    if pr.get("merged_at") and pr["merged_at"] >= started:
-                        merges[pr["number"]] = {"number": pr["number"], "merged_at": pr["merged_at"]}
+                merges.update(read_merges(args.gh, args.repository, started))
+                github_current = True
                 report["github_checked_at"] = now
             except Exception as exc:
+                github_current = False
                 errors.append(f"GitHub read failed: {exc}")
             next_github_read = time.monotonic() + 600
         finished = time.monotonic() >= deadline
         report.update(last_updated_at=now, finished=finished,
-                      confirmed_merges=list(merges.values()), read_errors=errors)
+                      confirmed_merges=list(merges.values()), read_errors=errors,
+                      delivery=delivery_metrics(report, merges, github_current))
         temporary = args.report.with_suffix(args.report.suffix + ".tmp")
         temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(args.report)
