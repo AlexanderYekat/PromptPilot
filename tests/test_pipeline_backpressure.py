@@ -69,6 +69,28 @@ def test_missing_diagnostic_is_not_zero_wip(admission):
     assert pi.dispatch_gate(task)["action"] == "defer"
 
 
+def test_expired_cache_requests_real_budgeted_refresh(admission, monkeypatch):
+    task, data = admission
+    data["cache"]["stale"] = True
+    captured = {}
+    def analyze(*args, **kwargs):
+        captured.update(kwargs)
+        data["cache"]["stale"] = False
+        return data
+    monkeypatch.setattr(pi, "analyze", analyze)
+    assert pi.dispatch_gate(task)["action"] == "defer"
+    assert captured == {"use_cache": False, "refresh_diagnostics": True}
+
+
+def test_refresh_exception_still_defers_without_agent(admission, monkeypatch):
+    task, data = admission
+    data["cache"]["stale"] = True
+    def analyze(*args, **kwargs):
+        raise RuntimeError("network unavailable")
+    monkeypatch.setattr(pi, "analyze", analyze)
+    assert pi.dispatch_gate(task)["action"] == "defer"
+
+
 def test_worker_passes_exception_scope_to_real_provider_boundary(admission, monkeypatch):
     from promptpilot import worker
     task, data = admission

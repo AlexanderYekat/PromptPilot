@@ -2291,8 +2291,15 @@ def dispatch_gate(task) -> dict | None:
                 # Intake cannot rely on stale state indefinitely. Refresh via
                 # the existing shared scan lease/budget and cache, never via an
                 # agent or an unbudgeted direct GitHub request.
-                data = analyze(profile_id, db.list_series(), use_cache=True,
-                               refresh_diagnostics=True)
+                try:
+                    data = analyze(profile_id, db.list_series(), use_cache=False,
+                                   refresh_diagnostics=True)
+                except Exception:
+                    return {
+                        "action": "defer", "defer_for": config.get("defer_for", "10m"),
+                        "reason": "WIP: обновление снимка не удалось; новые задачи отложены",
+                        "profile_id": profile_id, "queue_id": queue_config["id"],
+                    }
                 cache = data.get("cache") or {}
             # A stale/partial empty snapshot must never complete a live stage as
             # empty, and stale diagnostics must not defer it. The project-owned

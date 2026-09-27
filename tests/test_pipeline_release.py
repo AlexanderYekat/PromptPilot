@@ -52,6 +52,9 @@ def test_configuration_preserves_other_profiles_gates_and_budget():
         assert cfg[key] == old_config[key]
     assert result["profiles"]["onebase"]["queues"][2]["execution"]["direct_complete"] is True
     assert result["profiles"]["onebase"]["queues"][2]["execution"]["command"] == ["/r/pp", "pipelinectl", "next", "merge"]
+    updated, _ = configure(result, cfg, PurePosixPath("/next/pp"), PurePosixPath("/next/health"),
+                           PurePosixPath("/next/procedures"), "next")
+    assert updated["profiles"]["onebase"]["queues"][2]["execution"]["command"][0] == "/next/pp"
 
 
 def test_manifest_detects_changed_artifact_before_install(tmp_path):

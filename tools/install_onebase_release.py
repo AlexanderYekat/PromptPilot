@@ -91,6 +91,8 @@ def configure(profiles, config, binary, health, procedures, release_id):
                 command = execution[key]
                 if command[:3] == ["{python}", "-m", "promptpilot.project_pipeline"]:
                     execution[key] = [str(binary), "pipelinectl", *command[3:]]
+                elif len(command) > 1 and command[1] == "pipelinectl":
+                    execution[key] = [str(binary), *command[1:]]
     profile["release_id"] = release_id
     return profiles, config
 
