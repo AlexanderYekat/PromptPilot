@@ -318,6 +318,12 @@ def do_merge(env: dict, state: dict, iid: int) -> None:
     project_api(env, f"/issues/{iid}", "PUT", {"state_event": "close"})
     project_api(env, f"/issues/{iid}/notes", "POST", {
         "body": f"📦 Задача выполнена и влита в main (v-запись в CHANGELOG-TEAM)."})
+    # Автообновление дашборда и фида после мержа
+    try:
+        dash = Path(__file__).resolve().parent / "os_dashboard.py"
+        run_shell(f'"{sys.executable}" "{dash}"', cwd=Path(__file__).resolve().parent.parent)
+    except Exception as exc:
+        print(f"  !! dashboard refresh: {exc}", flush=True)
     notify_author(env, iid, w,
                   f"🎉 Твоя задача «{w.get('title', '')}» выполнена и влита "
                   f"в основную ветку. Спасибо за вклад!")
