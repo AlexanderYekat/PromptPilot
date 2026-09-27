@@ -153,9 +153,13 @@ def create_issue(env: dict, title: str, description: str,
 
 
 def upload_file(env: dict, filename: str, blob: bytes) -> str:
+    """Загрузить файл и вернуть markdown `![имя](относительный путь)`.
+
+    Относительный путь (url из ответа) — канонический для GitLab: в issue
+    он рендерится как картинка для залогиненных пользователей."""
     result = project_api(env, "/uploads", "POST", raw_file=(filename, blob))
-    mark = result.get("full_path") or result.get("url") or ""
-    return f"[{filename}]({mark})"
+    mark = result.get("url") or result.get("full_path") or ""
+    return f"![{filename}]({mark})"
 
 
 # --- почта ------------------------------------------------------------------
