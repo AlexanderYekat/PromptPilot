@@ -98,8 +98,14 @@ and paraphrasing do not restart the same expensive diagnosis. Multi-target
 lists must give a separate diagnosis for every `#N`, separated by semicolons;
 ambiguous joint reports remain text-sensitive. Existing single-target and
 execution-error behavior is unchanged. This is an admission pause, not a
-resolution of the blockers: after repair, explicitly resume the schedule.
-Other stages continue and no mutation authorization is inferred from prose.
+resolution of the blockers. The sampler resumes only a still-current automatic
+pause when a fresh complete snapshot proves new eligible TRIAGE/REVIEW work,
+when a stale-ship PR re-enters content REVIEW, or when exact GitHub reads prove
+all named targets closed. Closed-target reads are throttled to one check per
+ten minutes per paused series. An explicit operator pause clears the automatic
+recovery marker and always requires manual Resume. Missing/partial snapshots,
+unknown targets and still-open blockers do not resume. Other stages continue;
+none of these checks grants `ship`, review proof or mutation authority.
 
 ## Outcome and maintenance budget (#1545)
 

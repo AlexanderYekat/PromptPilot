@@ -2488,6 +2488,10 @@ def series_action(series_id: int, action: str) -> bool:
         if action == "pause":
             conn.execute("UPDATE task_series SET paused = 1, updated_at = ? WHERE id = ?",
                          (now, series_id))
+            # An explicit operator pause overrides an earlier automatic pause.
+            # A background repair must never resume it on the operator's behalf.
+            conn.execute("DELETE FROM settings WHERE key = ?",
+                         (_pipeline_repeat_blocker_pause_key(series_id),))
             conn.execute(
                 """UPDATE tasks
                    SET budget_wait_scope = NULL,
@@ -2582,6 +2586,51 @@ def series_action(series_id: int, action: str) -> bool:
             )
         else:
             return False
+        return True
+
+
+def resume_resolved_pipeline_blocker(series_id: int, task_id: int) -> bool:
+    """Resume only the still-current automatic pause, never an operator pause.
+
+    The caller supplies external proof that the blocker changed. The pause
+    record and series state are checked together under SQLite's write lock so
+    a manual pause or a newer blocker cannot be overwritten by a stale scan.
+    """
+    with _connect(immediate=True) as conn:
+        series = conn.execute(
+            "SELECT * FROM task_series WHERE id = ?", (series_id,),
+        ).fetchone()
+        if not series or not series["paused"] or series["ended_at"]:
+            return False
+        key = _pipeline_repeat_blocker_pause_key(series_id)
+        row = conn.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,),
+        ).fetchone()
+        if not row:
+            return False
+        try:
+            pause = json.loads(row["value"])
+        except (TypeError, ValueError):
+            return False
+        if (not isinstance(pause, dict)
+                or pause.get("kind") != "repeated_blocker"
+                or pause.get("current_task_id") != task_id):
+            return False
+        now = _now()
+        conn.execute(
+            "UPDATE task_series SET paused = 0, updated_at = ? WHERE id = ?",
+            (now, series_id),
+        )
+        conn.execute("DELETE FROM settings WHERE key = ?", (key,))
+        if conn.execute(
+                """SELECT 1 FROM tasks WHERE series_id = ?
+                   AND status IN ('pending', 'running', 'rate_limited')""",
+                (series_id,),
+        ).fetchone() is None:
+            if not _recreate_series_occurrence(
+                    conn, series_id, series, datetime.now(timezone.utc)):
+                raise RuntimeError(
+                    "automatic pipeline resume could not recreate its occurrence")
         return True
 
 
