@@ -125,6 +125,26 @@ def _atomic_write_json(path: "Path", data):
     os.replace(tmp, path)
 
 
+def _read_json_file(path: "Path"):
+    """Read a JSON config that _atomic_write_json wrote — or a human edited.
+
+    These files are written as UTF-8, but open() without an encoding decodes
+    with the Windows code page (cp1251): Cyrillic came back as mojibake, and a
+    byte such as 0x98 (the second byte of «И») raised a UnicodeDecodeError no
+    caller expected, so one custom provider took the API, worker and bot down.
+    utf-8-sig also accepts the BOM Notepad writes, and a file saved by hand in
+    the code page still reads. Anything unreadable raises ValueError —
+    JSONDecodeError and UnicodeDecodeError are both ValueErrors.
+    """
+    raw = path.read_bytes()
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        import locale
+        text = raw.decode(locale.getpreferredencoding(False))
+    return json.loads(text)
+
+
 # Database
 DB_DIR = Path(os.environ.get("PP_DATA_DIR", Path.home() / ".promptpilot"))
 DB_PATH = DB_DIR / "promptpilot.db"
@@ -314,18 +334,13 @@ def load_providers() -> dict:
     user_file = _providers_file()
     if user_file.exists():
         try:
-            # providers.json is written as UTF-8.  Do not use the Windows
-            # locale here (cp1251 on the supported desktop setup): otherwise
-            # human labels such as "🤖 МиниМакс" are returned to the UI as
-            # mojibake ("рџ¤– РњРёРЅРёРњР°РєСЃ").
-            with open(user_file, encoding="utf-8") as f:
-                custom = json.load(f)
+            custom = _read_json_file(user_file)
             for name, info in custom.items():
                 if name in providers:
                     providers[name] = {**providers[name], **info}
                 else:
                     providers[name] = info
-        except json.JSONDecodeError as e:
+        except ValueError as e:
             _warn_once("providers.json",
                        f"⚠ {user_file} не читается ({e}) — кастомные провайдеры игнорируются")
         except OSError:
@@ -353,8 +368,7 @@ def load_providers_detailed() -> dict:
     custom_names = set()
     if user_file.exists():
         try:
-            with open(user_file, encoding="utf-8") as f:
-                custom = json.load(f)
+            custom = _read_json_file(user_file)
             for name, info in custom.items():
                 custom_names.add(name)
                 entry = dict(info)
@@ -368,7 +382,7 @@ def load_providers_detailed() -> dict:
                     entry["_source"] = "providers.json"
                 entry["_source_path"] = str(user_file)
                 providers[name] = entry
-        except json.JSONDecodeError as e:
+        except ValueError as e:
             _warn_once("providers.json",
                        f"⚠ {user_file} не читается ({e}) — кастомные провайдеры игнорируются")
         except OSError:
@@ -381,9 +395,8 @@ def _load_custom_providers() -> dict:
     user_file = _providers_file()
     if user_file.exists():
         try:
-            with open(user_file, encoding="utf-8") as f:
-                return json.load(f)
-        except json.JSONDecodeError as e:
+            return _read_json_file(user_file)
+        except ValueError as e:
             _warn_once("providers.json",
                        f"⚠ {user_file} не читается ({e}) — кастомные провайдеры игнорируются")
         except OSError:
@@ -463,9 +476,8 @@ def load_machines() -> dict:
     f = _machines_file()
     if f.exists():
         try:
-            with open(f) as fp:
-                return json.load(fp)
-        except (json.JSONDecodeError, OSError):
+            return _read_json_file(f)
+        except (ValueError, OSError):
             pass
     return {}
 
@@ -582,9 +594,8 @@ def remove_provider(name: str) -> bool:
     if not user_file.exists():
         return False
     try:
-        with open(user_file, encoding="utf-8") as f:
-            custom = json.load(f)
-    except (json.JSONDecodeError, OSError):
+        custom = _read_json_file(user_file)
+    except (ValueError, OSError):
         return False
     if name not in custom:
         return False
