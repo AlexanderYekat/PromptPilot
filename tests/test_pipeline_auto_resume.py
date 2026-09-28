@@ -1,6 +1,7 @@
 """An automatic circuit breaker recovers only from externally proven change."""
 
 import json
+import time
 
 from promptpilot import pipeline_insights, worker
 from promptpilot.models import TaskCreate
@@ -45,7 +46,12 @@ def test_closed_blockers_resume_triage_once(isolated_db, monkeypatch):
         return {"number": number, "state": "closed"}
 
     monkeypatch.setattr(pipeline_insights, "_gh_api_json", read_target)
-    monkeypatch.setattr(pipeline_insights, "analyze", lambda *_a, **_kw: snapshot())
+    observed = snapshot()
+    observed["cache"]["token"] = {
+        "profile_hash": pipeline_insights._profile_fingerprint(profile),
+        "epoch": 1, "revision": 1, "generated_at": time.time(),
+    }
+    monkeypatch.setattr(pipeline_insights, "analyze", lambda *_a, **_kw: observed)
     assert pipeline_insights.sample_active_profiles([series]) == {
         "example": f"ok; resumed={series['id']}"}
     assert calls == ["repos/owner/example/issues/1670",

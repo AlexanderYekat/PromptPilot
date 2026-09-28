@@ -5656,7 +5656,10 @@ def sample_active_profiles(series: list[dict]) -> dict[str, str]:
             if current_profile is None:
                 outcomes[profile_id] = "profile removed"
                 continue
-            resumed = _resume_resolved_blockers(current_profile, data, series)
+            resumed = (_resume_resolved_blockers(current_profile, data, series)
+                       if _wake_cache_guard(
+                           profile_id, current_profile, data.get("cache") or {})
+                       else [])
             woken = _wake_ready_queues(
                 profile_id, current_profile, data, series)
             outcomes[profile_id] = (
