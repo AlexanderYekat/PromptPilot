@@ -2719,6 +2719,105 @@ def _wake_ready_queues(profile_id: str, profile: dict, data: dict,
     return woken
 
 
+_AUTO_RESUME_CHECK_PREFIX = "pipeline_auto_resume_check:v1:"
+_AUTO_RESUME_CHECK_SECONDS = 600
+
+
+def _resume_resolved_blockers(profile: dict, data: dict,
+                              series: list[dict]) -> list[int]:
+    """Recover an automatic pause only after fresh, narrow external proof.
+
+    A closed GitHub target cannot still need work from its old series. A new
+    eligible TRIAGE/REVIEW item may proceed independently of an old blocker.
+    REVIEW may also resume when a stale-ship target has re-entered the
+    content-review queue; this launches a review, never a merge or ship.
+    Unknown or still-open blockers without new work remain paused.
+    """
+    cache = data.get("cache") or {}
+    if (db.is_paused() or cache.get("complete") is not True
+            or cache.get("stale") or cache.get("refresh_blocked")):
+        return []
+    repository = profile.get("repository")
+    if not isinstance(repository, str) or not re.fullmatch(
+            r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+        return []
+    diagnostics = data.get("diagnostics") or {}
+    from .pipeline_item_holds import complete_members
+    reviewable = {
+        item.get("number") for item in
+        (diagnostics.get("content_review_candidates") or [])
+        if isinstance(item, dict) and type(item.get("number")) is int
+    }
+    resumed = []
+    for queue in profile.get("queues", []):
+        for item in _series_replicas_for_queue(queue, series):
+            reason = item.get("auto_pause_reason")
+            task_id = item.get("last_task_id")
+            series_id = item.get("id")
+            if (not item.get("paused") or not isinstance(reason, str)
+                    or type(task_id) is not int or type(series_id) is not int):
+                continue
+            numbers = {int(value) for value in re.findall(
+                r"(?<![\w#])#([1-9][0-9]*)\b", reason)}
+            if not 1 <= len(numbers) <= 3:
+                continue
+            review_ready = (
+                queue.get("id") == "review" and len(numbers) == 1
+                and "ship" in reason.casefold()
+                and next(iter(numbers)) in reviewable
+            )
+            new_work = False
+            if queue.get("id") in {"triage", "review"}:
+                try:
+                    baseline = json.loads(db.get_setting(
+                        f"pipeline_item_baseline:v1:{series_id}") or "{}")
+                except (TypeError, ValueError):
+                    baseline = {}
+                current_queue = next(
+                    (entry for entry in (data.get("queues") or [])
+                     if isinstance(entry, dict)
+                     and entry.get("id") == queue.get("id")), None)
+                members = complete_members(current_queue) if isinstance(
+                    current_queue, dict) else None
+                if (isinstance(baseline, dict)
+                        and baseline.get("task_id") == task_id
+                        and isinstance(baseline.get("states"), dict)
+                        and members is not None):
+                    new_work = any(
+                        isinstance(member, dict)
+                        and type(member.get("number")) is int
+                        and str(member["number"]) not in baseline["states"]
+                        for member in members)
+            if not review_ready and not new_work:
+                key = f"{_AUTO_RESUME_CHECK_PREFIX}{series_id}"
+                now = time.time()
+                try:
+                    previous = json.loads(db.get_setting(key) or "{}")
+                except (TypeError, ValueError):
+                    previous = {}
+                if (isinstance(previous, dict)
+                        and previous.get("task_id") == task_id
+                        and type(previous.get("at")) in (int, float)
+                        and 0 <= now - previous["at"] < _AUTO_RESUME_CHECK_SECONDS):
+                    continue
+                db.set_setting(key, json.dumps({"task_id": task_id, "at": now}))
+                try:
+                    closed = all(
+                        (target := _gh_api_json([
+                            f"repos/{repository}/issues/{number}"]))
+                        .get("number") == number
+                        and target.get("state") == "closed"
+                        for number in sorted(numbers)
+                    )
+                except Exception:
+                    continue
+                if not closed:
+                    continue
+            if db.resume_resolved_pipeline_blocker(series_id, task_id):
+                resumed.append(series_id)
+    return resumed
+
+
 def _wake_configured_successors(profile: dict, queue: dict,
                                 series: list[dict]) -> list[str] | None:
     """Wake explicit successors locally; None preserves legacy scan-based wake."""
@@ -3794,11 +3893,11 @@ def _health(backlog: int, windows: dict, broken_series: int, paused_series: int 
 def _profile_active(profile: dict, series: list[dict]) -> bool:
     if profile.get("always_sample"):
         return True
-    # Individually paused pipelines need no background samples. A global pause
-    # is enforced by sample_active_profiles() and analyze(), including profiles
-    # that opt into always_sample.
+    # Automatic pauses need fresh observations to recover when their external
+    # blocker disappears. Explicit operator pauses do not.
     titles = [item.get("title", "").lower() for item in series
-              if not item.get("ended") and not item.get("paused")]
+              if not item.get("ended") and (not item.get("paused")
+                  or item.get("auto_pause_reason"))]
     return any(queue.get("series_contains", "").lower() in title
                for queue in profile.get("queues", []) for title in titles
                if queue.get("series_contains"))
@@ -5557,9 +5656,17 @@ def sample_active_profiles(series: list[dict]) -> dict[str, str]:
             if current_profile is None:
                 outcomes[profile_id] = "profile removed"
                 continue
+            resumed = (_resume_resolved_blockers(current_profile, data, series)
+                       if _wake_cache_guard(
+                           profile_id, current_profile, data.get("cache") or {})
+                       else [])
             woken = _wake_ready_queues(
                 profile_id, current_profile, data, series)
-            outcomes[profile_id] = "ok" + (f"; woken={','.join(woken)}" if woken else "")
+            outcomes[profile_id] = (
+                "ok"
+                + (f"; resumed={','.join(map(str, resumed))}" if resumed else "")
+                + (f"; woken={','.join(woken)}" if woken else "")
+            )
         except Exception as exc:  # one external repository must not stop the sampler
             outcomes[profile_id] = str(exc)
     return outcomes
