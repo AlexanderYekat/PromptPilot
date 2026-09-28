@@ -566,7 +566,7 @@ def api_get_workflow(workflow_id: str):
 @app.patch("/api/workflows/{workflow_id}", response_model=WorkflowInDB)
 def api_update_workflow(workflow_id: str, update: WorkflowUpdate):
     try:
-        updated = db.update_workflow(workflow_id, update)
+        db.update_workflow(workflow_id, update)
         return workflows.advance_workflow(workflow_id)
     except db.WorkflowNotFoundError as exc:
         raise HTTPException(404, "Workflow not found") from exc
