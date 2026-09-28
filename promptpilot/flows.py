@@ -36,7 +36,7 @@ import subprocess
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated, Any, Literal, Optional, Union
+from typing import Annotated, Any, ClassVar, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -88,10 +88,13 @@ class _Model(BaseModel):
 class Condition(_Model):
     """True when steps.<step>.<field> is (with not_in: is not) one of the values.
 
-    A step that has not produced the field yet makes the condition false.
+    Instead of a step, ``input`` names a flag the input connector sets on the
+    request itself (e.g. ``sender_allowed`` of a letter). A value that is not
+    there yet makes the condition false.
     """
-    step: str
-    field: str
+    step: Optional[str] = None
+    field: Optional[str] = None
+    input: Optional[str] = None
     values: Optional[list[Any]] = Field(default=None, alias="in", min_length=1)
     not_values: Optional[list[Any]] = Field(default=None, alias="not_in", min_length=1)
 
@@ -99,33 +102,45 @@ class Condition(_Model):
     def _one_list(self):
         if (self.values is None) == (self.not_values is None):
             raise ValueError("условие задаётся ровно одним из in / not_in")
+        if (self.input is None) == (self.step is None) or (self.step and not self.field):
+            raise ValueError("условие — это step + field или input")
         return self
 
     def holds(self, data: dict) -> bool:
-        result = data.get("steps", {}).get(self.step) or {}
-        if self.field not in result:
+        if self.input is not None:
+            result, key = data.get("input") or {}, self.input
+        else:
+            result, key = data.get("steps", {}).get(self.step) or {}, self.field
+        if key not in result:
             return False
         if self.values is not None:
-            return result[self.field] in self.values
-        return result[self.field] not in self.not_values
+            return result[key] in self.values
+        return result[key] not in self.not_values
 
     def listed(self) -> list:
         return self.values if self.values is not None else self.not_values
 
 
 class FieldSpec(_Model):
-    """One field of an agent's answer: enum → exact value, integer → range, text → capped."""
+    """One field of an agent's answer: enum → exact value, integer → range, text → capped.
+
+    ``enum_dirs`` adds the names of the folders under a path (``{{flow.…}}``)
+    to the enum when the flow is loaded — a project catalogue that follows
+    the disk. ``dirs_depth: 2`` also lists ``group/project``.
+    """
     type: Literal["text", "integer", "enum"] = "text"
     values: Optional[list[str]] = Field(default=None, alias="enum")
+    enum_dirs: str = ""
+    dirs_depth: int = Field(default=1, ge=1, le=2)
     min: Optional[int] = None
     max: Optional[int] = None
     required: bool = True
 
     @model_validator(mode="after")
     def _enum_has_values(self):
-        if self.values:
+        if self.values or self.enum_dirs:
             self.type = "enum"
-        if self.type == "enum" and not self.values:
+        if self.type == "enum" and not self.values and not self.enum_dirs:
             raise ValueError("у поля enum должен быть список значений")
         return self
 
@@ -209,6 +224,9 @@ class CommandStep(_Step):
     kind: Literal["command"]
     run: list[str] = Field(min_length=1)
     cwd: str = ""
+    # Data for the program on its standard input — the one way text from
+    # outside may reach a command: as data, never as a part of the command line.
+    stdin: str = ""
     timeout: int = Field(default=600, ge=1, le=7200)
     ok_codes: list[int] = Field(default_factory=lambda: [0])
     require_output: str = ""
@@ -230,7 +248,48 @@ class FinishStep(_Step):
     notify: bool = False
 
 
-Step = Annotated[Union[AgentStep, HumanStep, PublishStep, CommandStep, FinishStep],
+class GitlabNewIssue(_Model):
+    title: str
+    description: str = ""
+    labels: str = ""
+
+
+class GitlabStep(_Step):
+    """Operations on a GitLab issue of the flow's project, in this order:
+    create, comment, labels (replace) / add_labels / remove_labels, assignee, state."""
+    kind: Literal["gitlab"]
+    issue: str = ""  # which issue; by default the item's own (a gitlab_issues input)
+    create: Optional[GitlabNewIssue] = None
+    comment: str = ""
+    labels: Optional[str] = None
+    add_labels: str = ""
+    remove_labels: str = ""
+    assignee_id: str = ""
+    state: Literal["", "close", "reopen"] = ""
+    on_error: Literal["human", "fail", "continue"] = "human"
+
+    @model_validator(mode="after")
+    def _does_something(self):
+        if not (self.create or self.comment or self.labels is not None or self.add_labels
+                or self.remove_labels or self.assignee_id or self.state):
+            raise ValueError("шаг gitlab ничего не делает")
+        return self
+
+
+class ReplyStep(_Step):
+    """A letter to the author of the request (an email input), in reply to it."""
+    kind: Literal["email_reply"]
+    text: str
+    text_override: str = ""  # e.g. "{{steps.reply_ok.note}}": the person's own wording wins
+    subject: str = "Re: {{input.subject}}"
+    smtp_host: str
+    smtp_port: int = 465
+    from_name: str = ""
+    on_error: Literal["human", "fail", "continue"] = "human"
+
+
+Step = Annotated[Union[AgentStep, HumanStep, PublishStep, CommandStep, FinishStep,
+                       GitlabStep, ReplyStep],
                  Field(discriminator="kind")]
 
 
@@ -246,10 +305,52 @@ class EmailInput(_Model):
     require_from_domain: str = ""
     dkim_authserv: str = ""
     allow_from: list[str] = Field(default_factory=list)
+    # reject: a letter from outside the list is not a request; mark: it is,
+    # and input.sender_allowed is false (a person decides later)
+    allow_from_mode: Literal["reject", "mark"] = "reject"
     author_pattern: str = ""
     generic_subjects: list[str] = Field(default_factory=list)
     body_limit: int = Field(default=5000, ge=100, le=50000)
+    save_attachments: bool = False
     every: int = Field(default=120, ge=30, le=86400)
+
+    # Request fields whose values the connector fixes (safe on a command line).
+    fixed_fields: ClassVar[tuple] = ("sender_allowed",)
+
+
+class GitlabInput(_Model):
+    """Open issues of the flow's GitLab project that carry the labels."""
+    type: Literal["gitlab_issues"]
+    labels: list[str] = Field(default_factory=list)
+    exclude_labels: list[str] = Field(default_factory=list)
+    body_limit: int = Field(default=20000, ge=100, le=200000)
+    every: int = Field(default=120, ge=30, le=86400)
+
+    fixed_fields: ClassVar[tuple] = ("iid",)
+
+
+Input = Annotated[Union[EmailInput, GitlabInput], Field(discriminator="type")]
+
+
+class GitlabConnection(_Model):
+    url: str = ""  # https://gitlab.example.com — or take it from url_env
+    url_env: str = ""
+    token_env: str
+    project: str  # numeric id or the URL-encoded path: group%2Fproject
+
+    @model_validator(mode="after")
+    def _has_url(self):
+        if not self.url and not self.url_env:
+            raise ValueError("у gitlab нужен url или url_env")
+        return self
+
+
+class Exclusive(_Model):
+    """At most ``max`` items at a time between these steps (both included) —
+    e.g. while they share one checkout or one test database."""
+    first: str
+    last: str
+    max: int = Field(default=1, ge=1, le=20)
 
 
 class Limits(_Model):
@@ -263,10 +364,12 @@ class FlowDef(_Model):
     description: str = ""
     trust: Literal["owner", "team", "client", "public"]
     vars: dict[str, str] = Field(default_factory=dict)
-    input: Optional[EmailInput] = None
+    input: Optional[Input] = None
+    gitlab: Optional[GitlabConnection] = None
+    exclusive: Optional[Exclusive] = None
     limits: Limits = Field(default_factory=Limits)
     notify_chat_ids: list[int] = Field(default_factory=list)
-    steps: list[Step] = Field(min_length=1, max_length=40)
+    steps: list[Step] = Field(min_length=1, max_length=80)
     source_dir: str = Field(default="", exclude=True)
 
     @model_validator(mode="after")
@@ -275,6 +378,7 @@ class FlowDef(_Model):
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) or key in _FLOW_BUILTINS:
                 raise ValueError(f"имя переменной «{key}» не подходит: латиница, цифры, _; "
                                  f"не {', '.join(_FLOW_BUILTINS)}")
+        expand_enum_dirs(self)
         check_flow(self)
         check_templates(self)
         return self
@@ -282,12 +386,15 @@ class FlowDef(_Model):
     def index_of(self, step_id: str) -> int:
         return next(index for index, step in enumerate(self.steps) if step.id == step_id)
 
+    def fixed_inputs(self) -> tuple:
+        return getattr(self.input, "fixed_fields", ()) if self.input else ()
+
 
 def _references(text: str) -> list[str]:
     return [match.group(1) for match in _PLACEHOLDER.finditer(text or "")]
 
 
-def reference_kind(reference: str, steps: dict) -> str:
+def reference_kind(reference: str, steps: dict, fixed_inputs: tuple = ()) -> str:
     """Where a template value comes from.
 
     ``fixed``   — from a known small set, or the owner's constants: safe on a
@@ -301,6 +408,8 @@ def reference_kind(reference: str, steps: dict) -> str:
         return "fixed"
     if head == "item":
         return "fixed" if rest in ("id", "created_at") else "outside"
+    if head == "input":
+        return "fixed" if rest in fixed_inputs else "outside"
     if head == "material":
         return "owner"
     if head == "steps":
@@ -313,12 +422,38 @@ def reference_kind(reference: str, steps: dict) -> str:
             return "fixed" if field in ("exit_code", "ok") else "outside"
         if isinstance(step, HumanStep):
             return "fixed" if field == "decision" else "owner"
+        if isinstance(step, GitlabStep):
+            return "fixed" if field == "iid" else "outside"
+        if isinstance(step, ReplyStep):
+            return "fixed" if field == "sent" else "outside"
     return "outside"
 
 
-def _check_condition(step, condition: Condition, known: dict) -> None:
-    target = known.get(condition.step)
+_FLOW_BUILTINS = ("name", "title", "dir", "attachments")
+_ITEM_FIELDS = ("id", "title", "author", "created_at")
+_STEP_FIELDS = {
+    "human": ("decision", "note", "by"),
+    "command": ("exit_code", "ok", "output"),
+    "publish": ("published",),
+    "gitlab": ("iid", "web_url"),
+    "email_reply": ("sent", "to"),
+}
+_INPUT_FIELDS = {
+    "email": ("message_id", "from", "reply_to", "subject", "title", "author", "body", "date",
+              "sender_allowed", "attachments"),
+    "gitlab_issues": ("iid", "title", "body", "author", "labels", "web_url", "created_at"),
+}
+
+
+def _check_condition(flow: FlowDef, step, condition: Condition, known: dict) -> None:
     where = f"шаг «{step.id}»: условие"
+    if condition.input is not None:
+        flags = flow.fixed_inputs()
+        if condition.input not in flags:
+            raise ValueError(f"{where}: у входа нет флага «{condition.input}» "
+                             f"(есть: {', '.join(flags) or 'никаких'})")
+        return
+    target = known.get(condition.step)
     if target is None:
         raise ValueError(f"{where} ссылается на «{condition.step}» — такого шага раньше нет")
     if isinstance(target, AgentStep):
@@ -336,8 +471,24 @@ def _check_condition(step, condition: Condition, known: dict) -> None:
         if condition.field not in ("exit_code", "ok") and not target.output_json:
             raise ValueError(f"{where}: у команды есть только exit_code и ok "
                              "(или поля её JSON при output_json)")
+    elif target.kind in ("gitlab", "email_reply"):
+        if condition.field not in _STEP_FIELDS[target.kind]:
+            raise ValueError(f"{where}: у шага «{target.id}» есть только "
+                             f"{', '.join(_STEP_FIELDS[target.kind])}")
     else:
         raise ValueError(f"{where}: шаг «{target.id}» ({target.kind}) ничего не возвращает")
+
+
+def _control_fields(step) -> list[str]:
+    """Templates that decide WHAT a step does or where: they take fixed values only."""
+    if isinstance(step, AgentStep):
+        return [step.working_dir]
+    if isinstance(step, CommandStep):
+        return [*step.run, step.cwd]
+    if isinstance(step, GitlabStep):
+        return [step.issue, step.labels or "", step.add_labels, step.remove_labels,
+                step.assignee_id, step.create.labels if step.create else ""]
+    return []
 
 
 def check_flow(flow: FlowDef) -> None:
@@ -346,17 +497,17 @@ def check_flow(flow: FlowDef) -> None:
     approved = False
     before, after = TRUST_LIMITS[flow.trust]
     outside_trusted = flow.trust == "owner"
+    fixed_inputs = flow.fixed_inputs()
     for step in flow.steps:
         if step.id in seen:
             raise ValueError(f"id шага «{step.id}» повторяется")
         if step.when:
-            _check_condition(step, step.when, seen)
+            _check_condition(flow, step, step.when, seen)
         if step.repeat:
             if step.repeat.back_to not in seen:
                 raise ValueError(f"шаг «{step.id}»: repeat.from «{step.repeat.back_to}» — "
                                  "такого шага раньше нет")
-            _check_condition(step, step.repeat.when, {**seen, step.id: step})
-        argv_parts: list[str] = []
+            _check_condition(flow, step, step.repeat.when, {**seen, step.id: step})
         if isinstance(step, AgentStep):
             if not outside_trusted and step.rights is None:
                 raise ValueError(f"шаг «{step.id}»: в маршруте с доверием {flow.trust} "
@@ -367,7 +518,6 @@ def check_flow(flow: FlowDef) -> None:
                     f"шаг «{step.id}»: права «{step.rights}» шире «{widest}» — предела для "
                     f"маршрута с доверием {flow.trust} "
                     f"{'после согласования человеком' if approved else 'до согласования человеком'}")
-            argv_parts.append(step.working_dir)
             for name, material in step.material.items():
                 for reference in _references(material.file or material.tree):
                     if not reference.startswith("flow.") and reference != "item.id":
@@ -375,37 +525,80 @@ def check_flow(flow: FlowDef) -> None:
                                          "ссылаться только на {{flow.…}} и {{item.id}}")
         if isinstance(step, HumanStep) and step.when is None and step.on_reject == "reject":
             approved = True
-        if isinstance(step, CommandStep):
-            argv_parts += [*step.run, step.cwd]
         if isinstance(step, PublishStep):
             for reference in _references(step.path):
                 if not reference.startswith("flow."):
                     raise ValueError(f"шаг «{step.id}»: путь публикации может ссылаться "
                                      "только на {{flow.…}}")
+        if isinstance(step, GitlabStep):
+            if flow.gitlab is None:
+                raise ValueError(f"шаг «{step.id}»: у маршрута не описан gitlab")
+            if not step.issue and not step.create and not isinstance(flow.input, GitlabInput):
+                raise ValueError(f"шаг «{step.id}»: какой issue? Укажите issue — вход "
+                                 "маршрута не gitlab_issues")
+        if isinstance(step, ReplyStep):
+            if not isinstance(flow.input, EmailInput):
+                raise ValueError(f"шаг «{step.id}»: отвечать письмом можно только на письмо "
+                                 "(вход email)")
+            if flow.trust in ("client", "public") and not approved:
+                raise ValueError(f"шаг «{step.id}»: письмо наружу в маршруте с доверием "
+                                 f"{flow.trust} — только после согласования человеком")
         if not outside_trusted:
-            for part in argv_parts:
+            for part in _control_fields(step):
                 for reference in _references(part):
-                    if reference_kind(reference, seen) != "fixed":
+                    if reference_kind(reference, seen, fixed_inputs) != "fixed":
                         raise ValueError(
                             f"шаг «{step.id}»: «{{{{{reference}}}}}» может нести текст извне в "
-                            "команду или путь — допустимы item.id, flow.* и поля с enum/integer")
+                            "команду, путь или действие — допустимы item.id, flow.* и поля "
+                            "с enum/integer")
         seen[step.id] = step
+    if flow.exclusive:
+        ids = [step.id for step in flow.steps]
+        for step_id in (flow.exclusive.first, flow.exclusive.last):
+            if step_id not in ids:
+                raise ValueError(f"exclusive: шага «{step_id}» нет")
+        if ids.index(flow.exclusive.first) > ids.index(flow.exclusive.last):
+            raise ValueError("exclusive: first должен быть не позже last")
 
 
-_FLOW_BUILTINS = ("name", "title", "dir")
-_ITEM_FIELDS = ("id", "title", "author", "created_at")
-_STEP_FIELDS = {
-    "human": ("decision", "note", "by"),
-    "command": ("exit_code", "ok", "output"),
-    "publish": ("published",),
-}
+def expand_enum_dirs(flow: FlowDef) -> None:
+    """enum_dirs: the enum gets the names of the folders the path has right now."""
+    context = {"flow": _flow_context(flow)}
+    for step in flow.steps:
+        for name, spec in getattr(step, "output", {}).items():
+            if not spec.enum_dirs:
+                continue
+            for reference in _references(spec.enum_dirs):
+                if not reference.startswith("flow."):
+                    raise ValueError(f"шаг «{step.id}»: enum_dirs может ссылаться только "
+                                     "на {{flow.…}}")
+            root = Path(render(spec.enum_dirs, context))
+            names = []
+            try:
+                for entry in sorted(root.iterdir()):
+                    if entry.is_dir() and not entry.name.startswith("."):
+                        names.append(entry.name)
+                        if spec.dirs_depth == 2:
+                            names += [f"{entry.name}/{child.name}" for child in sorted(entry.iterdir())
+                                      if child.is_dir() and not child.name.startswith(".")]
+            except OSError as exc:
+                raise ValueError(f"шаг «{step.id}»: поле «{name}»: папку {root} "
+                                 f"не прочитать: {exc}") from exc
+            spec.values = list(dict.fromkeys([*(spec.values or []), *names]))
+            if not spec.values:
+                raise ValueError(f"шаг «{step.id}»: поле «{name}»: в {root} нет папок")
 
 
 def _template_error(flow: FlowDef, step, reference: str) -> str | None:
     """Why a {{reference}} of this step can never have a value, or None."""
     head, _, rest = reference.partition(".")
     if head == "input":
-        return None if rest else "нужно поле: input.<поле>"
+        if not rest:
+            return "нужно поле: input.<поле>"
+        if flow.input is not None:
+            known = (*_INPUT_FIELDS[flow.input.type], "title", "body")
+            return None if rest in known else f"у входа {flow.input.type} нет поля «{rest}»"
+        return None
     if head == "item":
         return None if rest in _ITEM_FIELDS else f"у заявки есть только {', '.join(_ITEM_FIELDS)}"
     if head == "flow":
@@ -444,9 +637,14 @@ def _step_templates(flow: FlowDef, step) -> list[str]:
     if isinstance(step, HumanStep):
         return [step.text, *(f"{{{{{reference}}}}}" for reference in step.show)]
     if isinstance(step, CommandStep):
-        return [*step.run, step.cwd]
+        return [*step.run, step.cwd, step.stdin]
     if isinstance(step, PublishStep):
         return [step.path, *step.fields.values()]
+    if isinstance(step, GitlabStep):
+        created = [step.create.title, step.create.description] if step.create else []
+        return [*_control_fields(step), step.comment, *created]
+    if isinstance(step, ReplyStep):
+        return [step.text, step.subject, step.text_override]
     return [step.note]
 
 
@@ -640,7 +838,8 @@ def agent_prompt(flow: FlowDef, step: AgentStep, item: dict) -> str:
     frame, framed = None, []
     if flow.trust != "owner":
         steps = {candidate.id: candidate for candidate in flow.steps}
-        frame = lambda reference: reference_kind(reference, steps) == "outside"  # noqa: E731
+        fixed_inputs = flow.fixed_inputs()
+        frame = lambda reference: reference_kind(reference, steps, fixed_inputs) == "outside"  # noqa: E731
     body = render(template, context, frame, framed)
     parts = [FRAME_NOTICE] if framed else []
     parts.append(body)
@@ -794,7 +993,8 @@ def created_today(flow: str, author: str | None = None, today: date | None = Non
 
 
 def _flow_context(flow: FlowDef) -> dict:
-    return {**flow.vars, "name": flow.name, "title": flow.title, "dir": flow.source_dir}
+    return {**flow.vars, "name": flow.name, "title": flow.title, "dir": flow.source_dir,
+            "attachments": str(attachments_dir(flow))}
 
 
 def _context(flow: FlowDef, item: dict) -> dict:
@@ -872,12 +1072,18 @@ def _step_once(flow: FlowDef, item: dict) -> bool:
         _goto(flow, item, index + 1)
         _commit(item, [("step.skipped", {}, step.id)])
         return True
+    if not _enter_section(flow, item, index, step):
+        return False
     if isinstance(step, AgentStep):
         return _start_agent(flow, item, step)
     if isinstance(step, HumanStep):
         return _ask_human(flow, item, step)
     if isinstance(step, CommandStep):
         return _run_command(flow, item, index, step)
+    if isinstance(step, GitlabStep):
+        return _run_gitlab(flow, item, index, step)
+    if isinstance(step, ReplyStep):
+        return _send_reply(flow, item, index, step)
     if isinstance(step, PublishStep):
         item["data"]["steps"][step.id] = {"published": True}
         _after_step(flow, item, index, step)
@@ -1025,7 +1231,7 @@ def _run_command(flow: FlowDef, item: dict, index: int, step: CommandStep) -> bo
     item["wait"] = {"command": step.id, "until": until.isoformat()}
     _commit(item, [("command.started", {"argv": argv}, step.id)])
     env = {**os.environ, "PP_FLOW": flow.name, "PP_FLOW_ITEM": str(item["id"])}
-    code, stdout, output = _execute(argv, cwd, step.timeout, env)
+    code, stdout, output = _execute(argv, cwd, step.timeout, env, render(step.stdin, context))
     ok = code in step.ok_codes and (not step.require_output
                                     or re.search(step.require_output, output) is not None)
     result: dict[str, Any] = {"exit_code": code, "ok": ok, "output": output[-step.output_limit:]}
@@ -1048,12 +1254,14 @@ def _run_command(flow: FlowDef, item: dict, index: int, step: CommandStep) -> bo
     return True
 
 
-def _execute(argv: list[str], cwd: str | None, timeout: int, env: dict) -> tuple[int, str, str]:
+def _execute(argv: list[str], cwd: str | None, timeout: int, env: dict,
+             stdin: str = "") -> tuple[int, str, str]:
     program = shutil.which(argv[0]) or argv[0]
     try:
         completed = subprocess.run(
             [program, *argv[1:]], cwd=cwd, env=env, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout, stdin=subprocess.DEVNULL)
+            encoding="utf-8", errors="replace", timeout=timeout,
+            **({"input": stdin} if stdin else {"stdin": subprocess.DEVNULL}))
     except subprocess.TimeoutExpired as exc:
         partial = "".join(part.decode("utf-8", "replace") if isinstance(part, bytes) else part
                           for part in (exc.stdout, exc.stderr) if part)
@@ -1062,6 +1270,99 @@ def _execute(argv: list[str], cwd: str | None, timeout: int, env: dict) -> tuple
         return 127, "", f"{type(exc).__name__}: {exc}"
     stdout = completed.stdout or ""
     return completed.returncode, stdout, stdout + (completed.stderr or "")
+
+
+def _enter_section(flow: FlowDef, item: dict, index: int, step) -> bool:
+    """Keep to flow.exclusive: False while the section is full (the item waits).
+
+    Entering is decided under the write lock, so two items never squeeze in
+    together; an item leaves once it is past the section.
+    """
+    section = flow.exclusive
+    if section is None:
+        return True
+    inside = flow.index_of(section.first) <= index <= flow.index_of(section.last)
+    entered = bool(item["data"].get("section"))
+    if inside == entered:
+        return True
+    with db._connect(immediate=True) as conn:
+        if inside:
+            rows = conn.execute(
+                "SELECT data_json FROM flow_items WHERE flow = ? AND id != ? AND status IN "
+                "('active', 'waiting_human', 'needs_human')", (flow.name, item["id"])).fetchall()
+            holders = sum(1 for row in rows if json.loads(row["data_json"] or "{}").get("section"))
+            if holders >= section.max:
+                return False
+            item["data"]["section"] = True
+            _commit(item, [("section.entered", {}, step.id)], conn)
+        else:
+            item["data"].pop("section", None)
+            _commit(item, [("section.left", {}, step.id)], conn)
+    return True
+
+
+def _connector_failed(flow: FlowDef, item: dict, index: int, step, error: str) -> bool:
+    item["data"]["steps"][step.id] = {"error": error[:500]}
+    if step.on_error == "continue":
+        _after_step(flow, item, index, step, {"error": error[:500]})
+        return True
+    if step.on_error == "fail":
+        _end(flow, item, "failed", step, note=error)
+    else:
+        _stop(flow, item, f"шаг «{step.id}»: {error}")
+    return False
+
+
+def _run_gitlab(flow: FlowDef, item: dict, index: int, step: GitlabStep) -> bool:
+    from .flow_connectors import ConnectorError, gitlab_apply
+
+    context = _context(flow, item)
+    issue = render(step.issue, context) if step.issue else item["data"]["input"].get("iid")
+    create = None
+    if step.create:
+        create = {"title": render(step.create.title, context),
+                  "description": render(step.create.description, context),
+                  "labels": render(step.create.labels, context)}
+    try:
+        result = gitlab_apply(
+            flow.gitlab, int(issue) if issue not in (None, "") else None, create=create,
+            comment=render(step.comment, context),
+            labels=render(step.labels, context) if step.labels is not None else None,
+            add_labels=render(step.add_labels, context),
+            remove_labels=render(step.remove_labels, context),
+            assignee_id=render(step.assignee_id, context), state=step.state)
+    except (ConnectorError, ValueError, KeyError) as exc:
+        return _connector_failed(flow, item, index, step, f"{type(exc).__name__}: {exc}")
+    item["data"]["steps"][step.id] = result
+    _after_step(flow, item, index, step, {"iid": result.get("iid")})
+    return True
+
+
+def _send_reply(flow: FlowDef, item: dict, index: int, step: ReplyStep) -> bool:
+    from .flow_connectors import ConnectorError, send_reply
+
+    source = flow.input
+    context = _context(flow, item)
+    credentials = (os.environ.get(source.user_env, ""), os.environ.get(source.password_env, ""))
+    if not all(credentials):
+        return _connector_failed(flow, item, index, step,
+                                 f"не заданы {source.user_env} / {source.password_env}")
+    # Claim first, like a command: a letter must not go out twice.
+    until = datetime.now(timezone.utc) + timedelta(seconds=300)
+    item["wait"] = {"command": step.id, "until": until.isoformat()}
+    _commit(item, [("reply.started", {}, step.id)])
+    try:
+        text = render(step.text_override, context).strip() or render(step.text, context)
+        sent_to = send_reply(source, item["data"]["input"], text=text,
+                             subject=render(step.subject, context), smtp_host=step.smtp_host,
+                             smtp_port=step.smtp_port, from_name=step.from_name,
+                             credentials=credentials)
+    except ConnectorError as exc:
+        item["wait"] = None
+        return _connector_failed(flow, item, index, step, str(exc))
+    item["data"]["steps"][step.id] = {"sent": True, "to": sent_to}
+    _after_step(flow, item, index, step, {"sent": True})
+    return True
 
 
 def _command_abandoned(flow: FlowDef, item: dict, step) -> bool:
@@ -1278,6 +1579,33 @@ def _input_state(flow: FlowDef) -> dict:
 
 
 def poll_input(flow: FlowDef, *, connect=None, today: date | None = None) -> list[dict]:
+    """Turn what is new at the flow's input into items, within the flow's limits."""
+    if flow.input is None:
+        return []
+    if isinstance(flow.input, GitlabInput):
+        return _poll_gitlab(flow)
+    return _poll_mail(flow, connect=connect, today=today)
+
+
+def _poll_gitlab(flow: FlowDef) -> list[dict]:
+    """Issues with the input's labels, one item per issue."""
+    from .flow_connectors import gitlab_issues
+
+    created = []
+    for request in gitlab_issues(flow.gitlab, flow.input):
+        key = f"issue:{request['iid']}"
+        if item_exists(flow.name, key):
+            continue
+        if flow.limits.per_day and created_today(flow.name) >= flow.limits.per_day:
+            break  # the issue stays open; the next day takes it
+        item = create_item(flow, request, dedup_key=key, title=request["title"],
+                           author=request["author"])
+        if item:
+            created.append(item)
+    return created
+
+
+def _poll_mail(flow: FlowDef, *, connect=None, today: date | None = None) -> list[dict]:
     """Turn new letters of the flow's mailbox into items, within the flow's limits.
 
     A letter over a limit is not lost: it waits in the mailbox and is taken on
@@ -1286,8 +1614,6 @@ def poll_input(flow: FlowDef, *, connect=None, today: date | None = None) -> lis
     from .flow_connectors import poll_mailbox
 
     source = flow.input
-    if source is None:
-        return []
     user = os.environ.get(source.user_env, "")
     password = os.environ.get(source.password_env, "")
     if not user or not password:
@@ -1296,7 +1622,8 @@ def poll_input(flow: FlowDef, *, connect=None, today: date | None = None) -> lis
     state = _input_state(flow)
     later = {key: when for key, when in state["later"].items() if when >= day}
     requests, judged = poll_mailbox(source, set(state["seen"]) | set(later),
-                                    (user, password), connect=connect)
+                                    (user, password), connect=connect,
+                                    keep_attachments=source.save_attachments)
     accepted = {request["message_id"] for request in requests}
     seen = state["seen"] + [key for key in judged if key not in accepted]
     created = []
@@ -1312,15 +1639,32 @@ def poll_input(flow: FlowDef, *, connect=None, today: date | None = None) -> lis
         if over_day or over_author:
             later[key] = day
             continue
+        parts = request.pop("_attachments", [])
         item = create_item(flow, request, dedup_key=key,
                            title=request.get("title") or request.get("subject") or "",
                            author=author)
+        if item and parts:
+            item = _keep_attachments(flow, item, parts)
         if item:
             created.append(item)
         seen.append(key)
     db.set_setting(_input_key(flow), json.dumps(
         {"seen": list(dict.fromkeys(seen))[-5000:], "later": later}, ensure_ascii=False))
     return created
+
+
+def attachments_dir(flow: FlowDef) -> Path:
+    """Where a flow keeps the attachments of its letters, one folder per item."""
+    return flows_dir() / "attachments" / flow.name
+
+
+def _keep_attachments(flow: FlowDef, item: dict, parts: list) -> dict:
+    from .flow_connectors import write_attachments
+
+    paths = write_attachments(attachments_dir(flow) / str(item["id"]), parts)
+    item["data"]["input"]["attachments"] = paths
+    _commit(item, [("input.attachments", {"count": len(paths)}, None)])
+    return item
 
 
 def active_item_ids() -> list[int]:
