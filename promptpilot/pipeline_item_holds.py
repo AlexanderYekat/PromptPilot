@@ -190,6 +190,8 @@ def record(conn, series_id, task_id, verdict, result):
                         and str(target.get("number")) in numbers
                         and isinstance(target.get("head"), str)
                         and re.fullmatch(r"[0-9a-f]{40}", target["head"]))
+        if target and not exact_target:
+            return False
         if not all(number in states for number in numbers) and not exact_target:
             return False
         row = conn.execute("SELECT value FROM settings WHERE key=?", (PREFIX + str(series_id),)).fetchone()
@@ -201,8 +203,8 @@ def record(conn, series_id, task_id, verdict, result):
     # Preserve the initial timestamp: recurrence repair must not extend a hold.
     for number in numbers:
         old = holds.get(number) or {}
-        identity = ({"fingerprint": states[number]} if number in states else
-                    {"head": target["head"]})
+        identity = ({"head": target["head"]} if exact_target else
+                    {"fingerprint": states[number]})
         if any(old.get(key) != value for key, value in identity.items()):
             holds[number] = {**identity, "at": time.time(),
                              "reason": reason, "task_id": task_id}

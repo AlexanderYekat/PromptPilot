@@ -117,6 +117,24 @@ def test_exact_review_election_survives_stale_queue_snapshot(isolated_db):
     assert holds.prepare(successor, queue, fresh) == []
 
 
+def test_exact_review_election_rejects_another_pr_in_human_result(isolated_db):
+    task = isolated_db.create_task(TaskCreate(prompt="Example - REVIEW", recurrence="15m"))
+    queue = {"id": "review", "item_blockers": True}
+    data = {"cache": {"complete": True, "stale": False},
+            "queues": [{"id": "review", "membership_complete": True,
+                        "backlog": 2, "admission_items": [
+                            {"number": number, "updated_at": "2026-09-30T00:00:00Z"}
+                            for number in (7, 8)]}]}
+    holds.prepare(task, queue, data)
+    holds.register_review_target(task, 7, "a" * 40)
+    isolated_db.mark_completed(
+        task.id, "ИТОГ: НУЖЕН ЧЕЛОВЕК (#8 — не та цель)",
+        verdict="НУЖЕН ЧЕЛОВЕК")
+    successor = SimpleNamespace(id=task.id + 1, series_id=task.series_id)
+    isolated_db.pause_pipeline_series_on_repeated_blocker(task.series_id, task.id)
+    assert holds.prepare(successor, queue, data) == []
+
+
 def test_excluded_integration_owner_is_not_skipped(monkeypatch):
     monkeypatch.setenv("PP_PIPELINE_EXCLUDED_NUMBERS", "[7]")
     monkeypatch.setattr(pp, "pending_merge_intents", lambda *_: [])
