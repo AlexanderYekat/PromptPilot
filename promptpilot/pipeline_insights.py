@@ -3399,6 +3399,9 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "pipeline target reservation contradicts task, repository, or target")
                 target_reservation = reservation
                 validated_target_stage = target_stage
+                if target_stage == "review" and queue.get("item_blockers") is True:
+                    from .pipeline_item_holds import register_review_target
+                    register_review_target(task, number, head)
             except (project_pipeline.PipelineError, TypeError, ValueError) as exc:
                 return {
                     "action": "block", "mode": "tool",
