@@ -240,20 +240,6 @@ class CommandStep(_Step):
             re.compile(self.require_output)
         return self
 
-    @model_validator(mode="after")
-    def _program_is_not_a_template(self):
-        """run[0] names the program and must not come from a substitution.
-
-        Arguments may: the shell is not involved and each substitution stays
-        one argv element, so a letter cannot split itself into extra options.
-        The program itself is another matter — a request field would pick what
-        runs. Caught here, when the route description is read, not at the step.
-        """
-        if _references(self.run[0]):
-            raise ValueError(
-                "run[0] — имя программы, подстановка в нём не допускается: "
-                f"{self.run[0]!r}; перенесите её в аргументы")
-        return self
 
 
 class FinishStep(_Step):
@@ -540,6 +526,19 @@ def check_flow(flow: FlowDef) -> None:
                                          "ссылаться только на {{flow.…}} и {{item.id}}")
         if isinstance(step, HumanStep) and step.when is None and step.on_reject == "reject":
             approved = True
+        if isinstance(step, CommandStep):
+            # run[0] — имя программы, и оно проверяется при любом доверии, в том
+            # числе owner. Аргумент, пришедший подстановкой, остаётся одним
+            # элементом argv: shell не участвует, расщепиться на лишние опции
+            # чужой текст не может. Имя программы — другая власть: оно решает,
+            # что вообще запустится. Фиксированные ссылки (flow.*, item.id,
+            # поля с enum/integer) допустимы — ими задают путь к бинарю.
+            for reference in _references(step.run[0]):
+                if reference_kind(reference, seen, fixed_inputs) != "fixed":
+                    raise ValueError(
+                        f"шаг «{step.id}»: run[0] — имя программы, а «{{{{{reference}}}}}» может "
+                        "нести текст извне: он выбрал бы, что запускать. Допустимы item.id, "
+                        "flow.* и поля с enum/integer; текст передавайте аргументом")
         if isinstance(step, PublishStep):
             for reference in _references(step.path):
                 if not reference.startswith("flow."):

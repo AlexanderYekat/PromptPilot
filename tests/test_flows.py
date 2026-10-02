@@ -374,19 +374,34 @@ def test_owner_flow_may_do_everything(env):
     assert flows.FlowDef.model_validate(flow).trust == "owner"
 
 
-def test_a_substitution_may_not_choose_the_program(env):
-    """Arguments may come from a substitution; the program may not.
+def test_outside_text_may_not_choose_the_program_even_in_an_owner_flow(env):
+    """An argument may carry outside text; the program name may not.
 
     Nothing is run through a shell and each substitution stays one argv
-    element, so letter text cannot grow extra options. But run[0] decides
-    which program starts, and that is not for a request field to fill — not
-    even in an owner flow.
+    element, so letter text cannot grow extra options — that is why an owner
+    flow is allowed to pass it as an argument. run[0] is another kind of
+    power: it decides which program starts at all. For every other trust
+    level the whole command line is already limited to fixed references; this
+    closes the owner case, and only for the program name.
     """
     flow = game_flow(env.root, trust="owner")
     flow["steps"][4]["run"] = ["{{input.body}}", "-c", "print(1)"]
 
     with pytest.raises(ValidationError, match="имя программы"):
         flows.FlowDef.model_validate(flow)
+
+
+def test_the_program_may_still_come_from_the_flows_own_vars(env):
+    """How a route names a binary: {{flow.…}} is written by the flow author.
+
+    This is what the shipped examples do ({{flow.godot}}), so the rule has to
+    let it through — it is a fixed reference, not outside text.
+    """
+    flow = game_flow(env.root)
+    flow["vars"] = {**flow["vars"], "tool": PY}
+    flow["steps"][4]["run"] = ["{{flow.tool}}", "-c", "print(1)"]
+
+    assert flows.FlowDef.model_validate(flow).name == "game"
 
 
 def test_owner_flow_prompts_are_not_framed(env):
