@@ -374,6 +374,21 @@ def test_owner_flow_may_do_everything(env):
     assert flows.FlowDef.model_validate(flow).trust == "owner"
 
 
+def test_a_substitution_may_not_choose_the_program(env):
+    """Arguments may come from a substitution; the program may not.
+
+    Nothing is run through a shell and each substitution stays one argv
+    element, so letter text cannot grow extra options. But run[0] decides
+    which program starts, and that is not for a request field to fill — not
+    even in an owner flow.
+    """
+    flow = game_flow(env.root, trust="owner")
+    flow["steps"][4]["run"] = ["{{input.body}}", "-c", "print(1)"]
+
+    with pytest.raises(ValidationError, match="имя программы"):
+        flows.FlowDef.model_validate(flow)
+
+
 def test_owner_flow_prompts_are_not_framed(env):
     flow = install(env, game_flow(env.root, trust="owner"))
     item = new_item(flow)
