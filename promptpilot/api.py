@@ -438,8 +438,19 @@ def _setup_check(code: str, status: str, message: str) -> WorkflowSetupCheck:
     return WorkflowSetupCheck(code=code, status=status, message=message)
 
 
-def _validate_gate_syntax(command: str) -> tuple[bool, str]:
-    """Parse one gate command without executing it."""
+# Preflight probes start other programs, and starting one is not instant: a
+# cold powershell.exe on a loaded Windows machine takes seconds. This is a
+# "the process hung" limit, not a measure of how long a parse should take.
+_PROBE_TIMEOUT = 20
+
+
+def _validate_gate_syntax(command: str) -> tuple[str, str]:
+    """Parse one gate command without executing it.
+
+    Returns the check status: "ok" when the parser accepted the command,
+    "error" when it rejected it, and "warning" when the parser could not be
+    run at all — not managing to check is not proof the command is broken.
+    """
     try:
         if os.name == "nt":
             env = os.environ.copy()
@@ -452,17 +463,20 @@ def _validate_gate_syntax(command: str) -> tuple[bool, str]:
             )
             parsed = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-                capture_output=True, text=True, timeout=5, errors="replace", env=env,
+                capture_output=True, text=True, timeout=_PROBE_TIMEOUT,
+                errors="replace", env=env,
             )
         else:
             parsed = subprocess.run(
                 ["/bin/sh", "-n", "-c", command], capture_output=True,
-                text=True, timeout=5, errors="replace",
+                text=True, timeout=_PROBE_TIMEOUT, errors="replace",
             )
+    except subprocess.TimeoutExpired:
+        return "warning", f"синтаксис не проверен: парсер не ответил за {_PROBE_TIMEOUT} с"
     except (OSError, subprocess.SubprocessError) as exc:
-        return False, f"не удалось запустить parser: {exc}"
+        return "warning", f"синтаксис не проверен: не удалось запустить parser ({exc})"
     detail = ((parsed.stdout or "") + (parsed.stderr or "")).strip()
-    return parsed.returncode == 0, detail
+    return ("ok" if parsed.returncode == 0 else "error"), detail
 
 
 @app.post(
@@ -481,7 +495,7 @@ def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
         try:
             git = subprocess.run(
                 ["git", "-C", str(repo), "rev-parse", "--show-toplevel"],
-                capture_output=True, text=True, timeout=5, errors="replace",
+                capture_output=True, text=True, timeout=_PROBE_TIMEOUT, errors="replace",
             )
             if git.returncode:
                 checks.append(_setup_check(
@@ -491,18 +505,30 @@ def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
                 checks.append(_setup_check(
                     "repository", "ok", f"Git-репозиторий: {git.stdout.strip()}",
                 ))
+        # A git that did not answer in time proves nothing about the directory;
+        # a git that cannot be started at all is a real problem. Keep them apart
+        # — TimeoutExpired is a SubprocessError, so it has to be caught first.
+        except subprocess.TimeoutExpired:
+            checks.append(_setup_check(
+                "repository", "warning",
+                f"не проверен: git не ответил за {_PROBE_TIMEOUT} с",
+            ))
         except (OSError, subprocess.SubprocessError) as exc:
             checks.append(_setup_check("repository", "error", f"Git недоступен: {exc}"))
 
     try:
         branch = subprocess.run(
             ["git", "check-ref-format", "--branch", request.candidate_branch],
-            capture_output=True, text=True, timeout=5, errors="replace",
+            capture_output=True, text=True, timeout=_PROBE_TIMEOUT, errors="replace",
         )
         checks.append(_setup_check(
             "branch", "ok" if branch.returncode == 0 else "error",
             (f"Допустимое имя ветки: {request.candidate_branch}"
              if branch.returncode == 0 else "Недопустимое имя Git-ветки"),
+        ))
+    except subprocess.TimeoutExpired:
+        checks.append(_setup_check(
+            "branch", "warning", f"не проверено: git не ответил за {_PROBE_TIMEOUT} с",
         ))
     except (OSError, subprocess.SubprocessError) as exc:
         checks.append(_setup_check("branch", "error", f"Git недоступен: {exc}"))
@@ -522,11 +548,11 @@ def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
             "gate", "warning", "Gate-команды не заданы: функциональная готовность не проверяется",
         ))
     for index, command in enumerate(request.gate_commands, start=1):
-        ok, detail = _validate_gate_syntax(command)
+        status, detail = _validate_gate_syntax(command)
         checks.append(_setup_check(
-            "gate", "ok" if ok else "error",
-            (f"Gate #{index}: синтаксис корректен"
-             if ok else f"Gate #{index}: {detail or 'ошибка синтаксиса'}"),
+            "gate", status,
+            (f"Gate #{index}: синтаксис корректен" if status == "ok"
+             else f"Gate #{index}: {detail or 'ошибка синтаксиса'}"),
         ))
 
     return WorkflowSetupValidationResponse(

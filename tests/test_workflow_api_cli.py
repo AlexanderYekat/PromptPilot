@@ -1,5 +1,6 @@
 import asyncio
 import io
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -314,10 +315,64 @@ def test_workflow_setup_preflight_accepts_repo_provider_and_gate(isolated_db, mo
     )
     assert response.status_code == 200
     result = response.json()
-    assert result["ready"] is True
+    # Name the check that objected: every probe here starts another program,
+    # and a bare "False is not True" says nothing about which one.
+    assert result["ready"] is True, result["checks"]
     assert {item["code"] for item in result["checks"]} >= {
         "repository", "branch", "provider", "gate",
     }
+
+
+def test_workflow_setup_preflight_timeout_is_not_a_syntax_error(isolated_db, monkeypatch):
+    """A parser that did not answer has not proven the command wrong.
+
+    Starting powershell.exe cold on a loaded machine can outlast the probe
+    timeout. Reporting that as a syntax error made the wizard lie and the
+    Windows CI job flaky.
+    """
+    monkeypatch.setattr("promptpilot.api.load_providers", lambda: {"test-provider": {"cmd": "test"}})
+    monkeypatch.setattr("promptpilot.api.provider_available", lambda info: True)
+    real_run = subprocess.run
+
+    def run(cmd, **kwargs):
+        if cmd and cmd[0] in ("powershell.exe", "/bin/sh"):
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr("promptpilot.api.subprocess.run", run)
+    response = request(
+        "POST", "/api/workflows/validate-setup", json={
+            "repository_path": str(Path(__file__).parents[1]),
+            "candidate_branch": "feature/workflow-wizard",
+            "providers": ["test-provider"],
+            "gate_commands": ["python --version"],
+        },
+    )
+    assert response.status_code == 200
+    result = response.json()
+    gate = [item for item in result["checks"] if item["code"] == "gate"]
+    assert [item["status"] for item in gate] == ["warning"], gate
+    assert "не проверен" in gate[0]["message"]
+    assert result["ready"] is True, result["checks"]
+
+
+def test_workflow_setup_preflight_still_rejects_broken_gate_syntax(isolated_db, monkeypatch):
+    """A parser that answered «no» is a real error — warning must not swallow it."""
+    monkeypatch.setattr("promptpilot.api.load_providers", lambda: {"test-provider": {"cmd": "test"}})
+    monkeypatch.setattr("promptpilot.api.provider_available", lambda info: True)
+    response = request(
+        "POST", "/api/workflows/validate-setup", json={
+            "repository_path": str(Path(__file__).parents[1]),
+            "candidate_branch": "feature/workflow-wizard",
+            "providers": ["test-provider"],
+            "gate_commands": ["if ("],
+        },
+    )
+    assert response.status_code == 200
+    result = response.json()
+    gate = [item for item in result["checks"] if item["code"] == "gate"]
+    assert [item["status"] for item in gate] == ["error"], gate
+    assert result["ready"] is False
 
 
 def test_workflow_setup_preflight_rejects_invalid_inputs(isolated_db, tmp_path):
