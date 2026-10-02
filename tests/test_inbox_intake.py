@@ -145,6 +145,14 @@ def test_form_only_can_be_switched_off(poller, monkeypatch, tmp_path):
     (["mxs.mail.ru; dkim=fail header.d=formsubmit.co"], False),
     # a header the sender wrote itself names another server
     (["attacker.example; dkim=pass header.d=formsubmit.co"], False),
+    # Our server's own verdict is fail, and below it the sender wrote a second
+    # header with our authserv-id. Only the top one of ours may decide: headers
+    # are prepended, so ours is first, and searching on would accept the forgery.
+    (["mxs.mail.ru; dkim=fail header.d=formsubmit.co",
+      "mxs.mail.ru; dkim=pass header.d=formsubmit.co"], False),
+    # Not the other way round either: our pass stands even with junk below it.
+    (["mxs.mail.ru; dkim=pass header.d=formsubmit.co",
+      "mxs.mail.ru; dkim=fail header.d=formsubmit.co"], True),
     ([], False),
 ])
 def test_dkim_is_checked_against_our_mail_server(poller, results, accepted):

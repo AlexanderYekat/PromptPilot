@@ -236,7 +236,11 @@ def dkim_passed(msg: email.message.Message, authserv: str, domain: str) -> bool:
     """Authentication-Results of OUR receiving server confirm the form's DKIM.
 
     Only the header whose authserv-id is the configured server counts: a
-    sender can write an Authentication-Results header of its own.
+    sender can write an Authentication-Results header of its own. And only the
+    FIRST such header decides. Headers are prepended, so ours — added last by
+    the receiving server — is on top; searching further would reach one the
+    sender wrote with our authserv-id in it, and a letter our own server
+    stamped dkim=fail would pass on the forgery below it.
     """
     signer = re.compile(r"header\.(?:d=|i=@?)(?:[\w-]+\.)*" + re.escape(domain) + r"\b")
     for header in msg.get_all("Authentication-Results") or []:
@@ -244,10 +248,8 @@ def dkim_passed(msg: email.message.Message, authserv: str, domain: str) -> bool:
         server, _, results = value.partition(";")
         if server.strip() != authserv:
             continue
-        for clause in results.split(";"):
-            clause = clause.strip()
-            if clause.startswith("dkim=pass") and signer.search(clause):
-                return True
+        return any(clause.strip().startswith("dkim=pass") and signer.search(clause.strip())
+                   for clause in results.split(";"))
     return False
 
 
