@@ -486,6 +486,9 @@ def _validate_gate_syntax(command: str) -> tuple[str, str]:
 def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
     """Validate repository, branch, providers and gate syntax without mutation."""
     checks: list[WorkflowSetupCheck] = []
+    # Required checks that could not be performed at all (a probe timed out).
+    # They are not errors and not successes: nothing was proven either way.
+    unverified: list[str] = []
     repo = Path(request.repository_path).expanduser()
     if not repo.exists():
         checks.append(_setup_check("repository", "error", "Каталог репозитория не найден"))
@@ -509,6 +512,7 @@ def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
         # a git that cannot be started at all is a real problem. Keep them apart
         # — TimeoutExpired is a SubprocessError, so it has to be caught first.
         except subprocess.TimeoutExpired:
+            unverified.append("repository")
             checks.append(_setup_check(
                 "repository", "warning",
                 f"не проверен: git не ответил за {_PROBE_TIMEOUT} с",
@@ -527,6 +531,7 @@ def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
              if branch.returncode == 0 else "Недопустимое имя Git-ветки"),
         ))
     except subprocess.TimeoutExpired:
+        unverified.append("branch")
         checks.append(_setup_check(
             "branch", "warning", f"не проверено: git не ответил за {_PROBE_TIMEOUT} с",
         ))
@@ -549,14 +554,25 @@ def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
         ))
     for index, command in enumerate(request.gate_commands, start=1):
         status, detail = _validate_gate_syntax(command)
+        if status == "warning":
+            # A gate the operator did specify, whose syntax we could not check.
+            unverified.append(f"gate#{index}")
         checks.append(_setup_check(
             "gate", status,
             (f"Gate #{index}: синтаксис корректен" if status == "ok"
              else f"Gate #{index}: {detail or 'ошибка синтаксиса'}"),
         ))
 
+    # ready opens «Создать и запустить» in the wizard, so it must mean «checked
+    # and fine», not merely «nothing came back wrong». A probe that did not
+    # answer keeps its own warning status — the message says what was not
+    # checked — but readiness is withheld: an unchecked gate must not let an
+    # unattended run start. A gate nobody specified is a different thing: there
+    # is nothing to check, and that warning stays non-blocking.
     return WorkflowSetupValidationResponse(
-        ready=not any(check.status == "error" for check in checks), checks=checks,
+        ready=(not any(check.status == "error" for check in checks)
+               and not unverified),
+        checks=checks,
     )
 
 
