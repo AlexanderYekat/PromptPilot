@@ -222,6 +222,58 @@ def test_wall_shows_a_proposal_only_after_acceptance(poller, monkeypatch, tmp_pa
     assert "http" not in json.dumps(items, ensure_ascii=False)
 
 
+def test_the_keepers_own_answer_is_cleaned_before_the_wall(poller, monkeypatch, tmp_path):
+    """Вердикт писали ПО письму игрока — ссылку оттуда он может повторить.
+
+    Прежний тест брал нейтральный ответ модели, поэтому путь «ссылка пришла
+    не из письма, а из ПРИЧИНЫ и ТЕХНИЧЕСКОГО ЗАДАНИЯ» не проверялся, а
+    reason/spec публиковались без очистки.
+    """
+    submission = letter("[KT] Предложение по игре", "name: Рыцарь\nЗаклинание", sender=FORM)
+    created, env = run(poller, monkeypatch, tmp_path, [submission])
+    answer = (
+        "ВЕРДИКТ: ПРИНЯТЬ\n"
+        "ПРИЧИНА: Хорошая идея, подробности тут http://evil.example/reason\n"
+        "КАТЕГОРИЯ: <script>alert(1)</script> и ещё текст\n"
+        "ПРИОРИТЕТ: 99 (или www.evil.example)\n"
+        "ТЕХНИЧЕСКОЕ ЗАДАНИЕ:\n"
+        "Контекст: см. https://evil.example/spec\n"
+        "Что нужно: добавить заклинание\n"
+        "ИТОГ: ГОТОВО — триаж завершён")
+    monkeypatch.setattr(poller.urllib.request, "urlopen", fake_api(
+        {1: {"status": "completed", "result": answer}}))
+
+    poller.flush_saves(env, state := poller.load_state())
+
+    items = json.loads(pathlib.Path(env["KT_SITE_FEED"]).read_text(encoding="utf-8"))["items"]
+    assert [item["verdict"] for item in items] == ["ПРИНЯТЬ"]
+    published = json.dumps(items, ensure_ascii=False)
+    assert "http" not in published and "www." not in published, published
+    assert "evil.example" not in published, published
+    # Категория и приоритет — только из набора; мимо набора публикуется пусто.
+    assert items[0]["category"] == "" and items[0]["priority"] == ""
+    # Ссылка именно вырезана, а поле не потеряно целиком.
+    assert "[ссылка]" in items[0]["reason"] and "[ссылка]" in items[0]["spec"]
+    assert "Что нужно: добавить заклинание" in items[0]["spec"]
+    # В состоянии остаётся исходный текст: чистка — только для публикации.
+    assert "evil.example" in state["kt_feed"][0]["reason"]
+
+
+def test_wall_fields_keep_the_values_the_keeper_was_asked_for(poller, tmp_path):
+    """Член набора проходит как есть — очистка не должна его съесть."""
+    feed = tmp_path / "feed.json"
+    state = {"kt_feed": [{"task_id": 3, "verdict": "принять", "title": "Заклинание",
+                          "author": "Рыцарь", "reason": "Вписывается", "category": "Баланс",
+                          "priority": "3", "spec": "Контекст: бой\nЧто нужно: ослабить"}]}
+
+    poller.write_kt_feed({"KT_SITE_FEED": str(feed)}, state)
+
+    item = json.loads(feed.read_text(encoding="utf-8"))["items"][0]
+    assert item["verdict"] == "ПРИНЯТЬ"  # нормализуется к члену набора
+    assert item["category"] == "баланс" and item["priority"] == "3"
+    assert item["spec"] == "Контекст: бой\nЧто нужно: ослабить"  # строки сохранены
+
+
 def test_rejected_and_rate_limited_are_not_published(poller, monkeypatch, tmp_path):
     submissions = [letter("[KT] Предложение по игре", f"name: Игрок{n}\nИдея {n}", sender=FORM)
                    for n in range(2)]

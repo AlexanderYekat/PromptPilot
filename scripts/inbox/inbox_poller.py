@@ -255,9 +255,37 @@ def dkim_passed(msg: email.message.Message, authserv: str, domain: str) -> bool:
 
 def clean_public_text(text: str, limit: int) -> str:
     """Text from a stranger shown on the public wall: no links, bounded."""
-    text = re.sub(r"(?i)\b(?:https?://|www\.)\S+", "[ссылка]", text or "")
-    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+", " ", _drop_links(text)).strip()
     return text[:limit]
+
+
+def _drop_links(text: str) -> str:
+    return re.sub(r"(?i)\b(?:https?://|www\.)\S+", "[ссылка]", text or "")
+
+
+def clean_public_block(text: str, limit: int) -> str:
+    """То же для многострочного поля: ТЗ читают по пунктам, строки сохраняем."""
+    lines = (re.sub(r"[ \t]+", " ", line).strip()
+             for line in _drop_links(text).splitlines())
+    return "\n".join(line for line in lines if line)[:limit]
+
+
+# Категория и приоритет — выбор из набора, заданного в промпте. На стену
+# идёт только член набора: ответ хранителя концепции — тоже текст, который
+# пересказывает письмо игрока, и произвольной строке там не место.
+KT_CATEGORIES = ("баг", "фича", "баланс", "контент", "ux")
+
+
+def public_category(value: str) -> str:
+    category = clean_public_text(value, 20).lower().strip(" .*")
+    return category if category in KT_CATEGORIES else ""
+
+
+def public_priority(value: str) -> str:
+    """Приоритет 1..10; всё прочее — пусто, а не текст модели на стене."""
+    match = re.search(r"\d{1,2}", value or "")
+    number = int(match.group()) if match else 0
+    return str(number) if 1 <= number <= 10 else ""
 
 
 def bulk_reason(msg: email.message.Message, sender: str) -> str | None:
@@ -566,15 +594,26 @@ def write_kt_feed(env: dict, state: dict) -> None:
         ("ОТКЛОНИТЬ",) if env.get("KT_WALL_SHOW_REJECTED") == "1" else ())
     items = []
     for entry in state.get("kt_feed", []):
-        if str(entry.get("verdict") or "").upper() not in shown:
+        verdict = str(entry.get("verdict") or "").upper()
+        if verdict not in shown:
             continue
         item = {key: entry.get(key, "") for key in
-                ("task_id", "author", "title", "subject", "verdict", "reason",
+                ("task_id", "author", "title", "subject", "reason",
                  "category", "priority", "spec")}
         item["title"] = clean_public_text(item["title"], 80)
         item["subject"] = clean_public_text(item["subject"], 120)
         item["author"] = clean_public_text(item["author"], 30) or "Анонимный странник"
-        item["stage"] = entry.get("stage", "триаж")
+        # Вердикт хранитель концепции писал ПО тексту игрока, и ссылку из письма
+        # он может повторить и в ПРИЧИНЕ, и в ТЕХНИЧЕСКОМ ЗАДАНИИ. Поэтому
+        # чистится и ограничивается всё публикуемое, а не только поля письма:
+        # раньше reason/spec уходили на стену как есть, а category/priority —
+        # произвольным текстом модели.
+        item["reason"] = clean_public_text(item["reason"], 300)
+        item["spec"] = clean_public_block(item["spec"], 900)
+        item["category"] = public_category(item["category"])
+        item["priority"] = public_priority(item["priority"])
+        item["verdict"] = verdict  # член PUBLIC_VERDICTS, а не исходная строка
+        item["stage"] = clean_public_text(entry.get("stage", "триаж"), 40) or "триаж"
         items.append(item)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({"updated": time.strftime("%Y-%m-%d %H:%M"),
