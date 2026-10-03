@@ -486,6 +486,55 @@ def test_trim_transcript_uses_agy_greater_than_prompt_marker():
     assert cleaned.endswith("ИТОГ: ГОТОВО — задача выполнена")
 
 
+def test_trim_transcript_drops_codex_input_chrome_after_workflow_verdict():
+    prompt = ensure_closing_verdict_contract("Fix the three PR findings.")
+    transcript = (
+        "› Fix the three PR findings.\n"
+        "  </promptpilot-workflow-contract>\n"
+        "\n• Work is blocked by the command runner.\n"
+        "ИТОГ: НЕ СМОГ — команды не запускаются\n"
+        "\n  11:58\n\n"
+        "  Tip: Use /permissions to control when Codex asks for confirmation.\n"
+        "› Ask Codex to do anything\n"
+        "  gpt-6.1-sol medium · F:\\Projects\\App · Fix the three PR findings.\n"
+    )
+
+    cleaned = _trim_transcript(transcript, prompt)
+
+    assert cleaned.endswith("ИТОГ: НЕ СМОГ — команды не запускаются")
+    assert _closing_workflow_verdict(cleaned) == "НЕ СМОГ"
+
+
+def test_trim_transcript_returns_only_codex_reply_without_workflow_contract():
+    prompt = "Reply with exactly READY."
+    transcript = (
+        "› Reply with exactly READY.\n\n"
+        "• READY\n\n  11:34\n\n"
+        "  Tip: Use /permissions to control when Codex asks for confirmation.\n"
+        "› Ask Codex to do anything\n"
+        "  gpt-6.1-sol medium · F:\\Projects\\App · Reply with exactly READY.\n"
+    )
+
+    assert _trim_transcript(transcript, prompt) == "› Reply with exactly READY.\n\n• READY"
+
+
+def test_trim_transcript_drops_codex_completion_status_after_verdict():
+    prompt = ensure_closing_verdict_contract("Run git status.")
+    transcript = (
+        "› Run git status.\n"
+        "</promptpilot-workflow-contract>\n"
+        "• Exit code: 0\n"
+        "  ИТОГ: ГОТОВО — команда выполнена\n\n"
+        "  Worked for 16s • 12:16\n"
+        "  ⚠ 5h limit: 34% left · resets at 14:34 · /status\n"
+    )
+
+    cleaned = _trim_transcript(transcript, prompt)
+
+    assert cleaned.endswith("ИТОГ: ГОТОВО — команда выполнена")
+    assert _closing_workflow_verdict(cleaned) == "ГОТОВО"
+
+
 def test_trim_transcript_drops_wrapped_workflow_contract_examples():
     prompt = """Final workflow registration only. Do not modify files.
 

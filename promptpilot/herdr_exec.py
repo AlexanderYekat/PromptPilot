@@ -398,8 +398,9 @@ def _trim_transcript(raw: str, prompt: str) -> str:
         # or >.  Requiring only ❯ made an attached agy session start trimming
         # at the previous turn; the first separator then cut the real answer
         # down to its heading even though the closing verdict was visible.
-        prompt_line = line.lstrip().lstrip("❯>").lstrip()
-        if probe and probe in prompt_line:
+        prompt_line = line.lstrip().lstrip("❯>›").lstrip()
+        if (probe and line.lstrip().startswith(("❯", ">", "›"))
+                and probe in prompt_line):
             start = i
 
     # Workflow prompts contain verdict examples.  Do not return those examples
@@ -419,14 +420,18 @@ def _trim_transcript(raw: str, prompt: str) -> str:
     end = len(lines)
     for i in range(start + 1, len(lines)):
         s = lines[i].strip()
-        if len(s) >= 30 and set(s) <= {"─"}:
+        if ((len(s) >= 30 and set(s) <= {"─"})
+                or s.startswith("› Ask Codex to do anything")):
             end = i
             break
 
     def chrome(s: str) -> bool:
         s = s.strip()
         return (not s or s == "❯" or s.startswith("⏸")
-                or "? for shortcuts" in s or "· /effort" in s)
+                or "? for shortcuts" in s or "· /effort" in s
+                or s.startswith("Tip:") or re.fullmatch(r"\d{1,2}:\d{2}", s)
+                or re.fullmatch(r"Worked for \d+s • \d{1,2}:\d{2}", s)
+                or (s.startswith("⚠ 5h limit:") and s.endswith("/status")))
 
     while end > start and chrome(lines[end - 1]):
         end -= 1
