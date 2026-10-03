@@ -356,7 +356,6 @@ def load_providers_detailed() -> dict:
       _source_path: path to providers.json (if applicable)
     """
     providers = {}
-    builtin_names = set(BUILTIN_PROVIDERS)
 
     for name, info in BUILTIN_PROVIDERS.items():
         entry = dict(info)
