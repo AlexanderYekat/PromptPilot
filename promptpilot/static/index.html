@@ -2230,7 +2230,8 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       <div class="wf-round-summary">Не запускайте новый раунд. Дождитесь завершения фоновых build/pytest; экран агента показан ниже.</div>
     </div>`;
   } else if (wf.status === 'revision_required' || (wf.status === 'awaiting_human' && !reviewerDone)) {
-    action = `<div class="wf-form"><input class="wide" id="wfHumanText" value="Продолжить работу с учётом сохранённого состояния" required>
+    action = `<div class="wf-form"><textarea class="wide" id="wfHumanNote" rows="3"
+        placeholder="Что передать агенту (необязательно). Уйдёт в следующий запуск исполнителя и аудитора как указание, главнее инструкций раунда."></textarea>
       <button class="btn btn-sm btn-primary" onclick="wfResume()">Продолжить ${wf.status === 'revision_required' ? 'новым раундом' : 'текущий раунд'}</button></div>`;
   } else if (wf.status === 'awaiting_human' && reviewerDone) {
     const auditColor = auditVerdict === 'PASS' ? 'var(--green)' : 'var(--red)';
@@ -2537,7 +2538,15 @@ function wfDownloadReport(format) {
 
 function wfStart() { return wfPost('start', {expected_version: selectedWorkflowData.state_version}); }
 function wfSync() { return wfPost('sync', {}); }
-function wfResume() { return wfPost('human-input', {expected_version: selectedWorkflowData.state_version, text: document.getElementById('wfHumanText').value, resume: true}); }
+function wfResume() {
+  const note = (document.getElementById('wfHumanNote')?.value || '').trim();
+  return wfPost('human-input', {
+    expected_version: selectedWorkflowData.state_version,
+    text: note || 'Продолжить работу с учётом сохранённого состояния',
+    note,
+    resume: true,
+  });
+}
 function wfGate(verdict) { return wfPost('gate', {expected_version: selectedWorkflowData.state_version, verdict, gate_id: 'ui-manual-gate', summary: document.getElementById('wfDecisionSummary').value}); }
 function wfReview(verdict) { return wfPost('review', {expected_version: selectedWorkflowData.state_version, verdict, summary: document.getElementById('wfDecisionSummary').value, findings: []}); }
 function wfCancel() { if (confirm('Отменить workflow и все его активные задачи?')) return wfPost('cancel', {expected_version: selectedWorkflowData.state_version}); }
