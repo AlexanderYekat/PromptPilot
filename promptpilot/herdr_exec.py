@@ -421,7 +421,9 @@ def _trim_transcript(raw: str, prompt: str) -> str:
     for i in range(start + 1, len(lines)):
         s = lines[i].strip()
         if ((len(s) >= 30 and set(s) <= {"─"})
-                or s.startswith("› Ask Codex to do anything")):
+                or s.startswith("› Ask Codex to do anything")
+                or (s == "Approaching rate limits" and i + 1 < len(lines)
+                    and lines[i + 1].strip().startswith("Switch to "))):
             end = i
             break
 
@@ -430,7 +432,7 @@ def _trim_transcript(raw: str, prompt: str) -> str:
         return (not s or s == "❯" or s.startswith("⏸")
                 or "? for shortcuts" in s or "· /effort" in s
                 or s.startswith("Tip:") or re.fullmatch(r"\d{1,2}:\d{2}", s)
-                or re.fullmatch(r"Worked for \d+s • \d{1,2}:\d{2}", s)
+                or re.fullmatch(r"Worked for (?:\d+h )?(?:\d+m )?\d+s • \d{1,2}:\d{2}", s)
                 or (s.startswith("⚠ 5h limit:") and s.endswith("/status")))
 
     while end > start and chrome(lines[end - 1]):

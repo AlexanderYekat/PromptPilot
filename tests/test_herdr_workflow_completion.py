@@ -535,6 +535,27 @@ def test_trim_transcript_drops_codex_completion_status_after_verdict():
     assert _closing_workflow_verdict(cleaned) == "ГОТОВО"
 
 
+def test_trim_transcript_drops_codex_model_switch_prompt_after_verdict():
+    prompt = ensure_closing_verdict_contract("Verify the candidate CI.")
+    transcript = (
+        "› Verify the candidate CI.\n"
+        "</promptpilot-workflow-contract>\n"
+        "• CI passed.\n"
+        "  ИТОГ: ГОТОВО — проверки завершены\n\n"
+        "  Worked for 17m 31s • 13:12\n\n"
+        "  Approaching rate limits\n"
+        "  Switch to gpt-6-luna for lower credit usage?\n\n"
+        "› 1. Switch to gpt-6-luna\n"
+        "  2. Keep current model\n"
+        "  3. Keep current model (never show again)\n"
+        "  enter select · esc back\n"
+    )
+
+    cleaned = _trim_transcript(transcript, prompt)
+    assert cleaned.endswith("ИТОГ: ГОТОВО — проверки завершены")
+    assert _closing_workflow_verdict(cleaned) == "ГОТОВО"
+
+
 def test_trim_transcript_drops_wrapped_workflow_contract_examples():
     prompt = """Final workflow registration only. Do not modify files.
 
