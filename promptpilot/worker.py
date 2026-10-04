@@ -11,6 +11,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -2425,6 +2426,7 @@ def _reap_futures(in_flight: dict, recoveries: dict,
                 f"{type(exc).__name__}: {exc}",
                 flush=True,
             )
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
             _queue_stuck_recovery(recoveries, task, lock, exc)
     _drain_stuck_recoveries(recoveries, now=now)
 
@@ -2701,6 +2703,7 @@ def run_worker():
                 execute_task(task)
             except Exception as exc:  # an unhandled crash must not stop the loop
                 print(f"  !! исполнение задачи #{task.id} упало: {type(exc).__name__}: {exc}", flush=True)
+                traceback.print_exception(type(exc), exc, exc.__traceback__)
                 _queue_stuck_recovery(
                     stuck_recoveries, task, lock_key(task), exc)
                 _drain_stuck_recoveries(stuck_recoveries)

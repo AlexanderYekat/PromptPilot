@@ -254,7 +254,9 @@ AUDIT_VERDICT: PASS
 
 Для замечаний верни JSON-массив объектов с полями fingerprint, severity
 (blocker/high/medium/low/info), category, title, status (open/resolved/reopened/
-accepted_risk), payload. AUDIT_VERDICT допускает только PASS,
+accepted_risk), payload. Поле payload — JSON-объект, не строка; например:
+{"fingerprint":"missing-check","severity":"medium","category":"requirements","title":"Нет проверки","status":"open","payload":{"details":"Описание замечания"}}
+AUDIT_VERDICT допускает только PASS,
 REVISION_REQUIRED или HUMAN_REQUIRED.
 
 Если список незакрытых замечаний выше не пуст, верни в AUDIT_FINDINGS_JSON

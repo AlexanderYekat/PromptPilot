@@ -29,6 +29,7 @@ try {
     & git diff --check
     if ($LASTEXITCODE) { throw 'git diff --check failed.' }
     if (& git status --porcelain --untracked-files=no) { throw 'Commit tracked changes before producing a release receipt.' }
+    if ((& git rev-parse HEAD) -ne $commit) { throw 'HEAD changed during validation; no release receipt can be issued.' }
     @{ commit=$commit; result='passed'; python=(& $Python --version); checked_at=[datetime]::UtcNow.ToString('o') } | ConvertTo-Json | Set-Content -LiteralPath $Receipt -Encoding utf8
 } finally {
     Get-ChildItem Env: | Where-Object { $_.Name -like 'PP_*' -or $_.Name -eq 'PYTHONUTF8' } | ForEach-Object { Remove-Item -LiteralPath "Env:$($_.Name)" }
