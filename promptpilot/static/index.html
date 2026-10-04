@@ -643,19 +643,14 @@
   .skill-name { font-family: var(--mono); font-size: 12px; color: var(--accent2); min-width: 120px; }
   .skill-arghint { font-size: 11px; color: var(--yellow); }
   .skill-desc { font-size: 11px; color: var(--text2); }
-  /* Which build is open: custom build only; the author's version shows no banner. */
-  .build-banner { position: sticky; top: 0; z-index: 1000; padding: 6px 16px; text-align: center;
-                  font-weight: 600; font-size: 13px; letter-spacing: .03em; color: #fff; background: #2457c5; }
-  .build-banner.hidden { display: none; }
-  .build-banner.trial { background: #c25e00; }
-  .build-banner.production { background: #1d7a3a; }
+  /* Which build is open: custom build only; the author's version shows no caption. */
+  .build-tag { font-size: 12px; font-weight: 400; letter-spacing: 0; color: var(--text2); margin-left: 10px; }
 </style>
 </head>
 <body>
-<div id="buildBanner" class="build-banner hidden"></div>
 <div class="container">
   <header>
-    <div class="logo">Prompt<span>Pilot</span></div>
+    <div class="logo">Prompt<span>Pilot</span><small class="build-tag" id="buildTag"></small></div>
     <div class="badges" id="badges"></div>
   </header>
 
@@ -1040,23 +1035,23 @@ function toast(msg, isErr = true) {
   el._t = setTimeout(() => { el.style.display = 'none'; }, isErr ? 6000 : 2500);
 }
 
-// Banner: «МОЯ СБОРКА · от 04.10.2026 · 828a9c7 · СТЕНД (ТЕСТОВЫЕ ДАННЫЕ)».
-function buildBannerText(b) {
+// Caption next to the logo: «моя сборка · от 04.10.2026 · стенд».
+function buildTagText(b) {
   const date = b.date ? new Date(b.date).toLocaleDateString('ru-RU') : '';
-  return ['МОЯ СБОРКА', date && 'от ' + date, b.commit && b.commit.slice(0, 7),
-          b.instance_title && b.instance_title.toUpperCase()].filter(Boolean).join(' · ');
+  const place = { trial: 'стенд', production: 'рабочая установка' }[b.instance] || '';
+  return ['моя сборка', date && 'от ' + date, place].filter(Boolean).join(' · ');
 }
 
-async function showBuildBanner() {
+async function showBuildTag() {
   try {
     const b = await fetchJSON(`${API}/build`);
     if (!b) return;
-    const el = document.getElementById('buildBanner');
-    el.textContent = buildBannerText(b);
-    el.className = 'build-banner ' + (b.instance || '');
+    const el = document.getElementById('buildTag');
+    el.textContent = buildTagText(b);
+    el.title = b.commit ? 'Версия ' + b.commit.slice(0, 7) : '';
     const prefix = { trial: '[Стенд] ', production: '[Рабочая] ' }[b.instance] || '';
     document.title = prefix + 'Моя сборка · PromptPilot';
-  } catch (e) { /* the page works without the banner */ }
+  } catch (e) { /* the page works without the caption */ }
 }
 
 async function fetchJSON(url, opts) {
@@ -4377,7 +4372,7 @@ setInterval(() => wfRefreshScreen(), 4000);  // экран активного ta
 setInterval(() => autoRefreshWorkflowState(), 5000);  // стадия, раунды и runs без ручного «Обновить»
 setInterval(loadWorkerStatus, 10000);
 setInterval(loadCosts, 30000);
-showBuildBanner();
+showBuildTag();
 </script>
 </body>
 </html>
