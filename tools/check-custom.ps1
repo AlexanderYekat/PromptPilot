@@ -13,19 +13,25 @@ try {
     @{ commit=$commit; result='running' } | ConvertTo-Json | Set-Content -LiteralPath $Receipt -Encoding utf8
     Get-ChildItem Env: | Where-Object { $_.Name -like 'PP_*' } | ForEach-Object { Remove-Item -LiteralPath "Env:$($_.Name)" }
     $env:PYTHONUTF8='1'
+    # A fresh candidate worktree has no _local yet.
+    New-Item -ItemType Directory -Force -Path (Join-Path $taskRoot '_local') | Out-Null
     $emptyEnv=Join-Path $taskRoot '_local\validation.env'
     Set-Content -LiteralPath $emptyEnv -Value ''
     $env:PP_ENV_FILE=$emptyEnv
     $env:PP_DATA_DIR=Join-Path $taskRoot '_local\validation'
+    Write-Host '== check: ruff'
     & $Python -m ruff check promptpilot tests tools main.py
     if ($LASTEXITCODE) { throw 'Lint failed.' }
+    Write-Host '== check: pytest'
     & $Python -m pytest -q -W error
     if ($LASTEXITCODE) { throw 'Tests failed.' }
+    Write-Host '== check: javascript'
     if (-not (Get-Command node -ErrorAction SilentlyContinue)) { throw 'Node.js is required.' }
     foreach ($taskTest in Get-ChildItem -LiteralPath tests -Filter '*.cjs') {
         & node $taskTest.FullName
         if ($LASTEXITCODE) { throw "JavaScript test failed: $($taskTest.Name)" }
     }
+    Write-Host '== check: git diff'
     & git diff --check
     if ($LASTEXITCODE) { throw 'git diff --check failed.' }
     if (& git status --porcelain --untracked-files=no) { throw 'Commit tracked changes before producing a release receipt.' }
