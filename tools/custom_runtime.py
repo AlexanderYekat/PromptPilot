@@ -1,7 +1,10 @@
 """Prepare an immutable trial release and safe, local demonstrations."""
 import argparse
+from contextlib import closing
 import json
 import os
+import shutil
+import sqlite3
 from pathlib import Path
 import subprocess
 import sys
@@ -18,6 +21,24 @@ def git(*args):
 def prepare(ref):
     sha = git("rev-parse", "--verify", ref + "^{commit}")
     local = ROOT / "_local"
+    if (local / "trial-processes.json").exists():
+        raise SystemExit("Stop the trial before preparing a release")
+    pointer_file = local / "trial-release.json"
+    previous = json.loads(pointer_file.read_text(encoding="utf-8")) if pointer_file.exists() else None
+    if previous and previous["commit"] != sha:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        backup = local / "backups" / f"{stamp}-{previous['commit'][:12]}"
+        backup.mkdir(parents=True)
+        source_data = Path(previous["data"])
+        shutil.copytree(source_data, backup / "data", ignore=shutil.ignore_patterns(
+            "promptpilot.db", "promptpilot.db-wal", "promptpilot.db-shm"))
+        source_db = source_data / "promptpilot.db"
+        if source_db.exists():
+            with closing(sqlite3.connect(source_db.as_uri() + "?mode=ro", uri=True)) as src:
+                with closing(sqlite3.connect(backup / "data" / "promptpilot.db")) as dst:
+                    src.backup(dst)
+        shutil.copy2(previous["env_file"], backup / "trial.env")
+        shutil.copy2(pointer_file, backup / "trial-release.json")
     release = local / "releases" / sha
     marker = release / "release.json"
     if release.exists() and not marker.exists():
@@ -44,7 +65,7 @@ def prepare(ref):
             "PP_VERDICT_REPAIR=0\n", encoding="utf-8")
     pointer = {"commit": sha, "release": str(release), "env_file": str(envfile),
                "data": str(data), "python": sys.executable}
-    (local / "trial-release.json").write_text(json.dumps(pointer, indent=2), encoding="utf-8")
+    pointer_file.write_text(json.dumps(pointer, indent=2), encoding="utf-8")
     print(json.dumps(pointer, indent=2))
 
 
@@ -56,7 +77,9 @@ def seed():
     config.DB_DIR.mkdir(parents=True, exist_ok=True)
     initialized = config.DB_DIR / "trial-initialized.json"
     if initialized.exists():
-        print(initialized.read_text(encoding="utf-8"))
+        receipt = json.loads(initialized.read_text(encoding="utf-8"))
+        receipt["worker_paused"] = db.is_paused()
+        print(json.dumps(receipt, indent=2))
         return
     db.init_db()
     db.set_setting("worker_paused", "1")
@@ -99,6 +122,7 @@ def seed():
             config={"automation": {"enabled": True}, "roles": {
                 "executor": {"provider": "codex", "rights": "read"},
                 "reviewer": {"provider": "codex", "rights": "read", "task_timeout": 180}},
+                "stage": {"code": "EXTERNAL", "title": "Внешняя инструкция", "execution_mode": "external"},
                 "gate": {"commands": []}, "limits": {"max_rounds": 6}}))
         wf = workflows.start_workflow(wf.id, WorkflowStartRequest(expected_version=wf.state_version))
         workflows.request_external(wf.id, wf.state_version)

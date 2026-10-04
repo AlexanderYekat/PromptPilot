@@ -864,14 +864,16 @@
         <div class="wf-wizard-roles">
           <div class="wf-wizard-role">
             <h5>Планировщик</h5><p>Один раз исследует задачу и предлагает этапы.</p>
-            <label>Provider<select id="wfNewPlannerProvider"></select></label>
+            <label>Provider<select id="wfNewPlannerProvider" onchange="wfRefreshRights('wfNewPlanner', false)"></select></label>
+            <label>Права<select id="wfNewPlannerRights"></select></label>
             <label>Модель<input id="wfNewPlannerModel" placeholder="по умолчанию"></label>
             <label>Effort<select id="wfNewPlannerEffort"><option value="">по умолчанию</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></label>
             <label>Timeout, сек<input id="wfNewPlannerTimeout" type="number" min="0" value="3600"></label>
           </div>
           <div class="wf-wizard-role executor">
             <h5>Исполнитель</h5><p>Пишет код и исправляет замечания аудитора.</p>
-            <label>Provider<select id="wfNewExecutorProvider"></select></label>
+            <label>Provider<select id="wfNewExecutorProvider" onchange="wfRefreshRights('wfNewExecutor', true)"></select></label>
+            <label>Права<select id="wfNewExecutorRights"></select></label>
             <label>Модель<input id="wfNewExecutorModel" placeholder="например Gemini Flash"></label>
             <label>Effort<select id="wfNewExecutorEffort"><option value="">по умолчанию</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></label>
             <label>Timeout, сек<input id="wfNewExecutorTimeout" type="number" min="0" value="14400"></label>
@@ -880,7 +882,8 @@
           </div>
           <div class="wf-wizard-role reviewer">
             <h5>Независимый аудитор</h5><p>Не исправляет код, а ищет ложные доказательства.</p>
-            <label>Provider<select id="wfNewReviewerProvider"></select></label>
+            <label>Provider<select id="wfNewReviewerProvider" onchange="wfRefreshRights('wfNewReviewer', false)"></select></label>
+            <label>Права<select id="wfNewReviewerRights"></select></label>
             <label>Модель<input id="wfNewReviewerModel" placeholder="по умолчанию"></label>
             <label>Effort<select id="wfNewReviewerEffort"><option value="">по умолчанию</option><option>medium</option><option>high</option><option>xhigh</option><option>max</option></select></label>
             <label>Timeout, сек<input id="wfNewReviewerTimeout" type="number" min="0" value="3600"></label>
@@ -1824,6 +1827,7 @@ function wfWizardApplyPreset(key) {
   wfWizardSetValue('wfNewPlannerProvider', codex);
   wfWizardSetValue('wfNewExecutorProvider', agy);
   wfWizardSetValue('wfNewReviewerProvider', codex);
+  for (const role of ['Planner', 'Executor', 'Reviewer']) wfRefreshRights(`wfNew${role}`, role === 'Executor');
   wfWizardSetValue('wfNewPlannerEffort', preset.planner);
   wfWizardSetValue('wfNewExecutorEffort', preset.executor);
   wfWizardSetValue('wfNewReviewerEffort', preset.reviewer);
@@ -1863,6 +1867,8 @@ function wfWizardApplyTemplateData(template) {
   for (const [prefix, role] of [['Planner', template.roles?.planner], ['Executor', template.roles?.executor], ['Reviewer', template.roles?.reviewer]]) {
     if (!role) continue;
     wfWizardSetValue(`wfNew${prefix}Provider`, role.provider);
+    wfRefreshRights(`wfNew${prefix}`, prefix === 'Executor');
+    wfWizardSetValue(`wfNew${prefix}Rights`, role.rights);
     wfWizardSetValue(`wfNew${prefix}Model`, role.model);
     wfWizardSetValue(`wfNew${prefix}Effort`, role.effort);
     wfWizardSetValue(`wfNew${prefix}Timeout`, role.task_timeout);
@@ -1997,6 +2003,7 @@ function wfWizardRole(prefix) {
     provider: document.getElementById(`wfNew${prefix}Provider`).value || null,
     model: document.getElementById(`wfNew${prefix}Model`).value.trim() || null,
     effort: document.getElementById(`wfNew${prefix}Effort`).value || null,
+    rights: document.getElementById(`wfNew${prefix}Rights`).value || null,
     task_timeout: timeout || null,
     worktree: prefix === 'Executor' ? document.getElementById('wfNewExecutorWorktree').checked : false,
     skip_permissions: prefix === 'Executor' ? document.getElementById('wfNewExecutorSkip').checked : false,
@@ -2169,6 +2176,17 @@ function workflowProviderOptions(selected = 'herdr-session', includeSession = tr
 
 function wfChecked(value) { return value ? ' checked' : ''; }
 
+function wfRightsOptions(provider, selected, allowFull) {
+  const supported = providersData[provider || document.getElementById('providerInput').value]?.rights || [];
+  const names = {'':'как обычно', none:'без инструментов', read:'чтение', write:'правка файлов', full:'полные'};
+  return Object.entries(names).map(([value, label]) => `<option value="${value}"${value === (selected || '') ? ' selected' : ''}${value && (!supported.includes(value) || (!allowFull && value === 'full')) ? ' disabled' : ''}>${label}</option>`).join('');
+}
+
+function wfRefreshRights(prefix, allowFull) {
+  const select = document.getElementById(`${prefix}Rights`);
+  select.innerHTML = wfRightsOptions(document.getElementById(`${prefix}Provider`).value, select.value, allowFull);
+}
+
 function workflowSettingsHtml(wf) {
   const cfg = wf.config || {};
   const automation = cfg.automation || {};
@@ -2182,7 +2200,8 @@ function workflowSettingsHtml(wf) {
     .map(x => `<option value="${x}"${x === (value || '') ? ' selected' : ''}>${x || 'по умолчанию'}</option>`).join('');
   const roleCard = (prefix, title, role, allowWrite) => `<div class="wf-settings-card">
     <h4>${title}</h4>
-    <label>Провайдер<select id="wfCfg${prefix}Provider">${workflowProviderOptions(role.provider || '', true)}</select></label>
+    <label>Провайдер<select id="wfCfg${prefix}Provider" onchange="wfRefreshRights('wfCfg${prefix}', ${allowWrite})">${workflowProviderOptions(role.provider || '', true)}</select></label>
+    <label title="Codex read/write используют песочницу и допускают команды; Claude ограничивает список инструментов.">Права<select id="wfCfg${prefix}Rights">${wfRightsOptions(role.provider, role.rights, allowWrite)}</select></label>
     <label>Модель<input id="wfCfg${prefix}Model" value="${escAttr(role.model || '')}" placeholder="по умолчанию провайдера"></label>
     <label>Effort<select id="wfCfg${prefix}Effort">${effortOptions(role.effort)}</select></label>
     <label>Timeout, сек<input id="wfCfg${prefix}Timeout" type="number" min="0" value="${role.task_timeout ?? ''}" placeholder="0 = без лимита"></label>
@@ -2574,6 +2593,7 @@ function wfRoleSettings(prefix, current, allowWrite) {
     provider: document.getElementById(`wfCfg${prefix}Provider`).value || null,
     model: document.getElementById(`wfCfg${prefix}Model`).value.trim() || null,
     effort: document.getElementById(`wfCfg${prefix}Effort`).value || null,
+    rights: document.getElementById(`wfCfg${prefix}Rights`).value || null,
     task_timeout: wfOptionalNumber(`wfCfg${prefix}Timeout`),
     herdr_target: document.getElementById(`wfCfg${prefix}Target`).value.trim() || null,
     worktree: document.getElementById(`wfCfg${prefix}Worktree`).checked,

@@ -240,6 +240,8 @@ class WorkflowRolesConfig(BaseModel):
     def reviewer_is_not_unrestricted(self):
         if self.reviewer.skip_permissions:
             raise ValueError("reviewer cannot use skip_permissions")
+        if self.reviewer.rights == "full":
+            raise ValueError("reviewer cannot run with full rights")
         return self
 
 

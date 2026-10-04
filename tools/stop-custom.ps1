@@ -14,7 +14,9 @@ foreach ($entry in $entries) {
     $process = Get-Process -Id $entry.pid -ErrorAction SilentlyContinue
     if (-not $process) { continue }
     $info = $snapshot | Where-Object { $_.ProcessId -eq $entry.pid }
-    $startMatches = [Math]::Abs(($process.StartTime.ToUniversalTime() - [datetime]::Parse($entry.started).ToUniversalTime()).TotalSeconds) -lt 1
+    # PowerShell 7 converts ISO JSON dates to DateTime; parsing its localized
+    # string a second time can swap day/month. Casting handles both PS5 and PS7.
+    $startMatches = [Math]::Abs(($process.StartTime.ToUniversalTime() - ([datetimeoffset]$entry.started).UtcDateTime).TotalSeconds) -lt 1
     $commandMatches = $info -and ([string]$info.CommandLine).Contains((Join-Path $entry.release 'main.py'))
     if (-not ($startMatches -and $commandMatches)) { throw "PID $($entry.pid) no longer matches this trial; left untouched." }
     if ($PSCmdlet.ShouldProcess("$($entry.service) PID $($entry.pid)", 'Stop trial process tree')) { Stop-TrialTree $entry.pid }

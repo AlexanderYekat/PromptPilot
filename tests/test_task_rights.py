@@ -58,6 +58,8 @@ def test_claude_rights(providers, rights, expected):
     cmd = config.build_cmd("claude", "do it", rights=rights)
 
     assert contains_run(args_before_prompt(cmd), expected)
+    if rights != "full":
+        assert cmd[-2:] == ["--", "do it"]  # variadic --tools must not eat the prompt
 
 
 def test_rights_win_over_skip_permissions(providers):

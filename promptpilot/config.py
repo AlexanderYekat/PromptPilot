@@ -797,6 +797,12 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
         else:
             prompt_idx = len(cmd)
         cmd[prompt_idx:prompt_idx] = extras
+    if is_claude and "--tools" in cmd and prompt in cmd:
+        # --tools is variadic: without an option terminator it consumes the
+        # positional prompt in none/read mode (write has a later flag by chance).
+        prompt_idx = cmd.index(prompt)
+        if "--" not in cmd[:prompt_idx]:
+            cmd.insert(prompt_idx, "--")
     return cmd
 
 
