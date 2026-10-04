@@ -596,9 +596,11 @@ def workflow_start(reference, base_sha):
 @click.option("-w", "--worktree", is_flag=True)
 @click.option("--skip-permissions", is_flag=True)
 @click.option("--timeout", "task_timeout", type=click.IntRange(0), default=None)
+@click.option("--rights", type=click.Choice(["none", "read", "write", "full"]))
+@click.option("--execution-mode", type=click.Choice(["automatic", "external"]), default="automatic")
 def workflow_dispatch(reference, role, prompt, file_path, provider, model,
                       priority, working_dir, worktree, skip_permissions,
-                      task_timeout):
+                      task_timeout, rights, execution_mode):
     """Queue an executor or reviewer task for the current round."""
     from . import workflows
     from .models import WorkflowRole, WorkflowTaskDispatch
@@ -623,6 +625,8 @@ def workflow_dispatch(reference, role, prompt, file_path, provider, model,
             worktree=worktree,
             skip_permissions=skip_permissions,
             task_timeout=task_timeout,
+            rights=rights,
+            execution_mode=execution_mode,
         ),
     )
     click.echo(

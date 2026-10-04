@@ -522,13 +522,12 @@ def _row_to_task(row: sqlite3.Row) -> TaskInDB:
 def _connect(immediate: bool = False):
     DB_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
-    if immediate:
-        # Take the write lock before reading: a claim that decides on a stale
-        # snapshot would hand the same task to two workers.
-        conn.execute("BEGIN IMMEDIATE")
     try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys=ON")
+        if immediate:
+            # Acquisition can fail too; always close the connection in that case.
+            conn.execute("BEGIN IMMEDIATE")
         yield conn
         conn.commit()
     except Exception:

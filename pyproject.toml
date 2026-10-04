@@ -52,3 +52,7 @@ promptpilot = ["static/*"]
 # Pyflakes-class only: real errors, not style.
 [tool.ruff.lint]
 select = ["F", "E9"]
+
+[tool.pytest.ini_options]
+# Local release snapshots and user backups can contain older copies of tests.
+testpaths = ["tests"]

@@ -20,16 +20,23 @@ def _load_dotenv():
       3. Current working directory
       4. ~/.promptpilot/.env  (permanent user config)
     """
-    candidates = []
+    # An isolated instance must not inherit the user's production .env.
+    # An explicitly supplied file is the only source, even when it is empty.
+    explicit = os.environ.get("PP_ENV_FILE")
+    if explicit is not None:
+        candidates = [Path(explicit)] if explicit else []
+    else:
+        candidates = []
 
-    if getattr(sys, "frozen", False):
+    if explicit is None and getattr(sys, "frozen", False):
         # Running as pp.exe — look next to the binary first, then one level up
         exe_dir = Path(sys.executable).parent
         candidates.append(exe_dir / ".env")
         candidates.append(exe_dir.parent / ".env")
 
-    candidates.append(Path.cwd() / ".env")
-    candidates.append(Path.home() / ".promptpilot" / ".env")
+    if explicit is None:
+        candidates.append(Path.cwd() / ".env")
+        candidates.append(Path.home() / ".promptpilot" / ".env")
 
     for env_file in candidates:
         if env_file.exists():

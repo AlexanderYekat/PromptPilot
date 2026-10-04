@@ -1,5 +1,9 @@
 # PromptPilot
 
+> Ветка `custom` форка AlexanderYekat: свежий PromptPilot + выбранные функции ivantit66.
+> Запуск, происхождение изменений и порядок обновления: [CUSTOM_SETUP.md](docs/CUSTOM_SETUP.md).
+> Ветка `main` сохраняется точной копией основной ветки автора.
+
 > **Background task queue for AI CLIs** — schedule prompts, retry on rate limits, manage everything via Web UI or Telegram bot.
 >
 > Works with Claude Code, OpenAI Codex, Qwen Code, Cursor Agent, or any CLI that accepts a prompt argument.

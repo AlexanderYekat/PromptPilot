@@ -719,7 +719,7 @@
         <input type="checkbox" id="skipPermissions" style="width:auto;margin:0">
         <span style="font-size:13px;color:var(--yellow)" title="Claude: --dangerously-skip-permissions; Codex: --dangerously-bypass-approvals-and-sandbox">⚠ не спрашивать разрешения</span>
       </label>
-      <label id="rightsLabel" style="display:none" title="Что агенту можно. Без инструментов — только текст; чтение — смотреть файлы; правка — менять файлы в папке задачи, не запуская команд; полные — всё. «Как обычно» — решает галочка «не спрашивать разрешения». Недоступное для провайдера неактивно.">Права
+      <label id="rightsLabel" style="display:none" title="Что агенту можно. Без инструментов — только текст. У Claude чтение и правка ограничивают список инструментов; у Codex это read-only и workspace-write: команды внутри песочницы остаются доступны. Полные — без этих ограничений. «Как обычно» — решает галочка «не спрашивать разрешения». Недоступное для провайдера неактивно.">Права
         <select id="rightsInput">
           <option value="">как обычно</option>
           <option value="none">без инструментов</option>
