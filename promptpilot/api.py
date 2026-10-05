@@ -60,6 +60,7 @@ from .models import (
     WorkflowVersionRequest,
 )
 from .version import check_for_update
+from .build_info import build_info
 
 
 def _sample_pipeline_profiles():
@@ -1157,6 +1158,12 @@ def api_worker_resume():
 @app.get("/api/version")
 def api_version():
     return check_for_update()
+
+
+@app.get("/api/build")
+def api_build():
+    """Which build and installation is running; the page shows it as a banner."""
+    return build_info()
 
 
 @app.get("/api/providers")

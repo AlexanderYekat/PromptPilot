@@ -1,10 +1,11 @@
 [CmdletBinding(SupportsShouldProcess)]
-param()
+param([string]$Root = '')
 $ErrorActionPreference = 'Stop'
-$taskRoot = Split-Path -Parent $PSScriptRoot
+$taskRoot = if ($Root) { (Resolve-Path -LiteralPath $Root).Path } else { Split-Path -Parent $PSScriptRoot }
 $pidFile = Join-Path $taskRoot '_local\trial-processes.json'
 if (-not (Test-Path -LiteralPath $pidFile)) { Write-Host 'No trial process manifest.'; return }
-$entries = @(Get-Content -LiteralPath $pidFile -Raw | ConvertFrom-Json)
+# Windows PowerShell 5.1 emits a JSON array as one object; @() would wrap it once more.
+$entries = Get-Content -LiteralPath $pidFile -Raw | ConvertFrom-Json
 $snapshot = @(Get-CimInstance Win32_Process)
 function Stop-TrialTree([int]$processId) {
     foreach ($child in @($snapshot | Where-Object { $_.ParentProcessId -eq $processId })) { Stop-TrialTree ([int]$child.ProcessId) }
