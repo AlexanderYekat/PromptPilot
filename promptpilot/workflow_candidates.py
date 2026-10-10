@@ -40,6 +40,7 @@ def git(path, *args, stdin=None):
     # Neither a parent GIT_DIR nor an index override may redirect verification.
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith('GIT_')}
     env['GIT_OPTIONAL_LOCKS'] = '0'
+    env['GIT_NO_REPLACE_OBJECTS'] = '1'
     try:
         result = subprocess.run(
             ['git', '-C', path, *args], env=env, capture_output=True, timeout=30,
@@ -112,6 +113,9 @@ def snapshot(path, policy):
         if PurePosixPath(name).suffix.lower() not in {'.md', '.txt', '.rst', '.pdf'}:
             raise CandidateError('invalid_additional_input', f'Дополнительный вход должен быть документом: {name}')
     for directory in outputs:
+        output_path = Path(path) / directory
+        if output_path.exists() and not output_path.is_dir():
+            raise CandidateError('unsafe_output_directory', f'Выходной путь должен быть каталогом: {directory}')
         if any(under(name, directory) for name in set(tracked) | inputs):
             raise CandidateError('unsafe_output_directory', f'Каталог содержит проверяемые входы: {directory}')
         if directory.split('/')[-1].lower() in {'src', 'tests', 'test', 'lib', 'promptpilot', '.git'}:
@@ -135,6 +139,10 @@ def snapshot(path, policy):
             metadata, name = item.split('\t', 1)
             committed[name] = metadata.split()[2]
     checked = sorted(set(tracked) - inputs)
+    attrs = git(path, 'check-attr', '-z', '--stdin', 'filter', stdin=''.join(n + '\0' for n in checked)).split('\0') if checked else []
+    for index in range(0, len(attrs) - 1, 3):
+        if attrs[index + 2] not in {'unspecified', 'unset'}:
+            raise CandidateError('unsupported_filter', 'Нельзя доказать соответствие commit через пользовательский Git filter: ' + attrs[index])
     actual_hashes = git(path, 'hash-object', '--stdin-paths', stdin=''.join(json.dumps(n, ensure_ascii=False) + '\n' for n in checked)).splitlines() if checked else []
     if len(actual_hashes) != len(checked):
         raise CandidateError('git_verification_failed', 'Не получены контрольные суммы всех файлов')
@@ -246,8 +254,11 @@ def validate(candidate):
 
 
 def task_blocked(conn, task):
-    path = canonical(task.working_dir or os.getcwd())
-    for lock in conn.execute('SELECT * FROM workflow_candidate_locks'):
+    locks = conn.execute('SELECT * FROM workflow_candidate_locks').fetchall()
+    if not locks:
+        return False
+    path = canonical(getattr(task, 'working_dir', None) or os.getcwd())
+    for lock in locks:
         if not overlaps(path, lock['repository_path']):
             continue
         own = conn.execute('SELECT 1 FROM workflow_runs WHERE task_id=? AND workflow_id=? AND round_id=?',
@@ -272,9 +283,12 @@ def prepare_dispatch(conn, workflow, round_row, dispatch, working_dir):
             (workflow['id'], candidate['round_id']))]
         gates = [g for g in gates if g.get('candidate_id') == candidate['candidate_id']]
         context = {'candidate_id': candidate['candidate_id'], 'candidate': candidate, 'gate_protocols': gates}
+        prompt_context = {k: v for k, v in candidate.items() if k not in {'manifest', 'additional_input_index'}}
+        prompt_context.update(manifest_files=len(candidate['manifest']), gate_protocols=gates,
+                              manifest_api=f"/api/workflows/{workflow['id']}/candidates")
         return context, (dispatch.prompt + '\n\nВерсия: ' + candidate['candidate_revision']
                          + '\nРабочая папка: ' + candidate['repository_path']
-                         + '\nПроверяемая передача результата (не изменяйте входы):\n' + json.dumps(context, ensure_ascii=False))
+                         + '\nПроверяемая передача результата (не изменяйте входы; полный манифест доступен в API):\n' + json.dumps(prompt_context, ensure_ascii=False))
     for lock in conn.execute('SELECT * FROM workflow_candidate_locks'):
         if overlaps(canonical(working_dir), lock['repository_path']):
             raise CandidateError('repository_busy', 'Папка уже зарезервирована для workflow ' + lock['workflow_id'])

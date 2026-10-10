@@ -416,3 +416,22 @@ def test_output_directory_cannot_hide_untracked_source(repo):
     (repo / 'results' / 'hidden.py').write_text('implementation = True')
     with pytest.raises(candidates.CandidateError, match='untracked_inputs'):
         candidates.snapshot(str(repo), WorkflowCandidateConfig(enabled=True, output_directories=['results']))
+
+
+def test_git_replace_cannot_redefine_a_commit(repo):
+    original = git(repo, 'rev-parse', 'HEAD')
+    (repo / 'code.py').write_text('different = True\n')
+    git(repo, 'add', 'code.py')
+    git(repo, 'commit', '-m', 'replacement')
+    replacement = git(repo, 'rev-parse', 'HEAD')
+    git(repo, 'replace', original, replacement)
+    assert candidates.git(str(repo), 'show', original + ':code.py') == 'value = 1'
+
+
+def test_custom_git_filter_cannot_mask_working_files(repo):
+    from promptpilot.models import WorkflowCandidateConfig
+    # Attributes in .git/info are untracked and could otherwise change the
+    # interpretation of bytes without changing the candidate commit.
+    (repo / '.git' / 'info' / 'attributes').write_text('code.py filter=custom\n')
+    with pytest.raises(candidates.CandidateError, match='unsupported_filter'):
+        candidates.snapshot(str(repo), WorkflowCandidateConfig(enabled=True))
