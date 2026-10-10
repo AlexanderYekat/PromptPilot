@@ -292,6 +292,16 @@ class WorkflowPlanningConfig(BaseModel):
     prompt_template: str = ""
 
 
+class WorkflowCandidateConfig(BaseModel):
+    """Opt-in Git handoff; exclusions must be explicit, repository-relative paths."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    additional_inputs: list[str] = Field(default_factory=list)
+    output_directories: list[str] = Field(default_factory=list)
+
+
 class WorkflowConfig(BaseModel):
     """Versioned workflow configuration with legacy-friendly defaults."""
 
@@ -306,6 +316,7 @@ class WorkflowConfig(BaseModel):
     planning: WorkflowPlanningConfig = Field(default_factory=WorkflowPlanningConfig)
     limits: WorkflowLimitsConfig = Field(default_factory=WorkflowLimitsConfig)
     stage: dict[str, Any] = Field(default_factory=dict)
+    candidate: WorkflowCandidateConfig = Field(default_factory=WorkflowCandidateConfig)
 
 
 class WorkflowSetupValidationRequest(BaseModel):
@@ -315,6 +326,7 @@ class WorkflowSetupValidationRequest(BaseModel):
     candidate_branch: str = Field(min_length=1)
     providers: list[str] = Field(default_factory=list, max_length=3)
     gate_commands: list[str] = Field(default_factory=list, max_length=20)
+    workflow_config: Optional[WorkflowConfig] = None
 
 
 class WorkflowSetupCheck(BaseModel):
@@ -660,6 +672,8 @@ class WorkflowGateDecision(BaseModel):
     gate_id: str = Field(default="manual-gate", min_length=1)
     summary: str = ""
     evidence: list[str] = Field(default_factory=list)
+    candidate_id: Optional[str] = None
+    receipt_id: Optional[str] = None
 
 
 class ReviewVerdict(str, Enum):

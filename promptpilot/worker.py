@@ -2167,6 +2167,12 @@ def execute_task(task, admission_complete=None):
     except Exception as exc:
         print(f"  !! workflow start sync #{task.id}: {exc}", flush=True)
     try:
+        from . import workflow_candidates
+        try:
+            workflow_candidates.preflight_task(task)
+        except workflow_candidates.CandidateError as exc:
+            _mark_failed(task, str(exc))
+            return
         if admission_complete is None:
             return _execute_task_inner(task)
         return _execute_task_inner(task, admission_complete)

@@ -14,7 +14,7 @@ import subprocess
 from collections import Counter
 from typing import Optional
 
-from . import db
+from . import db, workflow_candidates as candidates
 from .models import (
     FindingStatus,
     FindingSeverity,
@@ -321,6 +321,8 @@ def _transition(conn: sqlite3.Connection, workflow: sqlite3.Row,
     )
     if cur.rowcount != 1:
         raise db.WorkflowConflictError("workflow changed concurrently")
+    if target in TERMINAL_STATES or target in {WorkflowStatus.QUEUED, WorkflowStatus.REVISION_REQUIRED}:
+        conn.execute('DELETE FROM workflow_candidate_locks WHERE workflow_id=?', (workflow['id'],))
     db._append_workflow_event(conn, WorkflowEventCreate(
         workflow_id=workflow["id"],
         round_id=round_id,
@@ -458,6 +460,9 @@ def _render_planner_prompt(workflow: WorkflowInDB, custom_prompt: str = "") -> s
         rendered = rendered.replace("{{" + name + "}}", value)
     if custom_prompt.strip():
         rendered += "\n\nДополнительные указания пользователя:\n" + custom_prompt.strip()
+    rendered += ('\nФиксация версии кандидата: ' + ('включена' if candidates.config(workflow).candidate.enabled else 'выключена')
+                 + '. PROMPTPILOT_CANDIDATE_SHA/ID/REPOSITORY доступны gate только при включённой фиксации. '
+                 'Не предполагай их наличие. Все роли должны использовать одну локальную папку без автоматического worktree.')
     return rendered.strip() + "\n\n" + PLAN_OUTPUT_CONTRACT.strip()
 
 
@@ -705,6 +710,7 @@ def approve_plan(workflow_id: str,
         ).fetchall()
         if not stages:
             raise db.WorkflowConflictError("workflow plan has no stages")
+        candidates.readiness(workflow, stages)
         now = db._now()
         conn.execute(
             "UPDATE workflow_stages SET status='pending' WHERE workflow_id=?",
@@ -747,6 +753,7 @@ def start_workflow(workflow_id: str,
         _require_version(workflow, request.expected_version)
         if WorkflowStatus(workflow["status"]) is not WorkflowStatus.DRAFT:
             raise db.WorkflowConflictError("only a draft workflow can be started")
+        candidates.readiness(workflow)
         round_no = workflow["current_round"] + 1
         round_row = _insert_round(
             conn, workflow_id, round_no, base_sha=request.base_sha
@@ -773,6 +780,7 @@ def _input_sha(dispatch: WorkflowTaskDispatch, working_dir: str) -> str:
     return hashlib.sha256(db._json_dump(payload).encode("utf-8")).hexdigest()
 
 
+@candidates.guard_boundary
 def dispatch_task(workflow_id: str,
                   dispatch: WorkflowTaskDispatch) -> WorkflowDispatchResult:
     if dispatch.role not in {WorkflowRole.EXECUTOR, WorkflowRole.REVIEWER}:
@@ -805,10 +813,13 @@ def dispatch_task(workflow_id: str,
             )
         round_row = _current_round_row(conn, workflow)
         working_dir = dispatch.working_dir or workflow["repository_path"]
+        candidate_input, candidate_prompt = candidates.prepare_dispatch(
+            conn, workflow, round_row, dispatch, working_dir)
         if external:
-            return _open_external_run(conn, workflow, round_row, dispatch, working_dir)
+            return _open_external_run(conn, workflow, round_row, dispatch, working_dir,
+                                      candidate_input=candidate_input, assignment=candidate_prompt)
         task = db._insert_task(conn, TaskCreate(
-            prompt=dispatch.prompt.rstrip() + WORKFLOW_VERDICT_INSTRUCTION,
+            prompt=candidate_prompt.rstrip() + WORKFLOW_VERDICT_INSTRUCTION,
             working_dir=working_dir,
             provider=dispatch.provider,
             priority=dispatch.priority,
@@ -833,10 +844,10 @@ def dispatch_task(workflow_id: str,
         conn.execute(
             """INSERT INTO workflow_runs
                (id, workflow_id, round_id, role, attempt_no, task_id, status,
-                input_sha256)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)""",
+                input_sha256, input_json)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
             (run_id, workflow_id, round_row["id"], dispatch.role.value,
-             attempt_no, task.id, input_sha),
+             attempt_no, task.id, input_sha, db._json_dump(candidate_input)),
         )
         db._append_workflow_event(conn, WorkflowEventCreate(
             workflow_id=workflow_id,
@@ -887,7 +898,7 @@ def dispatch_task(workflow_id: str,
 
 def _open_external_run(conn: sqlite3.Connection, workflow: sqlite3.Row,
                        round_row: sqlite3.Row, dispatch: WorkflowTaskDispatch,
-                       working_dir: str) -> WorkflowDispatchResult:
+                       working_dir: str, *, candidate_input=None, assignment=None) -> WorkflowDispatchResult:
     """Hand the stage out: a run with the assignment and no queue task.
 
     The wait survives restarts (it is only rows) and holds no CLI process.
@@ -899,14 +910,14 @@ def _open_external_run(conn: sqlite3.Connection, workflow: sqlite3.Row,
     ).fetchone()[0]
     run_id = db._new_id("run")
     input_sha = _input_sha(dispatch, working_dir)
-    assignment = dispatch.prompt.strip()
+    assignment = (assignment if assignment is not None else dispatch.prompt).strip()
     conn.execute(
         """INSERT INTO workflow_runs
            (id, workflow_id, round_id, role, attempt_no, task_id, status,
             input_sha256, input_json, started_at)
            VALUES (?, ?, ?, 'executor', ?, NULL, 'awaiting_external', ?, ?, ?)""",
         (run_id, workflow["id"], round_row["id"], attempt_no, input_sha,
-         db._json_dump({"execution_mode": "external", "assignment": assignment}),
+         db._json_dump({"execution_mode": "external", "assignment": assignment, **(candidate_input or {})}),
          db._now()),
     )
     db._append_workflow_event(conn, WorkflowEventCreate(
@@ -983,6 +994,7 @@ def external_assignment(workflow_id: str) -> Optional[WorkflowExternalAssignment
     )
 
 
+@candidates.guard_boundary
 def submit_external_result(workflow_id: str,
                            submission: WorkflowExternalResult) -> WorkflowInDB:
     """Accept the result of an external stage; it goes on to gate and review.
@@ -1005,6 +1017,11 @@ def submit_external_result(workflow_id: str,
         ).fetchone()
         if not run:
             raise db.WorkflowConflictError("current round has no external assignment")
+        if candidates.config(workflow).candidate.enabled:
+            candidates.capture(conn, workflow, run, {
+                'id': None, 'worktree_path': None, 'working_dir': workflow['repository_path'],
+                'result': submission.result,
+            })
         external = {"performer": submission.performer.strip(),
                     "comment": submission.comment.strip()}
         output = {"task_status": "completed", "result": submission.result,
@@ -1036,6 +1053,7 @@ def submit_external_result(workflow_id: str,
         return db._row_to_workflow(workflow)
 
 
+@candidates.guard_boundary
 def record_gate(workflow_id: str,
                 decision: WorkflowGateDecision) -> WorkflowInDB:
     with db._connect(immediate=True) as conn:
@@ -1050,6 +1068,21 @@ def record_gate(workflow_id: str,
             "evidence": decision.evidence,
             "verdict": decision.verdict.value,
         }
+        if candidates.config(workflow).candidate.enabled:
+            candidate = candidates.current(conn, workflow, required=decision.verdict is GateVerdict.PASS)
+            if candidate is None:
+                raise candidates.CandidateError('candidate_missing', 'Нет зафиксированной сдачи')
+            common.update(candidate_id=candidate['candidate_id'], receipt_id=decision.receipt_id)
+            if decision.candidate_id != candidate['candidate_id']:
+                raise candidates.CandidateError('stale_candidate', 'Gate относится к другой сдаче')
+            if decision.verdict is GateVerdict.PASS:
+                candidates.validate(candidate)
+                receipt = conn.execute("SELECT payload_json FROM workflow_events WHERE seq=? AND event_type='candidate.gate_finished' AND workflow_id=? AND round_id=?",
+                                       (decision.receipt_id, workflow_id, round_row['id'])).fetchone()
+                proof = db._json_load(receipt[0]) if receipt else {}
+                if (proof.get('candidate_id') != candidate['candidate_id'] or proof.get('verdict') != 'PASS'
+                        or proof.get('state_version') != workflow['state_version']):
+                    raise candidates.CandidateError('gate_receipt_missing', 'Нужен успешный протокол обязательных gate этой сдачи')
         if decision.verdict is GateVerdict.PASS:
             round_status = WorkflowRoundStatus.REVIEWING
             target = WorkflowStatus.REVIEWING
@@ -1134,6 +1167,7 @@ def _upsert_review_finding(conn: sqlite3.Connection, workflow_id: str,
     return db._row_to_workflow_finding(row)
 
 
+@candidates.guard_boundary
 def record_review(workflow_id: str,
                   decision: WorkflowReviewDecision) -> WorkflowInDB:
     with db._connect(immediate=True) as conn:
@@ -1162,6 +1196,23 @@ def record_review(workflow_id: str,
         if not gate:
             raise db.WorkflowConflictError("current round has no passed gate")
 
+        candidate = None
+        if candidates.config(workflow).candidate.enabled:
+            candidate = candidates.current(conn, workflow)
+            candidates.validate(candidate)
+            context = db._json_load(reviewer['input_json'])
+            if context.get('candidate_id') != candidate['candidate_id']:
+                raise candidates.CandidateError('stale_candidate', 'Аудитор проверял другую сдачу')
+            task = conn.execute('SELECT * FROM tasks WHERE id=?', (reviewer['task_id'],)).fetchone()
+            if not task or candidates.canonical(task['worktree_path'] or task['working_dir']) != candidate['repository_path']:
+                raise candidates.CandidateError('repository_mismatch', 'Папка аудитора отличается от кандидата')
+            gates = conn.execute("SELECT payload_json FROM workflow_events WHERE workflow_id=? AND round_id=? AND event_type='gate.passed'", (workflow_id, round_row['id'])).fetchall()
+            if not any(db._json_load(g[0]).get('candidate_id') == candidate['candidate_id'] for g in gates):
+                raise candidates.CandidateError('gate_receipt_missing', 'Нет PASS gate этой сдачи')
+            parsed = parse_reviewer_report(db._json_load(reviewer['output_json']).get('result') or '')
+            if decision.verdict is ReviewVerdict.PASS and (not parsed or parsed.verdict is not ReviewVerdict.PASS or parsed.findings != decision.findings):
+                raise candidates.CandidateError('audit_not_passed', 'Независимый аудитор не подтвердил PASS с этими замечаниями')
+
         for finding in decision.findings:
             _upsert_review_finding(
                 conn, workflow_id, round_row["round_no"], finding
@@ -1172,6 +1223,9 @@ def record_review(workflow_id: str,
             "summary": decision.summary,
             "finding_count": len(decision.findings),
         }
+        if candidate:
+            common['candidate_id'] = candidate['candidate_id']
+            conn.execute('UPDATE workflow_rounds SET audit_sha=? WHERE id=?', (candidate['candidate_revision'], round_row['id']))
         if decision.verdict is ReviewVerdict.PASS:
             blockers = conn.execute(
                 """SELECT COUNT(*) FROM workflow_findings
@@ -1309,6 +1363,8 @@ def human_input(workflow_id: str,
         revision_context = (
             state is WorkflowStatus.REVISION_REQUIRED
             or round_row["status"] == WorkflowRoundStatus.REVISION_REQUIRED.value
+            or (candidates.config(workflow).candidate.enabled
+                and candidates.current(conn, workflow, required=False) is not None)
         )
         if revision_context:
             next_round = workflow["current_round"] + 1
@@ -1771,6 +1827,8 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         "objective": workflow.objective,
         "repository_path": workflow.repository_path,
         "candidate_branch": workflow.candidate_branch,
+        "candidate_revision": "",
+        "candidate_repository_path": "",
         "round_no": str(round_no),
         "stage_code": str(stage.get("code") or ""),
         "stage_title": str(stage.get("title") or ""),
@@ -1803,6 +1861,14 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         ], ensure_ascii=False, indent=2),
     }
     notes = _operator_notes(workflow.id, role)
+    if candidates.config(workflow).candidate.enabled:
+        with db._connect() as conn:
+            candidate = candidates.current(conn, _workflow_row(conn, workflow.id), required=False)
+        if candidate:
+            values['candidate_revision'] = candidate['candidate_revision']
+            values['candidate_repository_path'] = candidate['repository_path']
+        if role is WorkflowRole.REVIEWER:
+            values['gate_evidence'] = _latest_gate_evidence(workflow.id)
     values["human_input"] = _operator_notes_block(notes)
     if external:
         # An agent-oriented executor template (commit, run tests) is not an
@@ -1924,7 +1990,7 @@ def _dispatch_configured_role(workflow: WorkflowInDB,
     ))
 
 
-def _run_gate_command_windows(argv: list[str], cwd: str, timeout: int) -> subprocess.CompletedProcess:
+def _run_gate_command_windows(argv: list[str], cwd: str, timeout: int, *, env=None) -> subprocess.CompletedProcess:
     """subprocess.run для gate-команды, убивающий по timeout всё ДЕРЕВО процессов.
 
     Обычный run() на Windows по таймауту убивает только прямого потомка
@@ -1935,7 +2001,7 @@ def _run_gate_command_windows(argv: list[str], cwd: str, timeout: int) -> subpro
     закрывает дерево, пайпы освобождаются, TimeoutExpired уходит наверх как раньше.
     """
     proc = subprocess.Popen(
-        argv, cwd=cwd,
+        argv, cwd=cwd, env=env,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, errors="replace",
     )
@@ -1955,6 +2021,8 @@ def _run_gate_command_windows(argv: list[str], cwd: str, timeout: int) -> subpro
 
 
 def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
+    if candidates.config(workflow).candidate.enabled:
+        return candidates.run_gates(workflow, _run_gate_command_windows)
     gate = _config_for(workflow).gate
     stage = (
         db.get_workflow_stage(workflow.current_stage_id)
@@ -2334,6 +2402,18 @@ def sync_task(task_id: int) -> Optional[WorkflowRunInDB]:
                 and run["output_sha256"] == output_sha
             ):
                 return db._row_to_workflow_run(run)
+            current_round = _current_round_row(conn, workflow)
+            latest = conn.execute('SELECT id FROM workflow_runs WHERE round_id=? AND role=? ORDER BY attempt_no DESC LIMIT 1',
+                                  (current_round['id'], run['role'])).fetchone()
+            if run['round_id'] != current_round['id'] or not latest or latest['id'] != run['id']:
+                db._append_workflow_event(conn, WorkflowEventCreate(
+                    workflow_id=run['workflow_id'], round_id=run['round_id'], run_id=run['id'],
+                    event_type='run.late_result', idempotency_key=f"run.late_result:{run['id']}:{output_sha}",
+                    payload={'task_id': task_id, 'output_sha256': output_sha, 'output': output}))
+                if run['status'] not in {'completed', 'failed', 'cancelled'}:
+                    conn.execute('UPDATE workflow_runs SET status=?, output_json=?, output_sha256=?, completed_at=? WHERE id=?',
+                                 (final_status, output_json, output_sha, task_row['completed_at'] or db._now(), run['id']))
+                return db._row_to_workflow_run(conn.execute('SELECT * FROM workflow_runs WHERE id=?', (run['id'],)).fetchone())
             conn.execute(
                 """UPDATE workflow_runs SET status = ?, output_json = ?,
                    output_sha256 = ?, completed_at = ? WHERE id = ?""",
@@ -2384,6 +2464,16 @@ def sync_task(task_id: int) -> Optional[WorkflowRunInDB]:
                 return db._row_to_workflow_run(refreshed)
             if final_status == "completed" and role is WorkflowRole.EXECUTOR:
                 if state is WorkflowStatus.EXECUTING:
+                    if candidates.config(workflow).candidate.enabled:
+                        try:
+                            candidates.capture(conn, workflow, run, task_row)
+                        except candidates.CandidateError as exc:
+                            prior = candidates.current(conn, workflow, required=False)
+                            if prior:
+                                candidates.invalidate(conn, prior, str(exc))
+                            _transition(conn, workflow, WorkflowStatus.AWAITING_HUMAN, 'candidate.blocked',
+                                        {'reason': str(exc), 'code': exc.code, 'task_id': task_id}, round_id=run['round_id'])
+                            return db._row_to_workflow_run(conn.execute('SELECT * FROM workflow_runs WHERE id=?', (run['id'],)).fetchone())
                     conn.execute(
                         "UPDATE workflow_rounds SET status = 'gating' WHERE id = ?",
                         (run["round_id"],),
@@ -2397,6 +2487,22 @@ def sync_task(task_id: int) -> Optional[WorkflowRunInDB]:
                     )
             elif final_status == "completed" and role is WorkflowRole.REVIEWER:
                 if state is WorkflowStatus.REVIEWING:
+                    if candidates.config(workflow).candidate.enabled:
+                        try:
+                            candidate = candidates.current(conn, workflow)
+                            context = db._json_load(run['input_json'])
+                            if context.get('candidate_id') != candidate['candidate_id']:
+                                raise candidates.CandidateError('stale_candidate', 'Ответ аудитора относится к другой сдаче')
+                            if candidates.canonical(task_row['worktree_path'] or task_row['working_dir']) != candidate['repository_path']:
+                                raise candidates.CandidateError('repository_mismatch', 'Аудитор работал в другой папке')
+                            candidates.validate(candidate)
+                        except candidates.CandidateError as exc:
+                            prior = candidates.current(conn, workflow, required=False)
+                            if prior:
+                                candidates.invalidate(conn, prior, str(exc))
+                            _transition(conn, workflow, WorkflowStatus.AWAITING_HUMAN, 'candidate.blocked',
+                                        {'reason': str(exc), 'code': exc.code, 'task_id': task_id}, round_id=run['round_id'])
+                            return db._row_to_workflow_run(conn.execute('SELECT * FROM workflow_runs WHERE id=?', (run['id'],)).fetchone())
                     workflow = _transition(
                         conn, workflow, WorkflowStatus.AWAITING_HUMAN,
                         "review.awaiting_decision",
@@ -2543,6 +2649,7 @@ def workflow_report(workflow_id: str) -> dict:
         "findings": [item.model_dump(mode="json") for item in findings],
         "artifacts": [item.model_dump(mode="json") for item in artifacts],
         "events": [item.model_dump(mode="json") for item in events],
+        "candidates": candidates.list_candidates(workflow_id),
     }
 
 
@@ -2582,6 +2689,10 @@ def workflow_report_markdown(workflow_id: str) -> str:
             f"- Round {round_item['round_no']}: {round_item['status']} "
             f"({round_item['started_at']} → {round_item.get('completed_at') or 'active'})"
         )
+    lines.extend(["", "## Candidate handoffs", ""])
+    for candidate in report['candidates']:
+        lines.extend([f"- Candidate `{candidate['candidate_id']}` · round {candidate['round_no']}",
+                      f"  - Revision: `{candidate['candidate_revision']}`", f"  - Repository: `{candidate['repository_path']}`"])
     lines.extend(["", "## Findings", ""])
     if report["findings"]:
         for finding in report["findings"]:

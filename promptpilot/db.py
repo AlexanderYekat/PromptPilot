@@ -575,6 +575,26 @@ def wal_connection_lifetime():
         yield
 
 
+CANDIDATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS workflow_candidates (
+    id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id),
+    round_id TEXT NOT NULL REFERENCES workflow_rounds(id),
+    run_id TEXT NOT NULL UNIQUE REFERENCES workflow_runs(id),
+    payload_json TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS workflow_candidates_no_update
+BEFORE UPDATE ON workflow_candidates BEGIN SELECT RAISE(ABORT, 'immutable candidate'); END;
+CREATE TRIGGER IF NOT EXISTS workflow_candidates_no_delete
+BEFORE DELETE ON workflow_candidates BEGIN SELECT RAISE(ABORT, 'immutable candidate'); END;
+CREATE TABLE IF NOT EXISTS workflow_candidate_locks (
+    repository_path TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL UNIQUE REFERENCES workflows(id),
+    round_id TEXT NOT NULL REFERENCES workflow_rounds(id)
+);
+"""
+
+
 INIT_DB_BUSY_DELAYS = (0.1, 0.5, 1.0, 2.0, 4.0)
 
 
@@ -587,6 +607,7 @@ def _init_db_once():
         # Bootstrap it once; foreign_keys remains per-connection in _connect.
         conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript(SCHEMA)
+        conn.executescript(CANDIDATE_SCHEMA)
         # Run migrations for existing databases
         for migration in MIGRATIONS:
             try:
@@ -1309,7 +1330,8 @@ def get_next_runnable(
         # task is found — a hard LIMIT could hide a free task behind a wall of
         # conflicting ones. Rows are materialised before any UPDATE so claiming
         # one doesn't disturb the iteration.
-        limit_clause = "" if (busy or order_key_fn is not None
+        candidate_locks = conn.execute('SELECT 1 FROM workflow_candidate_locks LIMIT 1').fetchone()
+        limit_clause = "" if (candidate_locks or busy or order_key_fn is not None
                               or fairness_task_id is not None) else " LIMIT 1"
         rows = conn.execute(
             f"""SELECT * FROM tasks
@@ -1325,6 +1347,10 @@ def get_next_runnable(
         candidates = []
         for position, row in enumerate(rows):
             task = _row_to_task(row)
+            if candidate_locks:
+                from . import workflow_candidates
+                if workflow_candidates.task_blocked(conn, task):
+                    continue
             if busy and key_fn and key_fn(task) in busy:
                 continue
             policy_rank = order_key_fn(task) if order_key_fn is not None else ()
@@ -5192,6 +5218,16 @@ def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:
                 f"workflow version is {current['state_version']}, "
                 f"expected {update.expected_version}"
             )
+
+        if 'config_json' in changes and current['current_round']:
+            from .models import WorkflowConfig
+            old_config = WorkflowConfig.model_validate(_json_load(current['config_json']))
+            new_config = WorkflowConfig.model_validate(_json_load(changes['config_json']))
+            if old_config.candidate != new_config.candidate:
+                raise WorkflowConflictError('candidate policy can only be changed before workflow execution')
+            if old_config.candidate.enabled and (old_config.gate != new_config.gate
+                                                or old_config.stage != new_config.stage):
+                raise WorkflowConflictError('candidate gate and stage contract cannot change after execution starts')
 
         new_version = current["state_version"] + 1
         assignments = [f"{field} = ?" for field in changes]

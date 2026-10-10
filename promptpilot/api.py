@@ -502,6 +502,12 @@ def api_validate_workflow_setup(request: WorkflowSetupValidationRequest):
     # Required checks that could not be performed at all (a probe timed out).
     # They are not errors and not successes: nothing was proven either way.
     unverified: list[str] = []
+    if request.workflow_config is not None:
+        try:
+            workflows.candidates.readiness({'config_json': request.workflow_config.model_dump_json()})
+            checks.append(_setup_check('candidate', 'ok', 'Настройки фиксации версии совместимы'))
+        except workflows.candidates.CandidateError as exc:
+            checks.append(_setup_check('candidate', 'error', str(exc)))
     repo = Path(request.repository_path).expanduser()
     if not repo.exists():
         checks.append(_setup_check("repository", "error", "Каталог репозитория не найден"))
@@ -629,6 +635,37 @@ def api_update_workflow(workflow_id: str, update: WorkflowUpdate):
         raise HTTPException(409, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+@app.get('/api/workflows/{workflow_id}/candidates')
+def api_workflow_candidates(workflow_id: str):
+    if not db.get_workflow(workflow_id):
+        raise HTTPException(404, 'Workflow not found')
+    return workflows.candidates.list_candidates(workflow_id)
+
+
+@app.get('/api/workflows/{workflow_id}/candidate-readiness')
+def api_workflow_candidate_readiness(workflow_id: str):
+    workflow = db.get_workflow(workflow_id)
+    if not workflow:
+        raise HTTPException(404, 'Workflow not found')
+    try:
+        workflows.candidates.readiness(workflow, db.list_workflow_stages(workflow_id))
+        return {'ready': True, 'enabled': workflows.candidates.config(workflow).candidate.enabled}
+    except workflows.candidates.CandidateError as exc:
+        return {'ready': False, 'code': exc.code, 'reason': str(exc)}
+
+
+@app.post('/api/workflows/{workflow_id}/gate/run', response_model=WorkflowInDB)
+def api_run_workflow_gate(workflow_id: str, request: WorkflowVersionRequest):
+    def run(wid, req):
+        workflow = db.get_workflow(wid)
+        if not workflow:
+            raise db.WorkflowNotFoundError(wid)
+        if workflow.state_version != req.expected_version or workflow.status.value != 'gating':
+            raise db.WorkflowConflictError('workflow changed concurrently or is not gating')
+        return workflows.record_gate(wid, workflows._run_gate_commands(workflow))
+    return _workflow_action(run, workflow_id, request)
 
 
 @app.get(
