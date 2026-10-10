@@ -314,7 +314,9 @@ def test_poll_exception_stops_provider_before_terminal_reservation_release(
         returncode = None
 
         def wait(self, timeout=None):
-            raise subprocess.TimeoutExpired(["provider"], timeout)
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired(["provider"], timeout)
+            return self.returncode
 
         def kill(self):
             events.append("kill")
@@ -327,6 +329,7 @@ def test_poll_exception_stops_provider_before_terminal_reservation_release(
 
         def close(self):
             events.append("close")
+            self.process.returncode = 1
 
     monkeypatch.setattr(worker.OwnedProcess, "start", lambda *_args, **_kwargs: Tree())
     monkeypatch.setattr(worker, "build_cmd", lambda *_args, **_kwargs: [sys.executable])
@@ -1600,7 +1603,7 @@ def test_headless_cancel_survives_transient_tree_cleanup_failure(isolated_db):
     class Tree:
         def __init__(self):
             self.close_calls = 0
-            self.process = SimpleNamespace(kill=lambda: None)
+            self.process = SimpleNamespace(kill=lambda: None, wait=lambda timeout: 1)
 
         def terminate(self):
             return None
@@ -1851,7 +1854,7 @@ def test_registered_provider_cleanup_retry_keeps_boundary_and_reservation(
         def __init__(self):
             self.terminate_calls = 0
             self.close_calls = 0
-            self.process = SimpleNamespace(kill=lambda: None)
+            self.process = SimpleNamespace(kill=lambda: None, wait=lambda timeout: 1)
 
         def terminate(self):
             self.terminate_calls += 1
@@ -1882,7 +1885,9 @@ def test_duplicate_provider_registration_closes_new_tree(isolated_db):
     class Tree:
         def __init__(self, events):
             self.events = events
-            self.process = SimpleNamespace(kill=lambda: events.append("kill"))
+            self.process = SimpleNamespace(
+                kill=lambda: events.append("kill"),
+                wait=lambda timeout: events.append("wait"))
 
         def terminate(self):
             self.events.append("terminate")
@@ -1896,10 +1901,35 @@ def test_duplicate_provider_registration_closes_new_tree(isolated_db):
     try:
         with pytest.raises(RuntimeError, match="already owns"):
             worker._register_provider_tree(777, second)
-        assert second_events == ["terminate", "close"]
+        assert second_events == ["terminate", "close", "wait"]
         assert first_events == []
     finally:
         assert worker._close_registered_provider_tree(777) is True
+
+
+def test_provider_wait_timeout_retains_task_and_reservation_until_reaped(isolated_db):
+    isolated_db.create_task(TaskCreate(prompt="delayed process exit"))
+    task = isolated_db.get_next_runnable()
+    isolated_db.reserve_pipeline_target("owner/repo", "review", 10, HEAD_A, task.id, 300)
+    waits = []
+
+    def wait(timeout):
+        waits.append(timeout)
+        if len(waits) == 1:
+            raise subprocess.TimeoutExpired(["provider"], timeout)
+        return 1
+
+    tree = SimpleNamespace(process=SimpleNamespace(wait=wait),
+                           terminate=lambda: None, close=lambda: None)
+    worker._register_provider_tree(task.id, tree)
+    assert worker._fail_stuck(task, RuntimeError("original poll error")) is False
+    assert isolated_db.get_task(task.id).status.value == "running"
+    assert isolated_db.task_has_live_pipeline_target_reservation(task.id)
+    assert worker._fail_stuck(task, RuntimeError("original poll error")) is True
+    assert isolated_db.get_task(task.id).status.value == "failed"
+    assert "original poll error" in isolated_db.get_task(task.id).error
+    assert waits == [10, 10]
+    assert not isolated_db.task_has_live_pipeline_target_reservation(task.id)
 
 
 def test_scheduler_requires_one_lane_per_replica(monkeypatch):
