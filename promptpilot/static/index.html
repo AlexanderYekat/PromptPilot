@@ -2414,8 +2414,8 @@ function workflowStageEditorCard(stage = {}, index = 0) {
       <textarea class="wide" data-field="deliverables" placeholder="Deliverables — по одному на строке">${esc((stage.deliverables || []).join('\n'))}</textarea>
       <textarea class="wide" data-field="acceptance_gates" placeholder="Gate-команды — по одной на строке">${esc((stage.acceptance_gates || []).join('\n'))}</textarea>
       <input data-field="max_revision_rounds" type="number" min="1" value="${stage.max_revision_rounds || ''}" placeholder="Лимит возвратов">
-      <input data-field="executor_prompt" value="${escAttr(stage.executor_prompt || '')}" placeholder="Особый prompt executor">
-      <input data-field="reviewer_prompt" value="${escAttr(stage.reviewer_prompt || '')}" placeholder="Особый prompt reviewer">
+      <textarea class="wide" rows="4" data-field="executor_prompt" placeholder="Особый prompt executor">${esc(stage.executor_prompt || '')}</textarea>
+      <textarea class="wide" rows="4" data-field="reviewer_prompt" placeholder="Особый prompt reviewer">${esc(stage.reviewer_prompt || '')}</textarea>
     </div>
     <div class="wf-actions"><button class="btn btn-sm btn-ghost" data-stage-action="up" onclick="wfMoveStage(${index},-1)">↑</button><button class="btn btn-sm btn-ghost" data-stage-action="down" onclick="wfMoveStage(${index},1)">↓</button><button class="btn btn-sm btn-danger" data-stage-action="delete" onclick="wfDeleteStage(${index})">Удалить</button></div>
   </div>`;
