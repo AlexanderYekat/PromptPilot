@@ -511,7 +511,45 @@ def dispatch_planner(workflow_id: str,
         herdr_target = dispatch.herdr_target or role.herdr_target
         if provider == "herdr-session" and not herdr_target:
             raise db.WorkflowConflictError("planner using herdr-session needs herdr_target")
+        saved_stages = [db._row_to_workflow_stage(row).model_dump(mode="json")
+                        for row in conn.execute(
+                            "SELECT * FROM workflow_stages WHERE workflow_id=? ORDER BY position",
+                            (workflow_id,))]
+        if dispatch.feedback is not None and (not saved_stages or state is WorkflowStatus.DRAFT):
+            raise db.WorkflowConflictError("there is no existing plan to revise")
+        revision = None
+        if saved_stages:
+            if dispatch.stages is not None and len(dispatch.stages) > config.planning.max_stages:
+                raise db.WorkflowConflictError(f"plan exceeds max_stages={config.planning.max_stages}")
+            input_stages = ([stage.model_dump(mode="json") for stage in dispatch.stages]
+                            if dispatch.stages is not None else
+                            [{key: stage[key] for key in WorkflowStageSpec.model_fields}
+                             for stage in saved_stages])
+            previous_plan = conn.execute(
+                "SELECT * FROM workflow_plans WHERE workflow_id=?", (workflow_id,)).fetchone()
+            revision = {
+                "state_version": workflow.state_version,
+                "feedback": (dispatch.feedback or dispatch.prompt).strip(),
+                "previous_stages": saved_stages, "stages": input_stages,
+                "config": config.model_dump(mode="json"),
+                "previous_plan": (db._row_to_workflow_plan(previous_plan).model_dump(mode="json")
+                                  if previous_plan else None),
+            }
+            # Save editor changes and enqueue the revision in the same transaction.
+            # Failed or invalid planner output must leave these stages available.
+            if dispatch.stages is not None:
+                db._replace_workflow_stages(conn, workflow_id, dispatch.stages)
         prompt = _render_planner_prompt(workflow, dispatch.prompt)
+        if revision is not None:
+            prompt += ("\n\nДоработайте текущий план по замечаниям. Сохраните требования и полезные "
+                       "ручные исправления. Не исполняйте этапы и не меняйте файлы или настройки. "
+                       "Замечания оценивайте вместе с целью и действующей конфигурацией. "
+                       "Перед полным WORKFLOW_PLAN_JSON перечислите внесённые изменения и "
+                       "нерешённые замечания; результат потребует ручного утверждения.\n"
+                       "Текущий план этапов:\n" + json.dumps(revision["stages"], ensure_ascii=False)
+                       + "\nДействующие настройки workflow:\n"
+                       + json.dumps(revision["config"], ensure_ascii=False)
+                       + "\nЗамечания к плану:\n" + revision["feedback"])
         task = db._insert_task(conn, TaskCreate(
             prompt=prompt.rstrip() + WORKFLOW_VERDICT_INSTRUCTION,
             working_dir=workflow.repository_path,
@@ -549,7 +587,8 @@ def dispatch_planner(workflow_id: str,
         workflow_row = _transition(
             conn, workflow_row, WorkflowStatus.PLANNING,
             "planner.dispatched",
-            {"task_id": task.id, "provider": provider, "input_sha256": input_sha},
+            {"task_id": task.id, "provider": provider, "input_sha256": input_sha,
+             **({"plan_revision": revision} if revision is not None else {})},
         )
         row = conn.execute(
             "SELECT * FROM workflow_plans WHERE workflow_id = ?", (workflow_id,)
@@ -643,7 +682,14 @@ def sync_planner_task(task_id: int) -> Optional[WorkflowPlanInDB]:
             # LLM-authored shell commands are never executed without a human
             # seeing the plan, even when command-free plans may auto-approve.
             has_generated_commands = any(stage.acceptance_gates for stage in stages)
-            if not config.planning.require_approval and not has_generated_commands:
+            dispatch_event = conn.execute(
+                "SELECT payload_json FROM workflow_events WHERE workflow_id=? "
+                "AND event_type='planner.dispatched' ORDER BY seq DESC LIMIT 1",
+                (workflow["id"],)).fetchone()
+            is_revision = bool(dispatch_event and
+                               db._json_load(dispatch_event[0]).get("plan_revision"))
+            if (not config.planning.require_approval and not has_generated_commands
+                    and not is_revision):
                 auto_approve = (workflow["id"], workflow["state_version"])
         else:
             conn.execute(

@@ -2421,9 +2421,55 @@ function workflowStageEditorCard(stage = {}, index = 0) {
   </div>`;
 }
 
-function workflowPlanHtml(wf, plan, stages) {
+function wfPlanFeedbackKey() { return `wf-plan-feedback:${selectedWorkflowId}`; }
+function wfPlanFeedbackDraft() {
+  try { return sessionStorage.getItem(wfPlanFeedbackKey()) || ''; } catch { return ''; }
+}
+function wfRememberPlanFeedback(value) {
+  try {
+    if (value) sessionStorage.setItem(wfPlanFeedbackKey(), value);
+    else sessionStorage.removeItem(wfPlanFeedbackKey());
+  } catch { /* The form remains usable when browser storage is unavailable. */ }
+}
+
+function workflowPlanChanges(before, after) {
+  const fields = {title:'название', objective:'цель', stage_type:'тип', execution_mode:'режим',
+    dependencies:'зависимости', allowed_paths:'разрешённые пути', deliverables:'результаты',
+    acceptance_gates:'команды приёмки', executor_prompt:'задание исполнителю',
+    reviewer_prompt:'задание аудитору', max_revision_rounds:'лимит возвратов'};
+  const oldByCode = new Map(before.map(s => [s.code, s]));
+  const newByCode = new Map(after.map(s => [s.code, s]));
+  const changes = [];
+  for (const stage of before) if (!newByCode.has(stage.code)) changes.push(`${stage.code}: удалён`);
+  for (const stage of after) {
+    const old = oldByCode.get(stage.code);
+    if (!old) { changes.push(`${stage.code}: добавлен`); continue; }
+    const changed = Object.keys(fields).filter(key => JSON.stringify(old[key]) !== JSON.stringify(stage[key]));
+    if (changed.length) changes.push(`${stage.code}: ${changed.map(key => fields[key]).join(', ')}`);
+  }
+  if (before.map(s => s.code).join(',') !== after.map(s => s.code).join(',')) changes.push('Изменён состав или порядок этапов');
+  return changes.length ? changes.join('\n') : 'Поля этапов не изменились';
+}
+
+function workflowPlanRevisionHistory(plan, stages, events) {
+  return events.filter(e => e.event_type === 'planner.dispatched' && e.payload?.plan_revision)
+    .slice().reverse().map(event => {
+      const revision = event.payload.plan_revision;
+      const current = plan?.status === 'awaiting_approval' && plan.planner_task_id === event.payload.task_id;
+      return `<details data-wf-detail="plan-revision-${event.seq}" class="wf-stage-card">
+        <summary>Доработка плана · task #${esc(event.payload.task_id)} · ${esc(formatTime(event.created_at))}</summary>
+        <b>Замечания</b><pre>${esc(revision.feedback || 'Повторное планирование')}</pre>
+        ${current ? `<b>Изменения относительно переданного плана</b><pre>${esc(workflowPlanChanges(revision.stages, stages))}</pre>` : ''}
+        <details><summary>План, переданный на доработку</summary><pre>${esc(JSON.stringify(revision.stages, null, 2))}</pre></details>
+        <details><summary>Сохранённая версия до отправки</summary><pre>${esc(JSON.stringify(revision.previous_stages, null, 2))}</pre></details>
+      </details>`;
+    }).join('');
+}
+
+function workflowPlanHtml(wf, plan, stages, events = []) {
   if (!wf.config?.planning?.enabled && !stages.length) return '';
-  const editable = wf.status === 'awaiting_plan_approval';
+  const awaitingApproval = wf.status === 'awaiting_plan_approval';
+  const editable = awaitingApproval || (wf.status === 'awaiting_human' && !wf.current_round && stages.length > 0);
   const cards = stages.map((stage, index) => editable ? workflowStageEditorCard(stage, index) : `
     <div class="wf-stage-card" data-status="${escAttr(stage.status)}">
       <div class="wf-stage-title">${index + 1}. ${esc(stage.code)} · ${esc(stage.title)} <span class="task-status" data-s="${escAttr(stage.status)}">${esc(stage.status)}</span></div>
@@ -2432,13 +2478,19 @@ function workflowPlanHtml(wf, plan, stages) {
     </div>`).join('');
   const controls = editable ? `<div class="wf-actions">
     <button class="btn btn-sm btn-ghost" onclick="wfAddStage()">Добавить этап</button>
-    <button class="btn btn-sm btn-ghost" onclick="wfSavePlan()">Сохранить план</button>
-    <button class="btn btn-sm btn-primary" onclick="wfApprovePlan()">Сохранить и утвердить</button>
-    <button class="btn btn-sm btn-ghost" onclick="wfPlannerDispatch(true)">Сформировать заново</button>
+    ${awaitingApproval ? `<button class="btn btn-sm btn-ghost" onclick="wfSavePlan()">Сохранить план</button>
+    <button class="btn btn-sm btn-primary" onclick="wfApprovePlan()">Сохранить и утвердить</button>` : ''}
   </div>` : '';
   return `<div class="wf-section-title">План этапов · ${stages.length}</div>
-    ${editable ? '<div class="wf-meta">Последний этап должен иметь тип integration. Gate-команды выполняются только после ручного утверждения плана.</div>' : ''}
-    <div class="wf-stage-list" id="wfStageList">${cards || '<div class="wf-meta">Планировщик ещё не сформировал этапы.</div>'}</div>${controls}`;
+    ${editable ? `<div class="wf-stage-card">
+      <label for="wfPlanFeedback"><b>Замечания к плану</b></label>
+      <textarea class="wide" id="wfPlanFeedback" rows="8" maxlength="30000" style="width:100%"
+        oninput="wfRememberPlanFeedback(this.value)" placeholder="Вставьте отзыв Claude или свои замечания. Планировщик получит их вместе с текущими этапами и сохранёнными настройками.">${esc(wfPlanFeedbackDraft())}</textarea>
+      <div class="wf-meta">Доработка сохранит предыдущую версию и правки в полях этапов. Исполнение начнётся только после отдельного утверждения.</div>
+      <button class="btn btn-primary" id="wfRevisePlanButton" onclick="wfRevisePlan()">Доработать по замечаниям</button>
+    </div><div class="wf-meta">Последний этап должен иметь тип integration. Gate-команды выполняются только после ручного утверждения плана.</div>` : ''}
+    <div class="wf-stage-list" id="wfStageList">${cards || '<div class="wf-meta">Планировщик ещё не сформировал этапы.</div>'}</div>${controls}
+    ${workflowPlanRevisionHistory(plan, stages, events)}`;
 }
 
 function workflowPlannerFailure(plan, task) {
@@ -2506,7 +2558,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       : `<button class="btn btn-sm btn-primary" onclick="wfStart()">Начать первый раунд</button>`;
   } else if (wf.status === 'awaiting_human' && ['failed','cancelled'].includes(plan?.status) && !wf.current_round) {
     const guidance = plannerFailure ? `<div class="wf-meta">${esc(plannerFailure.next_action)}</div>` : '';
-    action = guidance + (['task_failed','cancelled'].includes(plannerFailure?.code)
+    action = stages.length ? guidance : guidance + (['task_failed','cancelled'].includes(plannerFailure?.code)
       ? '<button class="btn btn-sm btn-primary" onclick="wfPlannerDispatch(false)">Повторно сформировать план</button>'
       : plannerForm);
   } else if (wf.status === 'awaiting_external') {
@@ -2603,7 +2655,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       ${!terminal ? `<button class="btn btn-sm btn-danger" onclick="wfCancel()">Отменить весь workflow</button>` : ''}
     </div>
     ${workflowSettingsHtml(wf)}
-    ${workflowPlanHtml(wf, plan, stages)}
+    ${workflowPlanHtml(wf, plan, stages, events)}
     ${action}
     <div class="wf-section-title">Текущий раунд</div>
     ${currentRound ? workflowRoundRow(currentRound, true) : '<div class="wf-meta">Текущий раунд ещё не создан.</div>'}
@@ -2832,6 +2884,28 @@ async function wfApprovePlan() {
     toast('План утверждён, первый этап запущен', false);
     await loadWorkflows();
   } catch (e) { toast('Утверждение плана: ' + e.message); }
+}
+
+async function wfRevisePlan() {
+  const feedback = document.getElementById('wfPlanFeedback')?.value?.trim() || '';
+  if (!feedback) { toast('Добавьте замечания к плану.'); return; }
+  const stages = wfCollectPlanStages();
+  if (!stages.length || stages.some(stage => !stage.code || !stage.title || !stage.objective)) {
+    toast('У каждого этапа обязательны код, название и проверяемая цель.'); return;
+  }
+  const button = document.getElementById('wfRevisePlanButton');
+  if (button?.disabled) return;
+  if (button) button.disabled = true;
+  try {
+    await fetchJSON(`${API}/workflows/${selectedWorkflowId}/plan/dispatch`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({expected_version:selectedWorkflowData.state_version, feedback, stages, keep_pane:true}),
+    });
+    wfRememberPlanFeedback('');
+    toast('План отправлен на доработку. Результат будет ждать вашего утверждения.', false);
+    await loadWorkflows();
+  } catch (e) { toast('Доработка плана: ' + e.message); }
+  finally { if (button) button.disabled = false; }
 }
 
 async function wfPlannerDispatch(regenerate = false) {

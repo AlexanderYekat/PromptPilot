@@ -503,6 +503,9 @@ class WorkflowStageInDB(WorkflowStageSpec):
 class WorkflowPlanDispatch(BaseModel):
     expected_version: int = Field(ge=0)
     prompt: str = ""
+    feedback: Optional[str] = Field(default=None, max_length=30000)
+    stages: Optional[list[WorkflowStageSpec]] = Field(default=None, min_length=1, max_length=50)
+
     provider: Optional[str] = None
     priority: int = Field(default=5, ge=1, le=10)
     max_retries: int = Field(default=5, ge=0, le=50)
@@ -513,6 +516,13 @@ class WorkflowPlanDispatch(BaseModel):
     machine: Optional[str] = None
     keep_pane: bool = True
 
+    @model_validator(mode="after")
+    def validate_revision(self):
+        if self.feedback is not None or self.stages is not None:
+            if not self.feedback or not self.feedback.strip() or not self.stages:
+                raise ValueError("plan revision requires feedback and the current stages")
+            WorkflowPlanReplace(expected_version=self.expected_version, stages=self.stages)
+        return self
 
 class WorkflowPlanInDB(BaseModel):
     workflow_id: str
