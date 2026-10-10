@@ -1,12 +1,14 @@
 """Real disposable Git repos and subprocesses; no model or external service calls."""
 import json
 import base64
+import asyncio
 import os
 import sqlite3
 import subprocess
 import sys
 
 import pytest
+import httpx
 
 from promptpilot import workflows, workflow_candidates as candidates
 from promptpilot.models import (
@@ -390,17 +392,22 @@ def test_plan_candidate_variable_requires_opt_in_before_approval(isolated_db, re
 
 
 def test_candidate_api_exports_and_manual_gate(isolated_db, repo):
-    from fastapi.testclient import TestClient
     from promptpilot.api import app
+
+    def request(method, path, **kwargs):
+        async def send():
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://testserver') as client:
+                return await client.request(method, path, **kwargs)
+        return asyncio.run(send())
+
     wf = create(isolated_db, repo)
     _, candidate = handoff(isolated_db, wf, repo)
-    with TestClient(app) as client:
-        assert client.get(f'/api/workflows/{wf.id}/candidates').json() == [candidate]
-        assert client.get(f'/api/workflows/{wf.id}/candidate-readiness').json()['ready']
-        response = client.post(f'/api/workflows/{wf.id}/gate/run', json={'expected_version': isolated_db.get_workflow(wf.id).state_version})
-        assert response.status_code == 200, response.text
-        assert response.json()['status'] == 'reviewing'
-        assert client.get('/api/workflows/missing/candidates').status_code == 404
+    assert request('GET', f'/api/workflows/{wf.id}/candidates').json() == [candidate]
+    assert request('GET', f'/api/workflows/{wf.id}/candidate-readiness').json()['ready']
+    response = request('POST', f'/api/workflows/{wf.id}/gate/run', json={'expected_version': isolated_db.get_workflow(wf.id).state_version})
+    assert response.status_code == 200, response.text
+    assert response.json()['status'] == 'reviewing'
+    assert request('GET', '/api/workflows/missing/candidates').status_code == 404
 
 
 def test_output_directory_cannot_hide_untracked_source(repo):
