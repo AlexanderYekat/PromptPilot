@@ -757,6 +757,9 @@ def _stop_owned_process(tree: OwnedProcess) -> None:
         # On Windows this closes a KILL_ON_JOB_CLOSE handle, an independent
         # second guarantee that every process assigned to this task is ended.
         tree.close()
+    # Kernel termination is asynchronous. Reap the root even on unexpected
+    # polling failures, before releasing its ownership or recording failure.
+    tree.process.wait(timeout=10)
 
 
 _active_provider_trees: dict[tuple[str, int], OwnedProcess] = {}
@@ -2332,10 +2335,13 @@ def _fail_stuck(task, exc) -> bool:
             )
         return True
     try:
+        detail = f"{type(exc).__name__}: {exc}"
+        if isinstance(exc, sqlite3.Error) and getattr(exc, "sqlite_errorname", None):
+            detail += f" [{exc.sqlite_errorname} ({exc.sqlite_errorcode})]"
         changed = db.fail_running_attempt(
             task.id,
             task.started_at,
-            f"Внутренняя ошибка воркера: {type(exc).__name__}: {exc}",
+            f"Внутренняя ошибка воркера: {detail}",
         )
     except Exception as e:  # never let recovery itself take down the loop
         print(f"  !! не удалось пометить #{task.id} failed: {e}", flush=True)
@@ -2552,6 +2558,13 @@ def _warm_pipeline_runtime():
 
 
 def run_worker():
+    # Hold an idle WAL attachment, not a transaction, until all work and
+    # cleanup have finished. The context also closes it on startup failure.
+    with db.wal_connection_lifetime():
+        return _run_worker()
+
+
+def _run_worker():
     """Main worker loop.
 
     With PP_CONCURRENCY=1 (the default) this is the plain sequential worker it

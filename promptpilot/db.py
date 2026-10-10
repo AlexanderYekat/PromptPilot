@@ -2,9 +2,12 @@
 
 import hashlib
 import json
+import logging
 import math
+import os
 import re
 import sqlite3
+import threading
 import time
 import unicodedata
 import uuid
@@ -518,11 +521,24 @@ def _row_to_task(row: sqlite3.Row) -> TaskInDB:
     return TaskInDB(**d)
 
 
+def sqlite_error_details(exc: sqlite3.Error) -> dict:
+    """Non-secret diagnostics; no SQL, parameters or provider environment."""
+    return {
+        "message": str(exc),
+        "sqlite_errorcode": getattr(exc, "sqlite_errorcode", None),
+        "sqlite_errorname": getattr(exc, "sqlite_errorname", None),
+        "sqlite_version": sqlite3.sqlite_version,
+        "database": os.path.abspath(DB_PATH),
+        "pid": os.getpid(), "thread_id": threading.get_ident(),
+    }
+
+
 @contextmanager
 def _connect(immediate: bool = False):
     DB_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    conn = None
     try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
         if immediate:
@@ -530,11 +546,33 @@ def _connect(immediate: bool = False):
             conn.execute("BEGIN IMMEDIATE")
         yield conn
         conn.commit()
-    except Exception:
-        conn.rollback()
+    except Exception as exc:
+        if isinstance(exc, sqlite3.Error):
+            logging.getLogger(__name__).error("SQLite failure: %s", sqlite_error_details(exc))
+        if conn is not None:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                # A second I/O failure must not hide the original operation.
+                logging.getLogger(__name__).exception("SQLite rollback failed")
         raise
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
+
+
+@contextmanager
+def wal_connection_lifetime():
+    """Keep WAL/SHM attached while the worker polls through short connections.
+
+    On Windows concurrent last-close/first-read churn can fail in winTruncate
+    of the SHM file (SQLITE_IOERR_TRUNCATE). An idle connection prevents that
+    teardown during execution. Exhaust the cursor: no read transaction or
+    checkpoint-blocking snapshot is held. Task transactions remain separate.
+    """
+    with _connect() as anchor:
+        anchor.execute("SELECT value FROM settings LIMIT 1").fetchall()
+        yield
 
 
 INIT_DB_BUSY_DELAYS = (0.1, 0.5, 1.0, 2.0, 4.0)

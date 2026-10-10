@@ -115,7 +115,7 @@ def test_malformed_optional_profile_falls_back_to_legacy_fifo(
     assert "pipeline lane scheduler unavailable" in capsys.readouterr().out
 
 
-def test_worker_recovers_then_warms_pipeline_before_claiming(monkeypatch):
+def test_worker_recovers_then_warms_pipeline_before_claiming(isolated_db, monkeypatch):
     events = []
     handlers = {}
     repair_args = {}

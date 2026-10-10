@@ -2352,7 +2352,8 @@ function workflowRoundRow(round, current = false) {
 
 function workflowStopReason(events) {
   const stopping = [
-    'planner.invalid_output','executor.invalid_output','reviewer.invalid_output','gate.failed',
+    'planner.invalid_output','planner.task_failed','planner.cancelled','planner.unsuccessful_result',
+    'executor.invalid_output','reviewer.invalid_output','gate.failed',
     'gate.human_required','run.failed','automation.paused','limit.max_rounds',
     'limit.stage_revisions',
   ];
@@ -2417,6 +2418,24 @@ function workflowPlanHtml(wf, plan, stages) {
     <div class="wf-stage-list" id="wfStageList">${cards || '<div class="wf-meta">Планировщик ещё не сформировал этапы.</div>'}</div>${controls}`;
 }
 
+function workflowPlannerFailure(plan, task) {
+  if (!['failed','cancelled'].includes(plan?.status)) return null;
+  if (plan.output?.failure) return plan.output.failure;
+  // Older releases stored the task outcome but mislabelled every failure as
+  // invalid_output. Read that durable evidence without rewriting history.
+  const output = plan.output || {};
+  const status = output.task_status || task?.status;
+  if (status === 'cancelled') return {
+    code: 'cancelled', reason: output.error || task?.error || 'Задача планировщика отменена.',
+    next_action: 'Если план ещё нужен, запустите формирование плана повторно.',
+  };
+  if (status === 'failed' || (status === 'completed' && output.exit_code != null && output.exit_code !== 0)) return {
+    code: 'task_failed', reason: output.error || task?.error || 'Задача планировщика завершилась с ошибкой.',
+    next_action: 'Проверьте ошибку задачи и журнал worker. После устранения причины повторно сформируйте план; дополнительные указания модели не требуются.',
+  };
+  return null;
+}
+
 function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, plannerTask, orphanPane = null) {
   const terminal = ['completed','failed','cancelled'].includes(wf.status);
   const plannerRun = wf.status === 'planning' && plannerTask ? {role:'planner', task_id:plannerTask.id, status:plannerTask.status} : null;
@@ -2433,7 +2452,10 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
   const stage = stages.find(item => item.id === wf.current_stage_id) || wf.config?.stage || {};
   const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone);
   const ownerInfo = workflowOwnerInfo(wf, activeRun, reviewerDone);
-  const stopReason = workflowStopReason(events);
+  const plannerFailure = wf.status === 'awaiting_human' && !wf.current_round
+    ? workflowPlannerFailure(plan, plannerTask) : null;
+  const stopReason = plannerFailure
+    ? `Task #${plan.planner_task_id}: ${plannerFailure.reason}` : workflowStopReason(events);
   const previousAudit = [...pastRounds].reverse().find(r => r.summary?.summary);
   const stageTitle = stage.title || `Раунд ${wf.current_round}: доработка после последнего аудита`;
   const stageGoal = stage.objective || stage.goal || previousAudit?.summary?.summary || wf.objective;
@@ -2447,8 +2469,11 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
     action = wf.config?.planning?.enabled
       ? `${plannerForm}<button class="btn btn-sm btn-ghost" onclick="wfStart()">Запустить без плана как один этап</button>`
       : `<button class="btn btn-sm btn-primary" onclick="wfStart()">Начать первый раунд</button>`;
-  } else if (wf.status === 'awaiting_human' && plan?.status === 'failed' && !wf.current_round) {
-    action = plannerForm;
+  } else if (wf.status === 'awaiting_human' && ['failed','cancelled'].includes(plan?.status) && !wf.current_round) {
+    const guidance = plannerFailure ? `<div class="wf-meta">${esc(plannerFailure.next_action)}</div>` : '';
+    action = guidance + (['task_failed','cancelled'].includes(plannerFailure?.code)
+      ? '<button class="btn btn-sm btn-primary" onclick="wfPlannerDispatch(false)">Повторно сформировать план</button>'
+      : plannerForm);
   } else if (wf.status === 'awaiting_external') {
     const externalRun = [...runs].reverse().find(r => r.input?.execution_mode === 'external' && r.status === 'awaiting_external');
     action = `<div class="wf-stage" style="border-color:var(--yellow)">

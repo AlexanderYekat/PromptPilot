@@ -589,6 +589,64 @@ def test_worker_cancel_kills_provider_descendant(isolated_db, monkeypatch, tmp_p
     assert _wait_not_running(descendant_pid)
 
 
+def test_planner_sqlite_poll_failure_cleans_tree_and_persists_cause(
+        isolated_db, monkeypatch, tmp_path):
+    from promptpilot import workflows
+    from promptpilot.models import WorkflowPlanDispatch
+    import test_workflow_stage_planner as planner
+
+    pid_file = tmp_path / "planner-child.pid"
+    script = (
+        "import pathlib,subprocess,sys,time; "
+        "child=subprocess.Popen([sys.executable,'-c',%r]); "
+        "pathlib.Path(sys.argv[1]).write_text(str(child.pid)); time.sleep(120)"
+    ) % SLEEP_CODE
+    command = [sys.executable, "-c", script, str(pid_file)]
+    wf = planner.create(isolated_db)
+    workflows.dispatch_planner(wf.id, WorkflowPlanDispatch(
+        expected_version=0, provider="process-tree-test", task_timeout=3600))
+    task = isolated_db.get_next_runnable()
+    monkeypatch.setattr(worker, "load_providers", lambda: {"process-tree-test": {}})
+    monkeypatch.setattr(worker, "build_cmd", lambda *a, **kw: command.copy())
+    monkeypatch.setattr(worker, "get_provider_env", lambda _: os.environ.copy())
+    error = sqlite3.OperationalError("disk I/O error")
+    error.sqlite_errorcode = 1546
+    error.sqlite_errorname = "SQLITE_IOERR_TRUNCATE"
+    def fail_poll(_id):
+        assert pid_file.exists()  # provider and its descendant really started
+        raise error
+    monkeypatch.setattr(worker.db, "is_cancel_requested", fail_poll)
+    unrelated = subprocess.Popen([sys.executable, "-c", SLEEP_CODE])
+    try:
+        with pytest.raises(sqlite3.OperationalError) as caught:
+            worker.execute_task(task)
+        assert caught.value is error
+        assert isinstance(error.__context__, subprocess.TimeoutExpired)
+        assert error.__context__.timeout == 2  # poll, not the task's 3600s limit
+        assert _wait_not_running(int(pid_file.read_text()))
+        assert unrelated.poll() is None
+        assert worker._provider_tree_key(task.id) not in worker._active_provider_trees
+        recoveries = {}
+        worker._queue_stuck_recovery(recoveries, task, worker.lock_key(task), error)
+        worker._drain_stuck_recoveries(recoveries)
+        assert not recoveries
+        settled = isolated_db.get_task(task.id)
+        assert settled.status.value == "failed"
+        assert settled.completed_at is not None
+        assert settled.result is None
+        assert "disk I/O error" in settled.error
+        assert "SQLITE_IOERR_TRUNCATE (1546)" in settled.error
+        assert "timed out" not in settled.error
+        assert settled.retry_count == 0
+        plan = isolated_db.get_workflow_plan(wf.id)
+        assert plan.output["failure"]["code"] == "task_failed"
+        assert plan.output["error"] == settled.error
+        assert isolated_db.list_workflow_events(wf.id)[-1].event_type == "planner.task_failed"
+    finally:
+        worker._close_registered_provider_tree(task.id)
+        _stop_unrelated(unrelated)
+
+
 def test_worker_success_kills_provider_descendant_not_unrelated(
         isolated_db, monkeypatch, tmp_path):
     child_pid_file = tmp_path / "completed-provider-child.pid"

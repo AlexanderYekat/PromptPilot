@@ -552,6 +552,34 @@ def dispatch_planner(workflow_id: str,
         return db._row_to_workflow_plan(row)
 
 
+def _planner_failure(task) -> dict | None:
+    """Classify execution before attempting to validate a model response."""
+    if task["status"] == "cancelled":
+        return {
+            "code": "cancelled",
+            "reason": task["error"] or "Задача планировщика отменена.",
+            "next_action": "Если план ещё нужен, запустите формирование плана повторно.",
+        }
+    if task["status"] != "completed" or task["exit_code"] not in (None, 0):
+        return {
+            "code": "task_failed",
+            "reason": task["error"] or (
+                f"Задача планировщика завершилась с ошибкой (exit code: {task['exit_code']})."
+            ),
+            "next_action": (
+                "Проверьте ошибку задачи и журнал worker. После устранения причины "
+                "повторно сформируйте план; дополнительные указания модели не требуются."
+            ),
+        }
+    if task["verdict"] not in SUCCESS_VERDICTS:
+        return {
+            "code": "unsuccessful_result",
+            "reason": "Планировщик завершил задачу без успешного итога ИТОГ.",
+            "next_action": "Прочитайте результат задачи и устраните указанное препятствие перед повторным планированием.",
+        }
+    return None
+
+
 def sync_planner_task(task_id: int) -> Optional[WorkflowPlanInDB]:
     auto_approve: tuple[str, int] | None = None
     with db._connect(immediate=True) as conn:
@@ -564,23 +592,34 @@ def sync_planner_task(task_id: int) -> Optional[WorkflowPlanInDB]:
         if not task:
             raise db.WorkflowConflictError(f"planner task {task_id} is missing")
         workflow = _workflow_row(conn, plan["workflow_id"])
+        # Late task callbacks must not revive a cancelled workflow or replace
+        # an approved plan. Legacy failed projections can be corrected in place.
+        if (workflow["status"] not in {"planning", "awaiting_human"}
+                or workflow["current_round"]):
+            return db._row_to_workflow_plan(plan)
         if task["status"] in {"pending", "rate_limited", "running"}:
             return db._row_to_workflow_plan(plan)
+        failure = _planner_failure(task)
+        config = _config_for(db._row_to_workflow(workflow))
+        stages = None if failure else parse_workflow_plan(
+            task["result"] or "", config.planning.max_stages)
+        if not failure and not stages:
+            failure = {
+                "code": "invalid_output",
+                "reason": "Планировщик завершил задачу, но результат не соответствует контракту stage-plan-v1.",
+                "next_action": "Проверьте ответ планировщика; уточните указания или повторно сформируйте план.",
+            }
         output = {
             "task_status": task["status"], "result": task["result"],
             "error": task["error"], "exit_code": task["exit_code"],
             "verdict": task["verdict"], "model_used": task["model_used"],
         }
+        if failure:
+            output["failure"] = failure
         output_json = db._json_dump(output)
         output_sha = hashlib.sha256(output_json.encode("utf-8")).hexdigest()
         if plan["output_sha256"] == output_sha:
             return db._row_to_workflow_plan(plan)
-        config = _config_for(db._row_to_workflow(workflow))
-        stages = (
-            parse_workflow_plan(task["result"] or "", config.planning.max_stages)
-            if task["status"] == "completed" and task["verdict"] in SUCCESS_VERDICTS
-            else None
-        )
         if stages:
             db._replace_workflow_stages(conn, workflow["id"], stages)
             conn.execute(
@@ -603,16 +642,20 @@ def sync_planner_task(task_id: int) -> Optional[WorkflowPlanInDB]:
                 auto_approve = (workflow["id"], workflow["state_version"])
         else:
             conn.execute(
-                """UPDATE workflow_plans SET status='failed', output_sha256=?,
+                """UPDATE workflow_plans SET status=?, output_sha256=?,
                    output_json=?, updated_at=? WHERE workflow_id=?""",
-                (output_sha, output_json, db._now(), workflow["id"]),
+                ("cancelled" if failure["code"] == "cancelled" else "failed",
+                 output_sha, output_json, db._now(), workflow["id"]),
             )
-            _transition(
-                conn, workflow, WorkflowStatus.AWAITING_HUMAN,
-                "planner.invalid_output",
-                {"task_id": task_id, "output_sha256": output_sha,
-                 "reason": "planner did not return a valid stage-plan-v1 contract"},
-            )
+            event_type = f"planner.{failure['code']}"
+            payload = {"task_id": task_id, "output_sha256": output_sha,
+                       "task_status": task["status"], "error": task["error"],
+                       "exit_code": task["exit_code"], **failure}
+            if workflow["status"] == "awaiting_human":
+                _touch(conn, workflow, event_type, payload)
+            else:
+                _transition(conn, workflow, WorkflowStatus.AWAITING_HUMAN,
+                            event_type, payload)
         row = conn.execute(
             "SELECT * FROM workflow_plans WHERE workflow_id = ?",
             (plan["workflow_id"],),
@@ -2401,14 +2444,15 @@ def sync_all_tasks(workflow_id: str = None) -> int:
         if workflow_id:
             planner_rows = conn.execute(
                 """SELECT planner_task_id AS task_id, workflow_id
-                   FROM workflow_plans WHERE workflow_id=? AND status='planning'
+                     FROM workflow_plans WHERE workflow_id=?
+                     AND status IN ('planning','failed','cancelled')
                    AND planner_task_id IS NOT NULL""",
                 (workflow_id,),
             ).fetchall()
         else:
             planner_rows = conn.execute(
                 """SELECT planner_task_id AS task_id, workflow_id
-                   FROM workflow_plans WHERE status='planning'
+                     FROM workflow_plans WHERE status IN ('planning','failed','cancelled')
                    AND planner_task_id IS NOT NULL"""
             ).fetchall()
     count = 0
