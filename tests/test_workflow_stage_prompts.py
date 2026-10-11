@@ -15,6 +15,7 @@ from promptpilot.models import (
     WorkflowExternalResult,
     WorkflowPlanApproval,
     WorkflowPlanDispatch,
+    WorkflowPlanReplace,
     WorkflowReviewDecision,
 )
 from test_workflow_candidates import shell_python
@@ -23,6 +24,7 @@ CONTRACT = workflows.AUDIT_RESPONSE_CONTRACT.strip()
 GATE = shell_python('print("GATE-MARKER-42")')
 CONTEXT = "<контекст-этапа>"
 VERDICT = "<promptpilot-workflow-contract"
+GOAL = "Этап: FINAL Проверка\nПроверяемая цель этапа:\nПроверить функцию"
 
 # Built-in templates as they were before the answer format moved into a
 # constant. Stages without their own prompts must keep exactly this text.
@@ -110,7 +112,7 @@ def plan_result(stages):
             + "\nWORKFLOW_PLAN_JSON_END\nИТОГ: ГОТОВО")
 
 
-def planned(db, stages, repository=None, branch="feature/prompts", **config):
+def planned(db, stages, repository=None, branch="feature/prompts", edited=None, **config):
     cfg = {
         "planning": {"enabled": True, "require_approval": True, "max_stages": 10},
         "automation": {"enabled": True},
@@ -129,6 +131,10 @@ def planned(db, stages, repository=None, branch="feature/prompts", **config):
     db.mark_completed(planner.id, plan_result(stages), exit_code=0)
     db.set_verdict(planner.id, "ГОТОВО")
     workflows.sync_planner_task(planner.id)
+    if edited is not None:  # the operator edits the cards before approval
+        waiting = db.get_workflow(workflow.id)
+        workflows.replace_plan(workflow.id, WorkflowPlanReplace(
+            expected_version=waiting.state_version, stages=edited))
     waiting = db.get_workflow(workflow.id)
     workflows.approve_plan(workflow.id, WorkflowPlanApproval(
         expected_version=waiting.state_version))
@@ -168,7 +174,8 @@ def test_stage_texts_keep_role_context_answer_format_and_revision_context(isolat
                  "(нет: это первая попытка этапа)", "(gate ещё не выполнялся)"):
         assert part in executor.prompt
     assert CONTRACT not in executor.prompt and "{{" not in executor.prompt
-    in_order(executor.prompt, "Сделай работу этапа.", CONTEXT, VERDICT)
+    # The card's goal reaches the agent although the stage text never states it.
+    in_order(executor.prompt, "Сделай работу этапа.", CONTEXT, GOAL, "Разрешённые пути:", VERDICT)
 
     reviewer = finish_task(isolated_db, REVISION)
     assert reviewer.prompt.startswith("Проверь работу этапа.")
@@ -177,7 +184,7 @@ def test_stage_texts_keep_role_context_answer_format_and_revision_context(isolat
     for part in ("EXEC-REPORT-1", "GATE-MARKER-42", "Незакрытые замечания",
                  "src/feature.py", "отчёт о проверке"):
         assert part in reviewer.prompt
-    in_order(reviewer.prompt, "Проверь работу этапа.", CONTEXT, "Отчёт исполнителя:",
+    in_order(reviewer.prompt, "Проверь работу этапа.", CONTEXT, GOAL, "Отчёт исполнителя:",
              "Незакрытые замечания", CONTRACT, VERDICT)
 
     # The revision round: the executor sees this stage's remarks, the gate,
@@ -203,24 +210,38 @@ def test_stage_texts_keep_role_context_answer_format_and_revision_context(isolat
 
 
 def test_sections_already_placed_by_the_stage_text_are_not_repeated(isolated_db):
-    reviewer_text = ("Проверь.\nОтчёт: {{executor_report}}\nGate: {{gate_evidence}}\n"
+    reviewer_text = ("Проверь {{stage_goal}}.\nОтчёт: {{executor_report}}\nGate: {{gate_evidence}}\n"
                      "Замечания: {{open_findings}}\nПути: {{allowed_paths}}\n"
                      "Результаты: {{deliverables}}\n{{audit_contract}}\n{{audit_contract}}")
-    executor_text = ("Делай.\nПути: {{allowed_paths}}\nРезультаты: {{deliverables}}\n"
+    executor_text = ("Делай: {{stage_goal}}.\nПути: {{allowed_paths}}\nРезультаты: {{deliverables}}\n"
                      "Замечания: {{stage_review}}\nGate: {{gate_evidence}}\n{{audit_contract}}")
     planned(isolated_db, [stage(executor_prompt=executor_text, reviewer_prompt=reviewer_text)])
 
     executor = finish_task(isolated_db, "EXEC-REPORT")
     assert CONTEXT not in executor.prompt
     assert executor.prompt.count("src/feature.py") == 1
+    assert executor.prompt.count("Проверить функцию") == 1
     assert CONTRACT not in executor.prompt and "{{" not in executor.prompt
 
     reviewer = pending(isolated_db)
     assert CONTEXT not in reviewer.prompt
     assert reviewer.prompt.count(CONTRACT) == 1
     assert reviewer.prompt.count("src/feature.py") == 1
+    assert reviewer.prompt.count("Проверить функцию") == 1
     assert reviewer.prompt.count("EXEC-REPORT") == 1
     assert "{{" not in reviewer.prompt
+
+
+def test_goal_edited_in_the_card_reaches_both_roles(isolated_db):
+    texts = {"executor_prompt": "Реализуй по разделу 3 ТЗ.", "reviewer_prompt": "Сверь с разделом 3."}
+    planned(isolated_db, [stage(**texts)],
+            edited=[stage(objective="Посчитать без двойного учёта", **texts)])
+
+    executor = finish_task(isolated_db, "EXEC-REPORT")
+    assert "Проверяемая цель этапа:\nПосчитать без двойного учёта" in executor.prompt
+    assert "Проверить функцию" not in executor.prompt
+    reviewer = pending(isolated_db)
+    assert "Проверяемая цель этапа:\nПосчитать без двойного учёта" in reviewer.prompt
 
 
 def test_answer_format_is_placed_exactly_once():
@@ -272,11 +293,13 @@ def test_custom_role_template_without_format_gets_it(isolated_db):
     executor = finish_task(isolated_db, "EXEC-REPORT")
     assert executor.prompt.startswith("Исполни: Проверить функцию")
     assert CONTEXT in executor.prompt and "src/feature.py" in executor.prompt
+    assert executor.prompt.count("Проверить функцию") == 1  # placed by the template
 
     reviewer = pending(isolated_db)
     assert reviewer.prompt.startswith("Аудит: Проверить функцию")
     assert reviewer.prompt.count(CONTRACT) == 1
     assert "EXEC-REPORT" in reviewer.prompt and "отчёт о проверке" in reviewer.prompt
+    assert "Проверяемая цель этапа" not in reviewer.prompt
 
 
 def submit(workflow_id, text):
@@ -299,7 +322,8 @@ def test_external_stage_with_own_assignment_keeps_its_context(isolated_db):
 
     first = workflows.external_assignment(workflow.id).assignment
     assert first.startswith("Сравните библиотеки вручную.")
-    for part in ("docs/research.md", "таблица сравнения", "Проверки приёмки:", GATE,
+    for part in ("Этап: S1 Исследование\nПроверяемая цель этапа:\nСравнить библиотеки",
+                 "docs/research.md", "таблица сравнения", "Проверки приёмки:", GATE,
                  "(нет: это первая попытка этапа)", "(gate ещё не выполнялся)"):
         assert part in first
     assert "ИТОГ:" not in first and CONTRACT not in first

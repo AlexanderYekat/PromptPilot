@@ -151,8 +151,9 @@ HUMAN_VERDICT = "НУЖЕН ЧЕЛОВЕК"
 
 STAGE_PROMPTS_NOTE = (
     "executor_prompt и reviewer_prompt необязательны и содержат только указания "
-    "этого этапа: разрешённые пути, ожидаемые результаты, отчёты, замечания аудита, "
-    "результаты gate и формат ответа аудитора PromptPilot добавляет к ним сам."
+    "этого этапа: код, название и проверяемую цель этапа (objective), разрешённые "
+    "пути, ожидаемые результаты, отчёты, замечания аудита, результаты gate и формат "
+    "ответа аудитора PromptPilot добавляет к ним сам."
 )
 
 DEFAULT_PLANNER_PROMPT = """Ты — ведущий инженер-планировщик PromptPilot.
@@ -286,24 +287,33 @@ Deterministic gate:
 
 Проверь diff, историю Git, тесты и evidence. """ + AUDIT_RESPONSE_CONTRACT
 
-# Context a stage text or a custom role template must not lose. A section is
-# added only when none of its placeholders is already in the text.
+# Context a stage text or a custom role template must not lose: the placeholders
+# that already place a section, and the section added when none of them is in
+# the text.
 _CONTEXT_SECTIONS = {
-    "executor_report": (("executor_report",), "Отчёт исполнителя:"),
-    "gate_evidence": (("gate_evidence",), "Результаты автоматических проверок (gate):"),
-    "open_findings": (("open_findings",), "Незакрытые замечания предыдущих аудитов:"),
-    "allowed_paths": (("allowed_paths",), "Разрешённые пути:"),
-    "deliverables": (("deliverables",), "Ожидаемые результаты:"),
-    "acceptance_gates": (("acceptance_gates",), "Проверки приёмки:"),
+    # The card's verifiable goal must reach the agent even when the stage text
+    # only says how to work, and an edited goal must not be silently ignored.
+    "stage_goal": (("stage_goal",),
+                   "Этап: {{stage_label}}\nПроверяемая цель этапа:\n{{stage_goal}}"),
+    "executor_report": (("executor_report",), "Отчёт исполнителя:\n{{executor_report}}"),
+    "gate_evidence": (("gate_evidence",),
+                      "Результаты автоматических проверок (gate):\n{{gate_evidence}}"),
+    "open_findings": (("open_findings",),
+                      "Незакрытые замечания предыдущих аудитов:\n{{open_findings}}"),
+    "allowed_paths": (("allowed_paths",), "Разрешённые пути:\n{{allowed_paths}}"),
+    "deliverables": (("deliverables",), "Ожидаемые результаты:\n{{deliverables}}"),
+    "acceptance_gates": (("acceptance_gates",), "Проверки приёмки:\n{{acceptance_gates}}"),
     # The built-in executor template places these remarks as previous_review.
     "stage_review": (("stage_review", "previous_review"),
-                     "Замечания независимого аудита к прошлой попытке этого этапа:"),
+                     "Замечания независимого аудита к прошлой попытке этого этапа:\n"
+                     "{{stage_review}}"),
 }
 _ROLE_CONTEXT = {
-    "reviewer": ("executor_report", "gate_evidence", "open_findings",
+    "reviewer": ("stage_goal", "executor_report", "gate_evidence", "open_findings",
                  "allowed_paths", "deliverables"),
-    "executor": ("allowed_paths", "deliverables", "stage_review", "gate_evidence"),
-    "external": ("allowed_paths", "deliverables", "acceptance_gates",
+    "executor": ("stage_goal", "allowed_paths", "deliverables", "stage_review",
+                 "gate_evidence"),
+    "external": ("stage_goal", "allowed_paths", "deliverables", "acceptance_gates",
                  "stage_review", "gate_evidence"),
 }
 
@@ -2034,9 +2044,9 @@ def _context_block(text: str, kind: str) -> str:
     """Sections of the role context that ``text`` does not place itself."""
     parts = []
     for name in _ROLE_CONTEXT[kind]:
-        placeholders, title = _CONTEXT_SECTIONS[name]
+        placeholders, section = _CONTEXT_SECTIONS[name]
         if not any("{{" + item + "}}" in text for item in placeholders):
-            parts.append(title + "\n{{" + name + "}}")
+            parts.append(section)
     if kind == "reviewer" and not _has_audit_contract(text):
         parts.append(AUDIT_CONTRACT_PLACEHOLDER)
     if not parts:
@@ -2082,6 +2092,8 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         "stage_code": str(stage.get("code") or ""),
         "stage_title": str(stage.get("title") or ""),
         "stage_goal": str(stage.get("objective") or stage.get("goal") or workflow.objective),
+        "stage_label": (f"{stage.get('code') or ''} {stage.get('title') or ''}".strip()
+                        or "единственный этап workflow"),
         "allowed_paths": "\n".join(stage.get("allowed_paths") or []) or "(не ограничены планом)",
         "deliverables": "\n".join(stage.get("deliverables") or []) or "(см. цель этапа)",
         "previous_review": _latest_run_output(

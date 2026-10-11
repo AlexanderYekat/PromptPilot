@@ -179,9 +179,13 @@ JSON-массив объектов с `fingerprint`, `severity`, `category`, `ti
 
 | Роль | Обязательные разделы (подстановки) |
 | --- | --- |
-| аудитор | отчёт исполнителя `{{executor_report}}`, gate `{{gate_evidence}}`, незакрытые замечания `{{open_findings}}`, разрешённые пути `{{allowed_paths}}`, ожидаемые результаты `{{deliverables}}`, формат ответа `{{audit_contract}}` |
-| исполнитель | `{{allowed_paths}}`, `{{deliverables}}`, замечания аудита этого этапа `{{stage_review}}` (или `{{previous_review}}`), `{{gate_evidence}}` |
-| внешний исполнитель | `{{allowed_paths}}`, `{{deliverables}}`, проверки приёмки `{{acceptance_gates}}`, `{{stage_review}}`, `{{gate_evidence}}` |
+| аудитор | этап и проверяемая цель `{{stage_goal}}`, отчёт исполнителя `{{executor_report}}`, gate `{{gate_evidence}}`, незакрытые замечания `{{open_findings}}`, разрешённые пути `{{allowed_paths}}`, ожидаемые результаты `{{deliverables}}`, формат ответа `{{audit_contract}}` |
+| исполнитель | `{{stage_goal}}`, `{{allowed_paths}}`, `{{deliverables}}`, замечания аудита этого этапа `{{stage_review}}` (или `{{previous_review}}`), `{{gate_evidence}}` |
+| внешний исполнитель | `{{stage_goal}}`, `{{allowed_paths}}`, `{{deliverables}}`, проверки приёмки `{{acceptance_gates}}`, `{{stage_review}}`, `{{gate_evidence}}` |
+
+Раздел цели выводит код, название и «Проверяемую цель» (`objective`) карточки, поэтому
+правка цели в карточке доходит до агентов, даже если подробный текст этапа её не
+повторяет.
 
 Раздел, подстановка которого уже есть в тексте, не повторяется. Порядок итогового
 промпта: текст этапа; добавленные разделы; прошлый отчёт исполнителя того же этапа;
