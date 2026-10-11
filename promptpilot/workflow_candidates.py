@@ -226,7 +226,11 @@ def readiness(workflow, stages=(), check_output_paths=False):
     commands.extend(cfg.stage.get('acceptance_gates', []))
     specs = []
     for stage in stages:
-        spec = db._json_load(stage['spec_json']) if not hasattr(stage, 'acceptance_gates') else stage.model_dump()
+        if hasattr(stage, 'acceptance_gates'):
+            spec = stage.model_dump()
+        else:
+            # A stage row keeps its code in a column, not in spec_json.
+            spec = {**db._json_load(stage['spec_json']), 'code': stage['code']}
         commands.extend(spec.get('acceptance_gates', []))
         specs.append(spec)
     if not cfg.candidate.enabled:

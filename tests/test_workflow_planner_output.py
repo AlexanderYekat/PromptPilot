@@ -391,7 +391,8 @@ def test_approval_and_readiness_report_the_conflict(isolated_db, repo):
 
     response = call("POST", f"/api/workflows/{workflow.id}/plan/approve",
                     json={"expected_version": waiting.state_version})
-    assert response.status_code == 409 and "output_path_conflict" in response.text
+    assert response.status_code == 409
+    assert response.json()["detail"] == readiness["reason"]
     assert isolated_db.get_workflow(workflow.id).status.value == "awaiting_plan_approval"
 
 
