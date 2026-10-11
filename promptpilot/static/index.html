@@ -2381,7 +2381,7 @@ function workflowStopReason(events) {
     'limit.stage_revisions','candidate.blocked','candidate.invalidated',
   ];
   const superseding = [
-    'planner.dispatched','planner.completed','plan.edited','plan.approved','stage.advanced',
+    'planner.dispatched','planner.completed','planner.output_applied','plan.edited','plan.approved','stage.advanced',
     'human.resumed','executor.dispatched','executor.completed','gate.passed','reviewer.dispatched',
     'review.awaiting_decision','review.passed','review.revision_required',
     'workflow.completed',
@@ -2451,19 +2451,70 @@ function workflowPlanChanges(before, after) {
   return changes.length ? changes.join('\n') : 'Поля этапов не изменились';
 }
 
+// What became of one planner run: applied, applied with reservations or by
+// hand from its answer, or not applied and why.
+function workflowPlanRevisionOutcome(event, events, plan) {
+  const taskId = event.payload?.task_id;
+  const later = events.filter(e => (e.seq || 0) > (event.seq || 0) && e.payload?.task_id === taskId
+    && e.event_type?.startsWith('planner.') && e.event_type !== 'planner.dispatched');
+  const completed = later.find(e => e.event_type === 'planner.completed');
+  const applied = later.find(e => e.event_type === 'planner.output_applied');
+  const failed = later.find(e => !['planner.completed', 'planner.output_applied'].includes(e.event_type));
+  if (applied) return {applied: true, label: 'применена вручную из ответа планировщика'};
+  if (completed) return {applied: true, label: completed.payload?.manual_approval ? 'применена с оговорками планировщика' : 'применена'};
+  if (failed) return {applied: false, label: 'не применена', reason: failed.payload?.reason || failed.event_type, verdict: failed.payload?.verdict};
+  if (plan?.planner_task_id === taskId && plan?.status === 'planning') return {applied: false, label: 'ожидает ответа планировщика'};
+  return {applied: plan?.planner_task_id === taskId && plan?.status === 'awaiting_approval', label: ''};
+}
+
 function workflowPlanRevisionHistory(plan, stages, events) {
   return events.filter(e => e.event_type === 'planner.dispatched' && e.payload?.plan_revision)
     .slice().reverse().map(event => {
       const revision = event.payload.plan_revision;
       const current = plan?.status === 'awaiting_approval' && plan.planner_task_id === event.payload.task_id;
+      const outcome = workflowPlanRevisionOutcome(event, events, plan);
       return `<details data-wf-detail="plan-revision-${event.seq}" class="wf-stage-card">
-        <summary>Доработка плана · task #${esc(event.payload.task_id)} · ${esc(formatTime(event.created_at))}</summary>
+        <summary>Доработка плана · task #${esc(event.payload.task_id)} · ${esc(formatTime(event.created_at))}${outcome.label ? ` · ${esc(outcome.label)}` : ''}</summary>
+        ${outcome.reason ? `<div class="wf-meta" style="color:var(--red)">Доработка не применена: ${esc(outcome.reason)}${outcome.verdict ? ` (ИТОГ: ${esc(outcome.verdict)})` : ''}</div>` : ''}
         <b>Замечания</b><pre>${esc(revision.feedback || 'Повторное планирование')}</pre>
         ${current ? `<b>Изменения относительно переданного плана</b><pre>${esc(workflowPlanChanges(revision.stages, stages))}</pre>` : ''}
         <details><summary>План, переданный на доработку</summary><pre>${esc(JSON.stringify(revision.stages, null, 2))}</pre></details>
         <details><summary>Сохранённая версия до отправки</summary><pre>${esc(JSON.stringify(revision.previous_stages, null, 2))}</pre></details>
       </details>`;
     }).join('');
+}
+
+const WORKFLOW_SUCCESS_VERDICTS = ['ГОТОВО', 'УЖЕ СДЕЛАНО'];
+
+// The planner's own words before its plan block: changes, open remarks, what
+// the operator must do.
+function workflowPlannerNarrative(result) {
+  return String(result || '').split('WORKFLOW_PLAN_JSON_BEGIN')[0].trim();
+}
+
+function workflowPlanReservationsHtml(plan) {
+  const output = plan?.output || {};
+  if (plan?.status !== 'awaiting_approval') return '';
+  if (!output.manual_approval && (!output.verdict || WORKFLOW_SUCCESS_VERDICTS.includes(output.verdict))) return '';
+  const how = output.manual_approval === 'planner_output_applied'
+    ? `План применён вручную из ответа задачи #${esc(plan.planner_task_id)}.`
+    : 'Планировщик вернул план с оговорками.';
+  return `<div class="wf-stage-card" style="border-color:var(--yellow)">
+    <b>Итог планировщика: ${esc(output.verdict || 'без итога')}</b>
+    <div class="wf-meta">${how} Перед утверждением прочитайте изменения, нерешённые замечания и действия оператора.</div>
+    <div class="result-block"><pre>${esc(workflowPlannerNarrative(output.result) || '(перед блоком плана текста нет)')}</pre></div>
+  </div>`;
+}
+
+function workflowPlanNotAppliedHtml(wf, plan, stages) {
+  if (wf.status !== 'awaiting_human' || wf.current_round || !['failed', 'cancelled'].includes(plan?.status)) return '';
+  const recovered = plan.planner_output_plan;
+  if (!stages.length && !recovered?.applicable) return '';
+  return `<div class="wf-stage-card" style="border-color:var(--red)">
+    <b>${stages.length ? 'План не применён; в карточках — предыдущая версия этапов.' : 'План не применён.'}</b>
+    ${recovered?.applicable ? `<div class="wf-meta">В ответе задачи #${esc(recovered.task_id)} есть план: ${esc((recovered.stage_codes || []).join(', '))}${recovered.verdict ? ` (ИТОГ: ${esc(recovered.verdict)})` : ''}. Он заменит карточки и будет ждать утверждения.</div>
+    <button class="btn btn-sm btn-primary" onclick="wfApplyPlannerOutput()">Применить план из ответа планировщика</button>` : ''}
+  </div>`;
 }
 
 function workflowPlanHtml(wf, plan, stages, events = []) {
@@ -2482,6 +2533,7 @@ function workflowPlanHtml(wf, plan, stages, events = []) {
     <button class="btn btn-sm btn-primary" onclick="wfApprovePlan()">Сохранить и утвердить</button>` : ''}
   </div>` : '';
   return `<div class="wf-section-title">План этапов · ${stages.length}</div>
+    ${workflowPlanNotAppliedHtml(wf, plan, stages)}
     ${editable ? `<div class="wf-stage-card">
       <label for="wfPlanFeedback"><b>Замечания к плану</b></label>
       <textarea class="wide" id="wfPlanFeedback" rows="8" maxlength="30000" style="width:100%"
@@ -2489,7 +2541,7 @@ function workflowPlanHtml(wf, plan, stages, events = []) {
       <div class="wf-meta">Доработка сохранит предыдущую версию и правки в полях этапов. Исполнение начнётся только после отдельного утверждения.</div>
       <button class="btn btn-primary" id="wfRevisePlanButton" onclick="wfRevisePlan()">Доработать по замечаниям</button>
     </div><div class="wf-meta">Последний этап должен иметь тип integration. Gate-команды выполняются только после ручного утверждения плана.</div>` : ''}
-    <div class="wf-stage-list" id="wfStageList">${cards || '<div class="wf-meta">Планировщик ещё не сформировал этапы.</div>'}</div>${controls}
+    <div class="wf-stage-list" id="wfStageList">${cards || '<div class="wf-meta">Планировщик ещё не сформировал этапы.</div>'}</div>${awaitingApproval ? workflowPlanReservationsHtml(plan) : ''}${controls}
     ${workflowPlanRevisionHistory(plan, stages, events)}`;
 }
 
@@ -2884,6 +2936,18 @@ async function wfApprovePlan() {
     toast('План утверждён, первый этап запущен', false);
     await loadWorkflows();
   } catch (e) { toast('Утверждение плана: ' + e.message); }
+}
+
+async function wfApplyPlannerOutput() {
+  if (!confirm('Заменить карточки этапов планом из ответа планировщика? Исполнение начнётся только после отдельного утверждения.')) return;
+  try {
+    await fetchJSON(`${API}/workflows/${selectedWorkflowId}/plan/apply-planner-output`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({expected_version:selectedWorkflowData.state_version}),
+    });
+    toast('План из ответа планировщика применён и ждёт утверждения', false);
+    await loadWorkflows();
+  } catch (e) { toast('Применение плана: ' + e.message); }
 }
 
 async function wfRevisePlan() {

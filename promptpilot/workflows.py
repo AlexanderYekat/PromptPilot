@@ -46,6 +46,7 @@ from .models import (
     WorkflowTaskDispatch,
     WorkflowGateDecision,
     WorkflowConfig,
+    WorkflowVersionRequest,
 )
 
 
@@ -117,6 +118,14 @@ ALLOWED_TRANSITIONS = {
     WorkflowStatus.CANCELLED: set(),
 }
 
+# Transitions that only one explicit action may take, keyed by its event type.
+ACTION_TRANSITIONS = {
+    # The operator applies the plan from a recorded planner answer.
+    "planner.output_applied": {
+        WorkflowStatus.AWAITING_HUMAN: {WorkflowStatus.AWAITING_PLAN_APPROVAL},
+    },
+}
+
 
 TERMINAL_STATES = {
     WorkflowStatus.COMPLETED,
@@ -138,6 +147,13 @@ WORKFLOW_VERDICT_INSTRUCTION = """
 """
 
 SUCCESS_VERDICTS = {"ГОТОВО", "УЖЕ СДЕЛАНО"}
+HUMAN_VERDICT = "НУЖЕН ЧЕЛОВЕК"
+
+STAGE_PROMPTS_NOTE = (
+    "executor_prompt и reviewer_prompt необязательны и содержат только указания "
+    "этого этапа: разрешённые пути, ожидаемые результаты, отчёты, замечания аудита, "
+    "результаты gate и формат ответа аудитора PromptPilot добавляет к ним сам."
+)
 
 DEFAULT_PLANNER_PROMPT = """Ты — ведущий инженер-планировщик PromptPilot.
 Изучи репозиторий и разложи общую задачу на короткие последовательные этапы,
@@ -161,7 +177,7 @@ DEFAULT_PLANNER_PROMPT = """Ты — ведущий инженер-планир�
 acceptance_gates, executor_prompt, reviewer_prompt, max_revision_rounds,
 execution_mode (automatic — делает агент PromptPilot; external — этап выполнит
 человек или внешний инструмент, PromptPilot выдаст задание и примет результат).
-"""
+""" + STAGE_PROMPTS_NOTE + "\n"
 
 PLAN_OUTPUT_CONTRACT = """
 <promptpilot-plan-contract version="stage-plan-v1">
@@ -228,6 +244,27 @@ EXTERNAL_REVIEW_NOTICE = """
 может не быть.
 </внешний-исполнитель>"""
 
+# The auditor's answer format. Every reviewer prompt carries it exactly once,
+# whatever the role template or stage text says (``{{audit_contract}}``).
+AUDIT_RESPONSE_CONTRACT = """В конце отчёта обязательно выведи
+две машинно-читаемые строки (каждая целиком на одной строке):
+AUDIT_FINDINGS_JSON: []
+AUDIT_VERDICT: PASS
+
+Для замечаний верни JSON-массив объектов с полями fingerprint, severity
+(blocker/high/medium/low/info), category, title, status (open/resolved/reopened/
+accepted_risk), payload. Поле payload — JSON-объект, не строка; например:
+{"fingerprint":"missing-check","severity":"medium","category":"requirements","title":"Нет проверки","status":"open","payload":{"details":"Описание замечания"}}
+AUDIT_VERDICT допускает только PASS,
+REVISION_REQUIRED или HUMAN_REQUIRED.
+
+Если список незакрытых замечаний выше не пуст, верни в AUDIT_FINDINGS_JSON
+каждый прежний fingerprint: со status=resolved, когда исправление проверено, либо
+со status=open/reopened и вердиктом REVISION_REQUIRED. Не возвращай PASS с
+пустым массивом, пока в реестре есть незакрытые замечания.
+"""
+AUDIT_CONTRACT_PLACEHOLDER = "{{audit_contract}}"
+
 DEFAULT_REVIEWER_PROMPT = """Ты — независимый аудитор в автономном workflow PromptPilot.
 Не исправляй код и не принимай заявления исполнителя на веру.
 
@@ -247,23 +284,28 @@ Deterministic gate:
 Незакрытые замечания предыдущих аудитов:
 {{open_findings}}
 
-Проверь diff, историю Git, тесты и evidence. В конце отчёта обязательно выведи
-две машинно-читаемые строки (каждая целиком на одной строке):
-AUDIT_FINDINGS_JSON: []
-AUDIT_VERDICT: PASS
+Проверь diff, историю Git, тесты и evidence. """ + AUDIT_RESPONSE_CONTRACT
 
-Для замечаний верни JSON-массив объектов с полями fingerprint, severity
-(blocker/high/medium/low/info), category, title, status (open/resolved/reopened/
-accepted_risk), payload. Поле payload — JSON-объект, не строка; например:
-{"fingerprint":"missing-check","severity":"medium","category":"requirements","title":"Нет проверки","status":"open","payload":{"details":"Описание замечания"}}
-AUDIT_VERDICT допускает только PASS,
-REVISION_REQUIRED или HUMAN_REQUIRED.
-
-Если список незакрытых замечаний выше не пуст, верни в AUDIT_FINDINGS_JSON
-каждый прежний fingerprint: со status=resolved, когда исправление проверено, либо
-со status=open/reopened и вердиктом REVISION_REQUIRED. Не возвращай PASS с
-пустым массивом, пока в реестре есть незакрытые замечания.
-"""
+# Context a stage text or a custom role template must not lose. A section is
+# added only when none of its placeholders is already in the text.
+_CONTEXT_SECTIONS = {
+    "executor_report": (("executor_report",), "Отчёт исполнителя:"),
+    "gate_evidence": (("gate_evidence",), "Результаты автоматических проверок (gate):"),
+    "open_findings": (("open_findings",), "Незакрытые замечания предыдущих аудитов:"),
+    "allowed_paths": (("allowed_paths",), "Разрешённые пути:"),
+    "deliverables": (("deliverables",), "Ожидаемые результаты:"),
+    "acceptance_gates": (("acceptance_gates",), "Проверки приёмки:"),
+    # The built-in executor template places these remarks as previous_review.
+    "stage_review": (("stage_review", "previous_review"),
+                     "Замечания независимого аудита к прошлой попытке этого этапа:"),
+}
+_ROLE_CONTEXT = {
+    "reviewer": ("executor_report", "gate_evidence", "open_findings",
+                 "allowed_paths", "deliverables"),
+    "executor": ("allowed_paths", "deliverables", "stage_review", "gate_evidence"),
+    "external": ("allowed_paths", "deliverables", "acceptance_gates",
+                 "stage_review", "gate_evidence"),
+}
 
 
 def _workflow_row(conn: sqlite3.Connection, workflow_id: str) -> sqlite3.Row:
@@ -305,7 +347,9 @@ def _transition(conn: sqlite3.Connection, workflow: sqlite3.Row,
                 target: WorkflowStatus, event_type: str, payload: dict,
                 round_id: str = None) -> sqlite3.Row:
     current = WorkflowStatus(workflow["status"])
-    if target not in ALLOWED_TRANSITIONS[current]:
+    allowed = ALLOWED_TRANSITIONS[current] | (
+        ACTION_TRANSITIONS.get(event_type, {}).get(current, set()))
+    if target not in allowed:
         raise db.WorkflowConflictError(
             f"invalid workflow transition: {current.value} -> {target.value}"
         )
@@ -545,7 +589,8 @@ def dispatch_planner(workflow_id: str,
                        "ручные исправления. Не исполняйте этапы и не меняйте файлы или настройки. "
                        "Замечания оценивайте вместе с целью и действующей конфигурацией. "
                        "Перед полным WORKFLOW_PLAN_JSON перечислите внесённые изменения и "
-                       "нерешённые замечания; результат потребует ручного утверждения.\n"
+                       "нерешённые замечания; результат потребует ручного утверждения. "
+                       + STAGE_PROMPTS_NOTE + "\n"
                        "Текущий план этапов:\n" + json.dumps(revision["stages"], ensure_ascii=False)
                        + "\nДействующие настройки workflow:\n"
                        + json.dumps(revision["config"], ensure_ascii=False)
@@ -645,14 +690,24 @@ def sync_planner_task(task_id: int) -> Optional[WorkflowPlanInDB]:
             return db._row_to_workflow_plan(plan)
         failure = _planner_failure(task)
         config = _config_for(db._row_to_workflow(workflow))
-        stages = None if failure else parse_workflow_plan(
-            task["result"] or "", config.planning.max_stages)
-        if not failure and not stages:
-            failure = {
-                "code": "invalid_output",
-                "reason": "Планировщик завершил задачу, но результат не соответствует контракту stage-plan-v1.",
-                "next_action": "Проверьте ответ планировщика; уточните указания или повторно сформируйте план.",
-            }
+        stages = None
+        reservations = False
+        if not failure:
+            stages = parse_workflow_plan(task["result"] or "", config.planning.max_stages)
+            if not stages:
+                failure = {
+                    "code": "invalid_output",
+                    "reason": "Планировщик завершил задачу, но результат не соответствует контракту stage-plan-v1.",
+                    "next_action": "Проверьте ответ планировщика; уточните указания или повторно сформируйте план.",
+                }
+        elif (failure["code"] == "unsuccessful_result" and task["verdict"] == HUMAN_VERDICT
+              and workflow["status"] == WorkflowStatus.PLANNING.value):
+            # A plan delivered with reservations goes to the operator instead of
+            # being discarded. Only a fresh result qualifies: a failure recorded
+            # by an older release keeps its outcome when it is synced again.
+            stages = parse_workflow_plan(task["result"] or "", config.planning.max_stages)
+            if stages:
+                failure, reservations = None, True
         output = {
             "task_status": task["status"], "result": task["result"],
             "error": task["error"], "exit_code": task["exit_code"],
@@ -660,6 +715,8 @@ def sync_planner_task(task_id: int) -> Optional[WorkflowPlanInDB]:
         }
         if failure:
             output["failure"] = failure
+        if reservations:
+            output["manual_approval"] = "planner_verdict"
         output_json = db._json_dump(output)
         output_sha = hashlib.sha256(output_json.encode("utf-8")).hexdigest()
         if plan["output_sha256"] == output_sha:
@@ -675,21 +732,17 @@ def sync_planner_task(task_id: int) -> Optional[WorkflowPlanInDB]:
             workflow = _transition(
                 conn, workflow, WorkflowStatus.AWAITING_PLAN_APPROVAL,
                 "planner.completed",
-                {"task_id": task_id, "stage_count": len(stages),
+                {"task_id": task_id, "verdict": task["verdict"],
+                 "stage_count": len(stages),
                  "stage_codes": [stage.code for stage in stages],
-                 "output_sha256": output_sha},
+                 "output_sha256": output_sha,
+                 **({"manual_approval": output["manual_approval"]} if reservations else {})},
             )
             # LLM-authored shell commands are never executed without a human
             # seeing the plan, even when command-free plans may auto-approve.
             has_generated_commands = any(stage.acceptance_gates for stage in stages)
-            dispatch_event = conn.execute(
-                "SELECT payload_json FROM workflow_events WHERE workflow_id=? "
-                "AND event_type='planner.dispatched' ORDER BY seq DESC LIMIT 1",
-                (workflow["id"],)).fetchone()
-            is_revision = bool(dispatch_event and
-                               db._json_load(dispatch_event[0]).get("plan_revision"))
             if (not config.planning.require_approval and not has_generated_commands
-                    and not is_revision):
+                    and not _manual_approval_reason(conn, workflow["id"])):
                 auto_approve = (workflow["id"], workflow["state_version"])
         else:
             conn.execute(
@@ -701,7 +754,8 @@ def sync_planner_task(task_id: int) -> Optional[WorkflowPlanInDB]:
             event_type = f"planner.{failure['code']}"
             payload = {"task_id": task_id, "output_sha256": output_sha,
                        "task_status": task["status"], "error": task["error"],
-                       "exit_code": task["exit_code"], **failure}
+                       "exit_code": task["exit_code"], "verdict": task["verdict"],
+                       **failure}
             if workflow["status"] == "awaiting_human":
                 _touch(conn, workflow, event_type, payload)
             else:
@@ -719,6 +773,124 @@ def sync_planner_task(task_id: int) -> Optional[WorkflowPlanInDB]:
         )
         return db.get_workflow_plan(auto_approve[0])
     return result
+
+
+def _manual_approval_reason(conn: sqlite3.Connection, workflow_id: str) -> Optional[str]:
+    """Why the plan awaiting approval must never be approved automatically.
+
+    A revision, a plan delivered with «НУЖЕН ЧЕЛОВЕК» and a plan the operator
+    applied from a recorded answer all need a person, whatever
+    ``require_approval`` says and whether the stages have gates.
+    """
+    plan = conn.execute(
+        "SELECT output_json FROM workflow_plans WHERE workflow_id=?", (workflow_id,)
+    ).fetchone()
+    output = db._json_load(plan["output_json"]) if plan else {}
+    if output.get("manual_approval"):
+        return output["manual_approval"]
+    dispatch = conn.execute(
+        "SELECT payload_json FROM workflow_events WHERE workflow_id=? "
+        "AND event_type='planner.dispatched' ORDER BY seq DESC LIMIT 1",
+        (workflow_id,)).fetchone()
+    if dispatch and db._json_load(dispatch[0]).get("plan_revision"):
+        return "plan_revision"
+    return None
+
+
+def _recorded_planner_plan(conn: sqlite3.Connection, workflow: sqlite3.Row):
+    """The stage plan in the answer of a failed planner task, or why there is none.
+
+    Returns ``(stages, task, reason)``; ``stages`` is None when the plan cannot
+    be applied.
+    """
+    if WorkflowStatus(workflow["status"]) is not WorkflowStatus.AWAITING_HUMAN:
+        return None, None, "planner output can only be applied while the workflow awaits a human"
+    if workflow["current_round"]:
+        return None, None, "planner output can only be applied before stage execution starts"
+    plan = conn.execute(
+        "SELECT * FROM workflow_plans WHERE workflow_id=?", (workflow["id"],)
+    ).fetchone()
+    if not plan or plan["status"] != "failed":
+        return None, None, "there is no failed planner result to apply"
+    task = conn.execute(
+        "SELECT * FROM tasks WHERE id=?", (plan["planner_task_id"],)
+    ).fetchone()
+    if not task:
+        return None, None, f"planner task {plan['planner_task_id']} is missing"
+    if task["status"] in {"pending", "rate_limited", "running"}:
+        return None, task, f"planner task {task['id']} has not finished"
+    if "WORKFLOW_PLAN_JSON_BEGIN" not in (task["result"] or ""):
+        return None, task, f"planner task {task['id']} answer has no WORKFLOW_PLAN_JSON block"
+    limit = _config_for(workflow).planning.max_stages
+    stages = parse_workflow_plan(task["result"], limit)
+    if not stages:
+        return None, task, (f"planner task {task['id']} answer has no valid stage plan "
+                            f"within max_stages={limit}")
+    return stages, task, ""
+
+
+def planner_output_plan(workflow_id: str) -> Optional[dict]:
+    """Whether a recorded planner failure still carries a plan to apply (for the UI)."""
+    with db._connect() as conn:
+        workflow = _workflow_row(conn, workflow_id)
+        plan = conn.execute(
+            "SELECT status FROM workflow_plans WHERE workflow_id=?", (workflow_id,)
+        ).fetchone()
+        if (not plan or plan["status"] != "failed" or workflow["current_round"]
+                or workflow["status"] != WorkflowStatus.AWAITING_HUMAN.value):
+            return None
+        stages, task, reason = _recorded_planner_plan(conn, workflow)
+    return {
+        "applicable": stages is not None,
+        "task_id": task["id"] if task else None,
+        "verdict": task["verdict"] if task else None,
+        "stage_codes": [stage.code for stage in stages or []],
+        "reason": reason,
+    }
+
+
+def apply_planner_output(workflow_id: str,
+                         request: WorkflowVersionRequest) -> WorkflowInDB:
+    """Put the plan from a recorded, unsuccessful planner answer up for approval.
+
+    Older releases discarded a usable plan delivered with «НУЖЕН ЧЕЛОВЕК»;
+    this explicit action recovers it. The plan still needs a person to approve.
+    """
+    with db._connect(immediate=True) as conn:
+        workflow = _workflow_row(conn, workflow_id)
+        _require_version(workflow, request.expected_version)
+        stages, task, reason = _recorded_planner_plan(conn, workflow)
+        if stages is None:
+            raise db.WorkflowConflictError(reason)
+        plan = conn.execute(
+            "SELECT * FROM workflow_plans WHERE workflow_id=?", (workflow_id,)
+        ).fetchone()
+        previous = db._json_load(plan["output_json"])
+        output = {
+            "task_status": task["status"], "result": task["result"],
+            "error": task["error"], "exit_code": task["exit_code"],
+            "verdict": task["verdict"], "model_used": task["model_used"],
+            "manual_approval": "planner_output_applied",
+            "previous_failure": previous.get("failure"),
+        }
+        output_json = db._json_dump(output)
+        output_sha = hashlib.sha256(output_json.encode("utf-8")).hexdigest()
+        db._replace_workflow_stages(conn, workflow_id, stages)
+        conn.execute(
+            """UPDATE workflow_plans SET status='awaiting_approval',
+               output_sha256=?, output_json=?, updated_at=? WHERE workflow_id=?""",
+            (output_sha, output_json, db._now(), workflow_id),
+        )
+        workflow = _transition(
+            conn, workflow, WorkflowStatus.AWAITING_PLAN_APPROVAL,
+            "planner.output_applied",
+            {"task_id": task["id"], "verdict": task["verdict"],
+             "output_sha256": output_sha,
+             "previous_output_sha256": plan["output_sha256"],
+             "stage_count": len(stages),
+             "stage_codes": [stage.code for stage in stages]},
+        )
+        return db._row_to_workflow(workflow)
 
 
 def replace_plan(workflow_id: str,
@@ -756,7 +928,7 @@ def approve_plan(workflow_id: str,
         ).fetchall()
         if not stages:
             raise db.WorkflowConflictError("workflow plan has no stages")
-        candidates.readiness(workflow, stages)
+        candidates.readiness(workflow, stages, check_output_paths=True)
         now = db._now()
         conn.execute(
             "UPDATE workflow_stages SET status='pending' WHERE workflow_id=?",
@@ -799,7 +971,7 @@ def start_workflow(workflow_id: str,
         _require_version(workflow, request.expected_version)
         if WorkflowStatus(workflow["status"]) is not WorkflowStatus.DRAFT:
             raise db.WorkflowConflictError("only a draft workflow can be started")
-        candidates.readiness(workflow)
+        candidates.readiness(workflow, check_output_paths=True)
         round_no = workflow["current_round"] + 1
         round_row = _insert_round(
             conn, workflow_id, round_no, base_sha=request.base_sha
@@ -1858,6 +2030,37 @@ def _stage_review_output(workflow: WorkflowInDB) -> str:
     return output.get("result") or output.get("error") or "(пустой отчёт)"
 
 
+def _context_block(text: str, kind: str) -> str:
+    """Sections of the role context that ``text`` does not place itself."""
+    parts = []
+    for name in _ROLE_CONTEXT[kind]:
+        placeholders, title = _CONTEXT_SECTIONS[name]
+        if not any("{{" + item + "}}" in text for item in placeholders):
+            parts.append(title + "\n{{" + name + "}}")
+    if kind == "reviewer" and not _has_audit_contract(text):
+        parts.append(AUDIT_CONTRACT_PLACEHOLDER)
+    if not parts:
+        return ""
+    return ("<контекст-этапа>\nЭти разделы добавил PromptPilot к заданию этапа.\n\n"
+            + "\n\n".join(parts) + "\n</контекст-этапа>")
+
+
+def _has_audit_contract(text: str) -> bool:
+    return (AUDIT_CONTRACT_PLACEHOLDER in text
+            or AUDIT_RESPONSE_CONTRACT.strip() in text)
+
+
+def _place_audit_contract(text: str, role: WorkflowRole) -> str:
+    """Put the auditor's answer format into a reviewer prompt exactly once."""
+    if role is not WorkflowRole.REVIEWER or AUDIT_RESPONSE_CONTRACT.strip() in text:
+        return text.replace(AUDIT_CONTRACT_PLACEHOLDER, "")
+    head, placed, tail = text.partition(AUDIT_CONTRACT_PLACEHOLDER)
+    if not placed:
+        return text
+    return (head + AUDIT_RESPONSE_CONTRACT.strip()
+            + tail.replace(AUDIT_CONTRACT_PLACEHOLDER, ""))
+
+
 def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
                         template: str, *, external: bool = False) -> str:
     round_no = workflow.current_round
@@ -1916,22 +2119,36 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         if role is WorkflowRole.REVIEWER:
             values['gate_evidence'] = _latest_gate_evidence(workflow.id)
     values["human_input"] = _operator_notes_block(notes)
-    if external:
-        # An agent-oriented executor template (commit, run tests) is not an
-        # assignment for a person; the stage's own executor_prompt still wins.
-        rendered = DEFAULT_EXTERNAL_PROMPT
-    else:
-        rendered = template or (
-            DEFAULT_EXECUTOR_PROMPT
-            if role is WorkflowRole.EXECUTOR else DEFAULT_REVIEWER_PROMPT
-        )
+    stage_text = ""
     if stage_row:
-        override = (
+        stage_text = (
             stage_row.executor_prompt
             if role is WorkflowRole.EXECUTOR else stage_row.reviewer_prompt
         )
-        if override:
-            rendered = override
+    if external:
+        # An agent-oriented executor template (commit, run tests) is not an
+        # assignment for a person; the stage's own executor_prompt still wins.
+        base = stage_text or DEFAULT_EXTERNAL_PROMPT
+        builtin = not stage_text
+    else:
+        base = stage_text or template or (
+            DEFAULT_EXECUTOR_PROMPT
+            if role is WorkflowRole.EXECUTOR else DEFAULT_REVIEWER_PROMPT
+        )
+        builtin = not (stage_text or template)
+    # A stage text or custom template supplements the role: PromptPilot adds
+    # the context and answer format it does not place itself. The built-in
+    # templates already carry every section.
+    block = "" if builtin else _context_block(
+        base, "external" if external else role.value)
+    rendered = base.rstrip() + "\n\n" + block if block else base
+    rendered = _place_audit_contract(rendered, role)
+    # Placeholders are filled in one pass, so a report quoting "{{...}}" is
+    # left as written.
+    placed_by_template = "{{human_input}}" in rendered
+    places_executor_report = "{{executor_report}}" in rendered
+    rendered = re.sub(r"\{\{([a-z_]+)\}\}",
+                      lambda match: values.get(match.group(1), match.group(0)), rendered)
     # Only a run of this same stage: the first round of the next stage has
     # another goal and other allowed paths, so its predecessor's report is
     # not a session to resume.
@@ -1939,7 +2156,7 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         workflow.id, WorkflowRole.EXECUTOR, stage_id=workflow.current_stage_id)
     if (role is WorkflowRole.EXECUTOR
             and previous_executor != "(нет: это первый раунд)"
-            and "{{executor_report}}" not in rendered):
+            and not places_executor_report):
         # A resumed executor may run in a fresh CLI session. Give it the prior
         # result as context; the repository remains the source of truth.
         if len(previous_executor) > 12000:
@@ -1953,9 +2170,6 @@ def _render_role_prompt(workflow: WorkflowInDB, role: WorkflowRole,
         )
     # A template may place the notes itself; otherwise they go last, marked
     # as outranking the round's instructions — the same rule as a task note.
-    placed_by_template = "{{human_input}}" in rendered
-    for name, value in values.items():
-        rendered = rendered.replace("{{" + name + "}}", value)
     if notes and not placed_by_template:
         rendered = (
             rendered.rstrip()
@@ -2235,6 +2449,9 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
                 stages = db.list_workflow_stages(workflow.id)
                 if any(stage.acceptance_gates for stage in stages):
                     return workflow
+                with db._connect() as conn:
+                    if _manual_approval_reason(conn, workflow.id):
+                        return workflow
                 workflow = approve_plan(
                     workflow.id,
                     WorkflowPlanApproval(expected_version=workflow.state_version),

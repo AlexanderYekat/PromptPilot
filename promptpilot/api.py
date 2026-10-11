@@ -650,10 +650,18 @@ def api_workflow_candidate_readiness(workflow_id: str):
     if not workflow:
         raise HTTPException(404, 'Workflow not found')
     try:
-        workflows.candidates.readiness(workflow, db.list_workflow_stages(workflow_id))
-        return {'ready': True, 'enabled': workflows.candidates.config(workflow).candidate.enabled}
+        workflows.candidates.readiness(
+            workflow, db.list_workflow_stages(workflow_id), check_output_paths=True)
+        result = {'ready': True, 'enabled': workflows.candidates.config(workflow).candidate.enabled}
     except workflows.candidates.CandidateError as exc:
-        return {'ready': False, 'code': exc.code, 'reason': str(exc)}
+        result = {'ready': False, 'code': exc.code, 'reason': str(exc)}
+    # Advisory only: a result directory Git does not ignore ends up in `git add -A`.
+    warnings = [f'Выходной каталог {directory} не исключён в .gitignore: '
+                'git add -A добавит результаты проверок в коммит'
+                for directory in workflows.candidates.unignored_output_directories(workflow)]
+    if warnings:
+        result['warnings'] = warnings
+    return result
 
 
 @app.post('/api/workflows/{workflow_id}/gate/run', response_model=WorkflowInDB)
@@ -742,7 +750,10 @@ def api_list_workflow_artifacts(
 def api_get_workflow_plan(workflow_id: str):
     if not db.get_workflow(workflow_id):
         raise HTTPException(404, "Workflow not found")
-    return db.get_workflow_plan(workflow_id)
+    plan = db.get_workflow_plan(workflow_id)
+    if plan and plan.status == "failed":
+        plan.planner_output_plan = workflows.planner_output_plan(workflow_id)
+    return plan
 
 
 @app.get(
@@ -804,6 +815,15 @@ def api_approve_workflow_plan(
 ):
     approved = _workflow_action(workflows.approve_plan, workflow_id, approval)
     return workflows.advance_workflow(approved.id)
+
+
+@app.post(
+    "/api/workflows/{workflow_id}/plan/apply-planner-output",
+    response_model=WorkflowInDB,
+)
+def api_apply_planner_output(workflow_id: str, request: WorkflowVersionRequest):
+    # No advance: the applied plan always waits for a person to approve it.
+    return _workflow_action(workflows.apply_planner_output, workflow_id, request)
 
 
 @app.post(

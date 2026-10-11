@@ -36,14 +36,18 @@ def overlaps(first, second):
         return False
 
 
-def git(path, *args, stdin=None):
+def _git_env():
     # Neither a parent GIT_DIR nor an index override may redirect verification.
     env = {k: v for k, v in os.environ.items() if not k.upper().startswith('GIT_')}
     env['GIT_OPTIONAL_LOCKS'] = '0'
     env['GIT_NO_REPLACE_OBJECTS'] = '1'
+    return env
+
+
+def git(path, *args, stdin=None):
     try:
         result = subprocess.run(
-            ['git', '-C', path, *args], env=env, capture_output=True, timeout=30,
+            ['git', '-C', path, *args], env=_git_env(), capture_output=True, timeout=30,
             input=stdin.encode('utf-8', 'surrogateescape') if stdin is not None else None)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise CandidateError('repository_unavailable', str(exc)) from exc
@@ -166,13 +170,65 @@ def existing_session(provider, target=None):
     return bool(target or provider == 'herdr-session' or load_providers().get(provider, {}).get('session_target'))
 
 
-def readiness(workflow, stages=()):
+def _reaches_output(entry, directory):
+    """Whether an allowed_paths entry equals, lies inside or contains an output directory."""
+    path = entry.strip().replace('\\', '/')
+    while path.startswith('./'):
+        path = path[2:]
+    if os.name == 'nt':
+        path, directory = path.casefold(), directory.casefold()
+    wildcards = [index for index in (path.find(c) for c in '*?[') if index >= 0]
+    if not wildcards:
+        path = path.rstrip('/')
+        return bool(path) and (under(path, directory) or under(directory, path))
+    # A pattern is judged by its fixed prefix: it can match anything continuing it.
+    prefix = path[:min(wildcards)]
+    return directory.startswith(prefix) or prefix.startswith(directory + '/')
+
+
+def output_path_conflicts(cfg, specs):
+    """Stage allowed_paths that would commit into output directories, as messages."""
+    outputs = [relative(name).rstrip('/') for name in cfg.candidate.output_directories]
+    conflicts = []
+    for spec in specs:
+        label = f"Этап {spec['code']}" if spec.get('code') else 'Этап'
+        for entry in spec.get('allowed_paths') or []:
+            for directory in outputs:
+                if _reaches_output(entry, directory):
+                    conflicts.append(f'{label}: путь {entry} пересекается с выходным каталогом {directory}.')
+    return conflicts
+
+
+def unignored_output_directories(workflow):
+    """Output directories Git would not ignore: `git add -A` would commit their results."""
+    cfg = config(workflow)
+    if not cfg.candidate.enabled:
+        return []
+    found = []
+    for name in cfg.candidate.output_directories:
+        try:
+            directory = relative(name).rstrip('/')
+            result = subprocess.run(
+                ['git', '-C', workflow.repository_path, 'check-ignore', '-q', '--',
+                 directory + '/promptpilot-output-probe'],
+                env=_git_env(), capture_output=True, timeout=30)
+        except (CandidateError, OSError, subprocess.TimeoutExpired):
+            continue
+        # 0: ignored, 1: not ignored, anything else: Git could not tell.
+        if result.returncode == 1:
+            found.append(directory)
+    return found
+
+
+def readiness(workflow, stages=(), check_output_paths=False):
     cfg = config(workflow)
     commands = list(cfg.gate.commands)
     commands.extend(cfg.stage.get('acceptance_gates', []))
+    specs = []
     for stage in stages:
         spec = db._json_load(stage['spec_json']) if not hasattr(stage, 'acceptance_gates') else stage.model_dump()
         commands.extend(spec.get('acceptance_gates', []))
+        specs.append(spec)
     if not cfg.candidate.enabled:
         if 'PROMPTPILOT_CANDIDATE_' in json.dumps(commands + [cfg.stage]):
             raise CandidateError('candidate_disabled', 'План использует PROMPTPILOT_CANDIDATE_SHA. Включите config.candidate.enabled')
@@ -185,6 +241,14 @@ def readiness(workflow, stages=()):
     for command in commands:
         if '\\"$env:PROMPTPILOT_CANDIDATE_' in command:
             raise CandidateError('invalid_candidate_command', 'В PowerShell используйте "$env:PROMPTPILOT_CANDIDATE_SHA" без обратных слешей')
+    # Checked when a plan is approved or a planless workflow starts. Committing
+    # into an output directory would otherwise surface only at handoff.
+    if check_output_paths:
+        conflicts = output_path_conflicts(cfg, specs or [cfg.stage])
+        if conflicts:
+            raise CandidateError('output_path_conflict', ' '.join(conflicts) + (
+                ' Выходные каталоги не коммитятся — уберите '
+                + ('путь' if len(conflicts) == 1 else 'эти пути') + ' из allowed_paths'))
 
 
 def current(conn, workflow, required=True):

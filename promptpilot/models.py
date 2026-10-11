@@ -534,6 +534,9 @@ class WorkflowPlanInDB(BaseModel):
     created_at: datetime
     updated_at: datetime
     approved_at: Optional[datetime] = None
+    # Filled by the API for a failed plan: whether the recorded planner answer
+    # still holds a stage plan the operator may apply.
+    planner_output_plan: Optional[dict[str, Any]] = None
 
 
 class WorkflowPlanApproval(BaseModel):
