@@ -49,7 +49,7 @@ from .remote import (POWERSHELL, REMOTE_CALL_TIMEOUT, as_remote, ps_quote,
 # even when the provider is limited, so detection is textual by necessity).
 RATE_LIMIT_RE = re.compile(
     r"reached your usage limit|usage limit reached|rate_limit_error"
-    r"|too many requests|quota exceeded|hit your session limit",
+    r"|too many requests|quota exceeded|hit your (?:(?:session|usage|weekly) )?limit",
     re.IGNORECASE,
 )
 

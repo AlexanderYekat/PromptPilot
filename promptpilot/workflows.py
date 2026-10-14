@@ -2634,6 +2634,7 @@ def sync_task(task_id: int) -> Optional[WorkflowRunInDB]:
                 event_type="run.queued" if task_status == "pending" else "run.requeued",
                 idempotency_key=(
                     f"run.{task_status}:{run['id']}:retry{task_row['retry_count']}"
+                    f":attempt{task_row['started_at']}"
                 ),
                 payload={"task_id": task_id, "task_status": task_status,
                          "retry_count": task_row["retry_count"]},
@@ -2651,6 +2652,7 @@ def sync_task(task_id: int) -> Optional[WorkflowRunInDB]:
                 event_type="run.started",
                 idempotency_key=(
                     f"run.started:{run['id']}:retry{task_row['retry_count']}"
+                    f":attempt{task_row['started_at']}"
                 ),
                 payload={"task_id": task_id,
                          "retry_count": task_row["retry_count"]},

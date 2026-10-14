@@ -21,7 +21,7 @@ from .config import (BASE_DELAY, CONCURRENCY, DEFAULT_CLI, MAX_DELAY, MIN_FREE_M
                      POLL_INTERVAL, TASK_TIMEOUT, VERDICT_REPAIR,
                      VERDICT_REPAIR_TIMEOUT, VERDICT_REQUIRED, RightsUnsupported,
                      build_cmd, get_provider_env, load_providers, rights_args,
-                     rights_supported)
+                     rights_supported, provider_is_claude)
 from .process_tree import OwnedProcess, ProcessTreeError
 
 # Our quota is spent — the wait is measured in hours and nothing else will get
@@ -32,7 +32,7 @@ RATE_LIMIT_RE = re.compile(
     r"|(?:error|status|http|code)[\s:]*429\b"
     r"|quota exceeded"
     r"|usage limit"
-    r"|hit your (?:session|usage|weekly) limit",
+    r"|hit your (?:(?:session|usage|weekly) )?limit",
     re.IGNORECASE,
 )
 
@@ -48,6 +48,7 @@ OVERLOADED_RE = re.compile(
 
 RETRY_RATE_LIMIT = "rate_limit"
 RETRY_OVERLOAD = "overload"
+CLAUDE_QUOTA_WAIT = timedelta(hours=5)
 
 # Human-facing wording per reason — a 529 reported as "упёрлась в лимит" sends
 # people looking at their subscription instead of status.claude.com.
@@ -708,7 +709,7 @@ def _remember_stream_session(task_id: int, line: str) -> None:
     session_id = None
     if event.get("type") == "thread.started":
         session_id = event.get("thread_id")
-    elif event.get("type") == "system":
+    elif event.get("type") in {"system", "result"}:
         session_id = event.get("session_id")
     if session_id:
         db.set_session_id(task_id, session_id)
@@ -1176,7 +1177,7 @@ def _maybe_recur(task, failed: bool = False):
 def _requeue_env_failure(task, marker: str, detail: str):
     """Hand the task back to the queue: the environment failed, not the task.
 
-    Accounted against max_retries like a rate limit, so an environment that is
+    Accounted against max_retries, so an environment that is
     broken for good ends up failing the task instead of retrying forever.
     """
     if task.retry_count >= task.max_retries:
@@ -1217,7 +1218,27 @@ def _notify_requeued(task, next_run, reason: str):
         print(f"  -> notify requeue failed: {e}")
 
 
-def _finalize_herdr_outcome(task, outcome: dict, *,
+def _requeue_provider_limit(task, reason: str, detail: str, provider_cfg: dict) -> bool:
+    """Wait for Claude quota without consuming the task's failure budget."""
+    quota_wait = reason == RETRY_RATE_LIMIT and provider_is_claude(provider_cfg)
+    label = RETRY_REASON_ERR.get(reason, RETRY_REASON_ERR[RETRY_RATE_LIMIT])
+    if not quota_wait and task.retry_count >= task.max_retries:
+        return _mark_failed(
+            task, f"{label}, max retries ({task.max_retries}) exceeded.\n{detail}")
+    next_run = (datetime.now(timezone.utc) + CLAUDE_QUOTA_WAIT if quota_wait
+                else compute_next_run(task.retry_count))
+    changed = _mark_rate_limited(
+        task, next_run, error=detail or label, count_retry=not quota_wait)
+    if changed:
+        reason_ru = ("лимит Claude; ожидание 5 часов" if quota_wait
+                     else RETRY_REASON_RU.get(reason, RETRY_REASON_RU[RETRY_RATE_LIMIT]))
+        _notify_requeued(task, next_run, reason_ru)
+        action = "Claude quota wait" if quota_wait else f"Retry #{task.retry_count + 1}"
+        print(f"  -> {label}. {action} until {next_run.isoformat()}")
+    return changed
+
+
+def _finalize_herdr_outcome(task, outcome: dict, *, provider_cfg: dict,
                             require_closing_verdict: bool,
                             allow_targeted_stale: bool) -> bool:
     """Commit a verified-stopped Herdr result for this exact task attempt."""
@@ -1232,26 +1253,7 @@ def _finalize_herdr_outcome(task, outcome: dict, *,
 
     if outcome["rate_limited"]:
         reason = outcome.get("retry_reason") or RETRY_RATE_LIMIT
-        label = RETRY_REASON_ERR.get(reason, RETRY_REASON_ERR[RETRY_RATE_LIMIT])
-        if task.retry_count >= task.max_retries:
-            return _mark_failed(
-                task,
-                f"{label}, max retries ({task.max_retries}) exceeded.\n"
-                f"{outcome['error']}",
-            )
-        next_run = compute_next_run(task.retry_count)
-        changed = _mark_rate_limited(
-            task, next_run, error=outcome["error"] or label)
-        if changed:
-            _notify_requeued(
-                task,
-                next_run,
-                RETRY_REASON_RU.get(reason, RETRY_REASON_RU[RETRY_RATE_LIMIT]),
-            )
-            print(
-                f"  -> {label}. Retry #{task.retry_count + 1} "
-                f"at {next_run.strftime('%H:%M:%S')}")
-        return changed
+        return _requeue_provider_limit(task, reason, outcome["error"], provider_cfg)
 
     if outcome.get("env_failure"):
         return _requeue_env_failure(
@@ -1317,7 +1319,7 @@ def _commit_terminal_or_defer(task, label: str, commit) -> bool:
     return changed is not False
 
 
-def _commit_herdr_outcome_or_defer(task, outcome: dict, *,
+def _commit_herdr_outcome_or_defer(task, outcome: dict, *, provider_cfg: dict,
                                    require_closing_verdict: bool,
                                    allow_targeted_stale: bool) -> None:
     """Do not turn a durable Herdr result into a generic worker failure."""
@@ -1327,6 +1329,7 @@ def _commit_herdr_outcome_or_defer(task, outcome: dict, *,
         lambda: _finalize_herdr_outcome(
             task,
             outcome,
+            provider_cfg=provider_cfg,
             require_closing_verdict=require_closing_verdict,
             allow_targeted_stale=allow_targeted_stale,
         ),
@@ -1434,6 +1437,7 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_over
             on_cleaned=lambda: _finalize_herdr_outcome(
                 task,
                 settled_outcome,
+                provider_cfg=provider_cfg,
                 require_closing_verdict=require_closing_verdict,
                 allow_targeted_stale=allow_targeted_stale,
             ),
@@ -1442,6 +1446,7 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_over
     _commit_herdr_outcome_or_defer(
         task,
         outcome,
+        provider_cfg=provider_cfg,
         require_closing_verdict=require_closing_verdict,
         allow_targeted_stale=allow_targeted_stale,
     )
@@ -2017,7 +2022,8 @@ def _execute_task_body(task, admission_complete=None):
     # both, matching the readable text extracted from stream-json rather than
     # raw JSON. Missing the stdout case sent the task to failed forever, which
     # defeats the whole point of the queue.
-    stdout_text = parse_stream_json(result.stdout).get("text", "") if is_stream_json(result.stdout) else ""
+    stdout_text = (parse_stream_json(result.stdout).get("text", "")
+                   if is_stream_json(result.stdout) else result.stdout)
     reason = (retry_reason(result.stderr, result.returncode)
               or retry_reason(stdout_text, result.returncode))
     if reason:
@@ -2029,29 +2035,9 @@ def _execute_task_body(task, admission_complete=None):
         elif is_stream_json(result.stderr):
             parsed = parse_stream_json(result.stderr)
             rl_error = format_result(parsed) or rl_error
-        label = RETRY_REASON_ERR[reason]
-        if task.retry_count >= task.max_retries:
-            _commit_terminal_or_defer(
-                task,
-                "headless exhausted retry outcome",
-                lambda: _mark_failed(
-                    task,
-                    f"{label}, max retries ({task.max_retries}) exceeded.\n"
-                    f"{rl_error}"),
-            )
-            return
-        next_run = compute_next_run(task.retry_count)
-        def commit_rate_limit():
-            changed = _mark_rate_limited(
-                task, next_run, error=rl_error or label)
-            if changed:
-                _notify_requeued(task, next_run, RETRY_REASON_RU[reason])
-                print(
-                    f"  -> {label}. Retry #{task.retry_count + 1} "
-                    f"at {next_run.strftime('%H:%M:%S')}")
-            return changed
         _commit_terminal_or_defer(
-            task, "headless rate-limit outcome", commit_rate_limit)
+            task, "headless rate-limit outcome",
+            lambda: _requeue_provider_limit(task, reason, rl_error, provider_cfg))
         return
 
     if result.returncode != 0:
@@ -2100,29 +2086,10 @@ def _execute_task_body(task, admission_complete=None):
         # Check for rate limit in stream events — only if no text was returned
         rl = parsed.get("rate_limit_info")
         if rl and not parsed["text"]:
-            if task.retry_count >= task.max_retries:
-                _commit_terminal_or_defer(
-                    task,
-                    "headless exhausted stream retry outcome",
-                    lambda: _mark_failed(
-                        task, f"{RETRY_REASON_ERR[RETRY_RATE_LIMIT]}.\n{output}"),
-                )
-                return
-            next_run = compute_next_run(task.retry_count)
-            def commit_stream_rate_limit():
-                changed = _mark_rate_limited(
-                    task, next_run,
-                    error=output or RETRY_REASON_ERR[RETRY_RATE_LIMIT])
-                if changed:
-                    _notify_requeued(
-                        task, next_run, RETRY_REASON_RU[RETRY_RATE_LIMIT])
-                    print(
-                        "  -> Rate limited (stream event). Retry at "
-                        f"{next_run.strftime('%H:%M:%S')}")
-                return changed
             _commit_terminal_or_defer(
                 task, "headless stream rate-limit outcome",
-                commit_stream_rate_limit)
+                lambda: _requeue_provider_limit(
+                    task, RETRY_RATE_LIMIT, output, provider_cfg))
             return
     else:
         # Plain text output (non-Claude CLIs)

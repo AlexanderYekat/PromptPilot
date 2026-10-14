@@ -1534,11 +1534,12 @@ def fail_running_attempt(task_id: int, started_at, error: str,
 
 
 def mark_rate_limited(task_id: int, next_run_at: datetime, error: str = None,
-                      *, expected_started_at=None) -> bool:
+                      *, expected_started_at=None, count_retry: bool = True) -> bool:
+    """Persist a wait; subscription quota waits do not spend failure retries."""
     with _connect() as conn:
         attempt = _attempt_iso(expected_started_at)
         where = "id = ?"
-        values = [_to_utc_iso(next_run_at), error, task_id]
+        values = [_to_utc_iso(next_run_at), int(count_retry), error, task_id]
         if attempt is not None:
             where += " AND status = 'running' AND started_at = ?"
             values.append(attempt)
@@ -1546,7 +1547,7 @@ def mark_rate_limited(task_id: int, next_run_at: datetime, error: str = None,
             """UPDATE tasks
                SET status = 'rate_limited',
                    next_run_at = ?,
-                   retry_count = retry_count + 1,
+                   retry_count = retry_count + ?,
                    error = COALESCE(?, error), budget_wait_scope = NULL,
                    budget_wait_started_at = NULL
                 WHERE """ + where,
