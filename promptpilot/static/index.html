@@ -2590,6 +2590,9 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
   const importedCount = rounds.filter(r => r.summary?.historical).length;
   const stage = stages.find(item => item.id === wf.current_stage_id) || wf.config?.stage || {};
   const statusInfo = workflowStatusInfo(wf.status, !!reviewerDone);
+  const autoExecutor = wf.status === 'queued' && stage.execution_mode !== 'external'
+    && wf.config?.automation?.enabled && wf.config.automation.auto_dispatch_executor !== false;
+  if (autoExecutor) statusInfo[1] = 'Продолжите автоматически: сохранённые настройки исполнителя и промпт уже готовы.';
   const ownerInfo = workflowOwnerInfo(wf, activeRun, reviewerDone);
   const plannerFailure = wf.status === 'awaiting_human' && !wf.current_round
     ? workflowPlannerFailure(plan, plannerTask) : null;
@@ -2628,6 +2631,12 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
     </div>`;
   } else if (wf.status === 'queued' && stage.execution_mode === 'external') {
     action = `<div class="wf-form"><button class="btn btn-sm btn-primary" onclick="wfRequestExternal()">Выдать задание внешнему исполнителю</button></div>`;
+  } else if (autoExecutor) {
+    const executor = wf.config?.roles?.executor || {};
+    action = `<div class="wf-form wide">
+      <div class="wf-meta wide">Исполнитель: ${esc(executor.provider || 'провайдер по умолчанию')}${executor.model ? ' · ' + esc(executor.model) : ''}. Промпт будет собран из сохранённого состояния раунда.</div>
+      <button class="btn btn-sm btn-primary" onclick="wfAdvance()">Продолжить автоматически</button>
+    </div>`;
   } else if (['queued','reviewing'].includes(wf.status)) {
     const role = wf.status === 'queued' ? 'executor' : 'reviewer';
     action = `<div class="wf-form wide">

@@ -898,7 +898,12 @@ def api_workflow_external_result(workflow_id: str, submission: WorkflowExternalR
 def api_workflow_human_input(
     workflow_id: str, action: WorkflowHumanInput
 ):
-    return _workflow_action(workflows.human_input, workflow_id, action)
+    resumed = _workflow_action(workflows.human_input, workflow_id, action)
+    # Notes and resumes refused by a round limit must stay paused. Once a
+    # resume succeeds, use the same configured automation as start/approve.
+    if action.resume and resumed.status is WorkflowStatus.QUEUED:
+        return _workflow_action(workflows.advance_workflow, resumed.id)
+    return resumed
 
 
 @app.post(
