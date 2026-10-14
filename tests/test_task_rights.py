@@ -27,6 +27,7 @@ def providers(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DB_DIR", tmp_path)
     monkeypatch.setattr(config, "GUARD", "auto")
     custom = {
+        "claude-argv": {"cmd": "claude -p {prompt}", "supports_skills": True},
         "agy": {"cmd": "agy -p {prompt} --dangerously-skip-permissions",
                 "description": "no rights map"},
         "declared": {"cmd": "tool run {prompt}",
@@ -47,6 +48,7 @@ def contains_run(values, run):
 
 # --- build_cmd ------------------------------------------------------------------
 
+@pytest.mark.parametrize("provider", ["claude", "claude-argv"])
 @pytest.mark.parametrize(("rights", "expected"), [
     ("none", ["--tools", ""]),
     ("read", ["--restricted", "--tools", "Read,Glob,Grep"]),
@@ -54,12 +56,16 @@ def contains_run(values, run):
                "--permission-mode", "acceptEdits"]),
     ("full", ["--dangerously-skip-permissions"]),
 ])
-def test_claude_rights(providers, rights, expected):
-    cmd = config.build_cmd("claude", "do it", rights=rights)
+def test_claude_rights(providers, rights, expected, provider):
+    cmd = config.build_cmd(provider, "do it", rights=rights)
 
-    assert contains_run(args_before_prompt(cmd), expected)
-    if rights != "full":
-        assert cmd[-2:] == ["--", "do it"]  # variadic --tools must not eat the prompt
+    if provider == "claude":
+        assert "do it" not in cmd
+        assert contains_run(cmd, expected)
+    else:
+        assert contains_run(args_before_prompt(cmd), expected)
+        if rights != "full":
+            assert cmd[-2:] == ["--", "do it"]  # variadic --tools must not eat the prompt
 
 
 def test_rights_win_over_skip_permissions(providers):
