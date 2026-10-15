@@ -2,7 +2,8 @@
 
 import re
 
-from . import db
+from . import db, workflows
+from .models import ReviewVerdict, TaskStatus
 
 
 def _short(text, limit):
@@ -24,11 +25,38 @@ def _prompt_goal(prompt):
     return lines[0] if lines else ""
 
 
+def _review_outcome(task):
+    """Describe the audit without rewriting the agent's historical report."""
+    if task.status is not TaskStatus.COMPLETED:
+        return None
+    decision = workflows.parse_reviewer_report(task.result or "")
+    if task.verdict == "НЕ СМОГ":
+        return {"label": "АУДИТ НЕ ЗАВЕРШЁН", "icon": "❌",
+                "summary": "Аудит не завершён: блокер указан в отчёте."}
+    if task.verdict == "НУЖЕН ЧЕЛОВЕК" or (decision and decision.verdict is ReviewVerdict.HUMAN_REQUIRED):
+        return {"label": "АУДИТ: НУЖЕН ЧЕЛОВЕК", "icon": "🟡",
+                "summary": "Для завершения аудита требуется решение или доступ человека."}
+    if not decision:
+        return {"label": "ИТОГ АУДИТА НЕ РАСПОЗНАН", "icon": "🟡",
+                "summary": "Нет корректного решения AUDIT_VERDICT: проверьте полный отчёт."}
+    if decision.verdict is ReviewVerdict.REVISION_REQUIRED:
+        return {"label": "ТРЕБУЕТСЯ ДОРАБОТКА", "icon": "🟡",
+                "summary": "АУДИТ ЗАВЕРШЁН: требуется доработка, замечания перечислены в отчёте."}
+    if decision.findings:
+        summary = "АУДИТ ЗАВЕРШЁН: аудитор сообщил PASS, замечания перечислены в отчёте."
+    elif re.search(r"(?mi)^AUDIT_FINDINGS_JSON:[ \t]*\[[ \t]*\][ \t]*\r?$", task.result or ""):
+        summary = "АУДИТ ЗАВЕРШЁН: замечаний не найдено"
+    else:
+        summary = "АУДИТ ЗАВЕРШЁН: аудитор сообщил PASS; список замечаний не указан."
+    return {"label": "АУДИТ ЗАВЕРШЁН", "icon": "✅", "summary": summary}
+
+
 def for_tasks(tasks):
     """Batch lookup uses each run's stage, including historical task cards."""
     if not tasks:
         return {}
     ids = [task.id for task in tasks]
+    tasks_by_id = {task.id: task for task in tasks}
     marks = ",".join("?" for _ in ids)
     with db._connect() as conn:
         runs = conn.execute(
@@ -75,4 +103,8 @@ def for_tasks(tasks):
             "title": _short(title, 120), "goal": _short(goal, 300),
             "context": f"{row['slug']} · {role} · Раунд {row['round_no']}", "source": "workflow",
         }
+        if reviewer:
+            outcome = _review_outcome(tasks_by_id[row["task_id"]])
+            if outcome:
+                briefs[row["task_id"]]["outcome"] = outcome
     return briefs

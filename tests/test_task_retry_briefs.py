@@ -163,6 +163,7 @@ def test_brief_uses_original_stage_not_prompt_preamble_or_current_stage(isolated
     assert brief["title"] == "S1 · Проверить окружение"
     assert brief["goal"] == "Подтвердить готовность окружения к измерениям."
     assert "Исполнитель" in brief["context"]
+    assert "outcome" not in brief
     finish_task(isolated_db, "Ready")
     reviewer = isolated_db.list_tasks(status=TaskStatus.PENDING)[0]
     assert "Независимо проверить" in task_briefs.for_tasks([reviewer])[reviewer.id]["goal"]
@@ -181,3 +182,46 @@ def test_regular_briefs_prefer_labeled_goal_and_bound_long_text(isolated_db):
     other = isolated_db.create_task(TaskCreate(prompt="Проверить " * 1000))
     brief = task_briefs.for_tasks([other])[other.id]
     assert len(brief["title"]) <= 100 and len(brief["goal"]) <= 300
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_historical_reviewer_card_uses_audit_outcome_without_changing_history(isolated_db, newline):
+    start_two_stages(isolated_db)
+    finish_task(isolated_db, "Ready")
+    reviewer = isolated_db.list_tasks(status=TaskStatus.PENDING)[0]
+    report = ('AUDIT_FINDINGS_JSON: []\nAUDIT_VERDICT: PASS\n'
+              'ИТОГ: УЖЕ СДЕЛАНО — изменений не потребовалось').replace("\n", newline)
+    isolated_db.mark_completed(reviewer.id, report, exit_code=0, verdict="УЖЕ СДЕЛАНО")
+    before = isolated_db.get_task(reviewer.id)
+    card = request("GET", f"/api/tasks/{reviewer.id}").json()
+    assert card["brief"]["outcome"]["label"] == "АУДИТ ЗАВЕРШЁН"
+    assert card["brief"]["outcome"]["summary"] == "АУДИТ ЗАВЕРШЁН: замечаний не найдено"
+    cards = request("GET", "/api/tasks").json()
+    assert next(t for t in cards if t["id"] == reviewer.id)["brief"] == card["brief"]
+    assert isolated_db.get_task(reviewer.id) == before
+    assert card["result"] == report and card["verdict"] == "УЖЕ СДЕЛАНО"
+    # Quoting an audit in an ordinary task does not make it a reviewer.
+    ordinary = isolated_db.create_task(TaskCreate(prompt="Проверка: аудитор"))
+    isolated_db.mark_completed(ordinary.id, report, exit_code=0, verdict="УЖЕ СДЕЛАНО")
+    assert "outcome" not in request("GET", f"/api/tasks/{ordinary.id}").json()["brief"]
+
+
+@pytest.mark.parametrize("report, verdict, label, summary_part", [
+    ("AUDIT_VERDICT: REVISION_REQUIRED", "ГОТОВО", "ТРЕБУЕТСЯ ДОРАБОТКА", "требуется доработка"),
+    ("AUDIT_VERDICT: HUMAN_REQUIRED", "ГОТОВО", "АУДИТ: НУЖЕН ЧЕЛОВЕК", "требуется решение"),
+    ("AUDIT_VERDICT: PASS\nAUDIT_FINDINGS_JSON: [broken]", "УЖЕ СДЕЛАНО", "ИТОГ АУДИТА НЕ РАСПОЗНАН", "Нет корректного"),
+    ("AUDIT_VERDICT: PASS", "УЖЕ СДЕЛАНО", "АУДИТ ЗАВЕРШЁН", "список замечаний не указан"),
+    ('AUDIT_VERDICT: PASS\nAUDIT_FINDINGS_JSON: [{"fingerprint":"f1","severity":"low","category":"docs","title":"Уточнить текст","status":"accepted_risk","payload":{}}]', "ГОТОВО", "АУДИТ ЗАВЕРШЁН", "замечания перечислены"),
+    ("AUDIT_VERDICT: PASS\nAUDIT_FINDINGS_JSON: []", "НЕ СМОГ", "АУДИТ НЕ ЗАВЕРШЁН", "блокер"),
+])
+def test_audit_card_does_not_infer_no_findings_from_task_success(report, verdict, label, summary_part):
+    from promptpilot.models import TaskInDB
+
+    task = TaskInDB(id=1, prompt="audit", status=TaskStatus.COMPLETED,
+                    created_at=datetime.now(timezone.utc), result=report, verdict=verdict)
+    outcome = task_briefs._review_outcome(task)
+    assert outcome["label"] == label
+    assert summary_part in outcome["summary"]
+    assert "замечаний не найдено" not in outcome["summary"]
+    task.status = TaskStatus.RUNNING
+    assert task_briefs._review_outcome(task) is None

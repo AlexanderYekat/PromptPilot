@@ -1186,6 +1186,14 @@ function taskDisplayTitle(t) {
   return firstLine ? firstLine.trim() : `Task #${t.id}`;
 }
 
+function taskVerdictHtml(t) {
+  const audit = t.brief?.outcome;
+  if (audit) {
+    return `<span class="task-meta task-verdict" title="${escAttr(audit.summary)}">${esc(audit.icon)} ${esc(audit.label)}</span>`;
+  }
+  return t.verdict ? `<span class="task-meta task-verdict" title="итог, которым задача сама себя закрыла">${verdictIcon(t.verdict)} ${esc(t.verdict)}</span>` : '';
+}
+
 const taskRetriesInFlight = new Set();
 function taskRetryButton(t) {
   if (t.status !== 'rate_limited') return '';
@@ -1200,6 +1208,7 @@ function taskBriefHtml(t) {
     <div class="task-brief-title">${esc(taskDisplayTitle(t))}</div>
     ${goal && goal !== taskDisplayTitle(t) ? `<p class="task-brief-goal">${esc(goal)}</p>` : ''}
     ${t.brief?.context ? `<div class="task-brief-context">${esc(t.brief.context)}</div>` : ''}
+    ${t.brief?.outcome ? `<p class="task-brief-goal task-audit-outcome"><strong>${esc(t.brief.outcome.summary)}</strong></p>` : ''}
     ${t.status === 'rate_limited' ? `<div class="task-brief-context">Ожидает повторного запуска после лимита.${t.next_run_at ? ` Автоматический повтор: ${esc(new Date(t.next_run_at).toLocaleString())}.` : ''}</div>` : ''}
   </div>`;
 }
@@ -1268,7 +1277,7 @@ async function loadTasks() {
         ${t.working_dir ? `<span class="task-meta">📁 ${esc(t.working_dir.split(/[/\\]/).filter(Boolean).pop() || t.working_dir)}</span>` : ''}
         ${t.worktree ? `<span class="task-meta" title="отдельный git worktree">🌿 ${esc(t.worktree_branch || 'worktree')}</span>` : ''}
         ${t.epf ? `<span class="task-meta" title="доработка обработки 1С: ${escAttr(t.epf.base_label || '')}">🔧 ${esc(EPF_STATUS_RU[t.epf.status] || '1С')}</span>` : ''}
-        ${t.verdict ? `<span class="task-meta" title="итог, которым задача сама себя закрыла">${verdictIcon(t.verdict)} ${esc(t.verdict)}</span>` : ''}
+        ${taskVerdictHtml(t)}
         ${t.note ? `<span class="task-meta" title="${escAttr(t.note)}">✎ приписка</span>` : ''}
         ${t.provider ? `<span class="task-meta">${esc(t.provider)}</span>` : ''}
         ${scheduleInfo(t)}

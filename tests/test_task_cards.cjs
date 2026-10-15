@@ -29,6 +29,7 @@ function load(start, end) {
   vm.runInContext(html.slice(from, to), context);
 }
 load('function taskDisplayTitle(', 'function providerOptions(');
+load('function verdictIcon(', 'async function saveNote(');
 load('async function retryTask(', 'async function cancelTask(');
 
 (async () => {
@@ -78,5 +79,19 @@ load('async function retryTask(', 'async function cancelTask(');
   assert.match(notices.at(-1)[0], /Не удалось повторить.*Время повтора изменилось/);
   assert.equal(button.disabled, false);
   assert.equal(requests.length, 2);
+  const audit = {id: 34, status: 'completed', verdict: 'УЖЕ СДЕЛАНО',
+    prompt: 'Проверить результат', result: 'ИТОГ: УЖЕ СДЕЛАНО — исходный отчёт',
+    brief: {title: 'Проверка: S1', outcome: {label: 'АУДИТ ЗАВЕРШЁН', icon: '✅',
+      summary: 'АУДИТ ЗАВЕРШЁН: замечаний не найдено'}}};
+  cards = [audit];
+  await context.loadTasks();
+  const header = list.innerHTML.split('<div class="task-detail">')[0];
+  assert.match(header, /АУДИТ ЗАВЕРШЁН/);
+  assert.doesNotMatch(header, /УЖЕ СДЕЛАНО/);
+  assert.match(list.innerHTML, /<strong>АУДИТ ЗАВЕРШЁН: замечаний не найдено<\/strong>/);
+  assert.match(list.innerHTML, /ИТОГ: УЖЕ СДЕЛАНО — исходный отчёт/);
+  assert.match(context.taskVerdictHtml({verdict: 'УЖЕ СДЕЛАНО'}), /УЖЕ СДЕЛАНО/);
+  const hostile = {brief: {outcome: {label: '<script>bad</script>', icon: '✅', summary: '"<img>'}}};
+  assert.doesNotMatch(context.taskVerdictHtml(hostile), /<script>|"<img>/);
   console.log('Task cards: meaningful brief, folded prompt, refresh, escaping and guarded retry OK');
 })().catch(error => { console.error(error); process.exitCode = 1; });
