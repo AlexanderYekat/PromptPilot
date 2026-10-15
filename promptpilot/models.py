@@ -63,6 +63,12 @@ class TaskUpdate(BaseModel):
     working_dir: Optional[str] = None
 
 
+class TaskRetryRequest(BaseModel):
+    # The displayed wait identifies the attempt; a stale click must not retry
+    # a newer limit response or a task that has already started.
+    expected_next_run_at: Optional[datetime] = Field(...)
+
+
 class TaskInDB(BaseModel):
     id: int
     prompt: str

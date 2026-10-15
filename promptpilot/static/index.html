@@ -318,6 +318,13 @@
     gap: 8px;
     margin-top: 12px;
   }
+  .task-brief { margin-bottom: 14px; line-height: 1.5; }
+  .task-brief-title { font-size: 15px; font-weight: 600; }
+  .task-brief-goal { margin: 6px 0; color: var(--text); }
+  .task-brief-context { font-size: 12px; color: var(--text2); }
+  .task-prompt-details { margin: 12px 0; }
+  .task-prompt-details > summary { cursor: pointer; color: var(--accent); padding: 6px 0; }
+  .task-retry { flex-shrink: 0; }
 
   /* Result meta cards */
   .result-meta {
@@ -1173,9 +1180,37 @@ function formatTime(iso) {
 }
 
 function taskDisplayTitle(t) {
+  if (t.brief?.title) return t.brief.title;
   if (t.series_title) return t.series_title;
   const firstLine = String(t.prompt || '').split(/\r?\n/).find(line => line.trim());
   return firstLine ? firstLine.trim() : `Task #${t.id}`;
+}
+
+const taskRetriesInFlight = new Set();
+function taskRetryButton(t) {
+  if (t.status !== 'rate_limited') return '';
+  return `<button class="btn btn-sm btn-primary task-retry" onclick="retryTask(event,${t.id})"
+    data-retry-at="${escAttr(t.next_run_at || '')}"${taskRetriesInFlight.has(t.id) ? ' disabled' : ''}
+    title="Убрать ожидание лимита и вернуть эту задачу в очередь">Повторить сейчас</button>`;
+}
+
+function taskBriefHtml(t) {
+  const goal = t.brief?.goal || '';
+  return `<div class="task-brief">
+    <div class="task-brief-title">${esc(taskDisplayTitle(t))}</div>
+    ${goal && goal !== taskDisplayTitle(t) ? `<p class="task-brief-goal">${esc(goal)}</p>` : ''}
+    ${t.brief?.context ? `<div class="task-brief-context">${esc(t.brief.context)}</div>` : ''}
+    ${t.status === 'rate_limited' ? `<div class="task-brief-context">Ожидает повторного запуска после лимита.${t.next_run_at ? ` Автоматический повтор: ${esc(new Date(t.next_run_at).toLocaleString())}.` : ''}</div>` : ''}
+  </div>`;
+}
+
+function taskPromptHtml(t, open) {
+  return `<details class="task-prompt-details" id="task-prompt-${t.id}"${open ? ' open' : ''}>
+    <summary>Полный промпт</summary>
+    <div class="result-block"><pre>${esc(t.prompt)}</pre>
+      <button class="copy-btn" data-copy="${escAttr(t.prompt)}" onclick="copyText(event)">Copy</button>
+    </div>
+  </details>`;
 }
 
 async function loadTasks() {
@@ -1195,6 +1230,7 @@ async function loadTasks() {
   // Snapshot scroll positions (prompt/result blocks of the expanded card) so
   // a reader is not yanked back to the top after the rebuild.
   const taskScrolls = uiSnapScrolls(list);
+  const openPrompts = new Set(Array.from(list.querySelectorAll('.task-prompt-details[open]'), el => el.id));
   list.innerHTML = tasks.map(t => {
     const expanded = t.id === expandedId;
     const time = timeAgo(t.created_at);
@@ -1236,15 +1272,13 @@ async function loadTasks() {
         ${t.note ? `<span class="task-meta" title="${escAttr(t.note)}">✎ приписка</span>` : ''}
         ${t.provider ? `<span class="task-meta">${esc(t.provider)}</span>` : ''}
         ${scheduleInfo(t)}
+        ${taskRetryButton(t)}
         <span class="task-meta">P${t.priority}</span>
         <span class="task-meta">${time}</span>
       </div>
       <div class="task-detail">
-        <div class="detail-label">Prompt</div>
-        <div class="result-block">
-          <pre>${esc(t.prompt)}</pre>
-          <button class="copy-btn" data-copy="${escAttr(t.prompt)}" onclick="copyText(event)">Copy</button>
-        </div>
+        ${taskBriefHtml(t)}
+        ${taskPromptHtml(t, openPrompts.has(`task-prompt-${t.id}`))}
 
         ${t.working_dir ? `<div class="detail-info"><span class="label">Dir: </span><span>${esc(t.working_dir)}</span></div>` : ''}
         ${t.epf ? `<div class="detail-info"><span class="label">1С (${esc(t.epf.base_label || '')}): </span><span>${t.epf.epf_path ? esc(t.epf.epf_path) : esc(EPF_STATUS_RU[t.epf.status] || t.epf.status)}</span></div>` : ''}
@@ -1495,6 +1529,29 @@ async function resetTask(e, id) {
   try { await fetchJSON(`${API}/tasks/${id}/reset`, { method: 'POST' }); }
   catch (err) { toast('Не удалось сбросить: ' + err.message); return; }
   refresh();
+}
+
+async function retryTask(e, id) {
+  e.stopPropagation();
+  if (taskRetriesInFlight.has(id)) return;
+  const button = e.currentTarget;
+  taskRetriesInFlight.add(id);
+  button.disabled = true;
+  try {
+    const result = await fetchJSON(`${API}/tasks/${id}/retry`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({expected_next_run_at: button.dataset.retryAt || null}),
+    });
+    toast(result.worker_paused
+      ? 'Повтор поставлен в очередь. Общая пауза остаётся включённой.'
+      : 'Повтор поставлен в очередь', false);
+  } catch (err) {
+    toast('Не удалось повторить: ' + err.message);
+  } finally {
+    taskRetriesInFlight.delete(id);
+    button.disabled = false;
+  }
+  await refresh();
 }
 
 async function cancelTask(e, id) {

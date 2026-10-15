@@ -19,7 +19,7 @@ from pydantic import BaseModel
 import os
 import re as _re
 
-from . import db, epf_tools, flows, workflows
+from . import db, epf_tools, flows, task_briefs, workflows
 from . import pipeline_insights
 from .config import API_TOKEN, DB_DIR, DEFAULT_CLI, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, RIGHTS_LEVELS, rights_supported, PROJECTS_ROOT
 from .models import (
@@ -29,6 +29,7 @@ from .models import (
     Stats,
     TaskCreate,
     TaskInDB,
+    TaskRetryRequest,
     TaskStatus,
     TaskUpdate,
     WorkflowArtifactInDB,
@@ -170,7 +171,9 @@ def _task_with_epf(task: TaskInDB) -> dict:
 
 @app.get("/api/tasks")
 def api_list_tasks(status: Optional[TaskStatus] = None, limit: int = 50, offset: int = 0):
-    return [_task_with_epf(t) for t in db.list_tasks(status=status, limit=limit, offset=offset)]
+    tasks = db.list_tasks(status=status, limit=limit, offset=offset)
+    briefs = task_briefs.for_tasks(tasks)
+    return [dict(_task_with_epf(t), brief=briefs[t.id]) for t in tasks]
 
 
 @app.post("/api/tasks", response_model=TaskInDB, status_code=201)
@@ -197,7 +200,18 @@ def api_get_task(task_id: int):
     task = db.get_task(task_id)
     if not task:
         raise HTTPException(404, "Task not found")
-    return _task_with_epf(task)
+    return dict(_task_with_epf(task), brief=task_briefs.for_tasks([task])[task.id])
+
+
+@app.post("/api/tasks/{task_id}/retry", response_model=dict)
+def api_retry_task(task_id: int, request: TaskRetryRequest):
+    if not db.get_task(task_id):
+        raise HTTPException(404, "Task not found")
+    try:
+        db.retry_rate_limited_task(task_id, request.expected_next_run_at)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return {"ok": True, "worker_paused": db.is_paused()}
 
 
 @app.patch("/api/tasks/{task_id}", response_model=dict)

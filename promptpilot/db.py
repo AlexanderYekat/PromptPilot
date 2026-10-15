@@ -1566,6 +1566,55 @@ def mark_rate_limited(task_id: int, next_run_at: datetime, error: str = None,
         return cur.rowcount > 0
 
 
+def retry_rate_limited_task(task_id: int, expected_next_run_at: Optional[datetime]):
+    """Operator-requested retry of the same task, under the worker claim lock."""
+    with _connect(immediate=True) as conn:
+        task = get_task(task_id, conn=conn)
+        if not task or task.status != TaskStatus.RATE_LIMITED:
+            raise ValueError("Задача уже не ожидает лимита. Обновите карточку.")
+        if _to_utc_iso(task.next_run_at) != _to_utc_iso(expected_next_run_at):
+            raise ValueError("Время повтора изменилось. Обновите карточку.")
+        if task.series_id:
+            series = conn.execute("SELECT * FROM task_series WHERE id=?", (task.series_id,)).fetchone()
+            if not series or series["paused"] or series["ended_at"]:
+                raise ValueError("Сначала возобновите серию задач.")
+        run = conn.execute(
+            """SELECT r.*, w.status AS workflow_status, w.current_round, n.round_no
+               FROM workflow_runs r JOIN workflows w ON w.id=r.workflow_id
+               JOIN workflow_rounds n ON n.id=r.round_id WHERE r.task_id=?""",
+            (task_id,),
+        ).fetchone()
+        if run:
+            latest = conn.execute(
+                "SELECT id FROM workflow_runs WHERE round_id=? AND role=? ORDER BY attempt_no DESC LIMIT 1",
+                (run["round_id"], run["role"]),
+            ).fetchone()
+            expected_status = "executing" if run["role"] == "executor" else "reviewing"
+            if (run["workflow_status"] != expected_status
+                    or run["round_no"] != run["current_round"]
+                    or latest["id"] != run["id"]
+                    or run["status"] not in {"pending", "running"}):
+                raise ValueError("Эта попытка workflow уже не активна. Откройте workflow.")
+        planner = conn.execute(
+            """SELECT w.status FROM workflow_plans p JOIN workflows w ON w.id=p.workflow_id
+               WHERE p.planner_task_id=?""", (task_id,),
+        ).fetchone()
+        if planner and planner["status"] != "planning":
+            raise ValueError("Планирование уже не активно. Откройте workflow.")
+        conn.execute(
+            "UPDATE tasks SET status='pending', next_run_at=NULL, scheduled_at=NULL WHERE id=?",
+            (task_id,),
+        )
+        if run:
+            _append_workflow_event(conn, WorkflowEventCreate(
+                workflow_id=run["workflow_id"], round_id=run["round_id"], run_id=run["id"],
+                event_type="run.retry_requested",
+                idempotency_key=f"run.retry_requested:{task_id}:{_now()}",
+                payload={"task_id": task_id, "previous_next_run_at": _to_utc_iso(task.next_run_at),
+                         "source": "operator"},
+            ))
+
+
 def defer_task(task_id: int, next_run_at: datetime, reason: str = None,
                *, hard_not_before: bool = False,
                budget_wait_scope: str | None = None,
