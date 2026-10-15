@@ -85,11 +85,14 @@ def shell_python(script):
     return shlex.quote(sys.executable) + ' -c ' + shlex.quote(script)
 
 
-def test_full_handoff_gate_auditor_acceptance(isolated_db, repo, monkeypatch):
+@pytest.mark.parametrize('change', [True, False])
+def test_full_handoff_gate_auditor_acceptance(isolated_db, repo, monkeypatch, change):
     command = shell_python('import os,json; print(json.dumps({k:v for k,v in os.environ.items() if k.startswith("PROMPTPILOT_CANDIDATE_")}))')
     monkeypatch.setenv('PROMPTPILOT_CANDIDATE_SHA', 'stale-parent-sha')
     wf = create(isolated_db, repo, gate={'commands': [command]})
-    task, candidate = handoff(isolated_db, wf, repo)
+    baseline_sha = git(repo, 'rev-parse', 'HEAD')
+    task, candidate = handoff(isolated_db, wf, repo, change=change)
+    assert (candidate['candidate_revision'] != baseline_sha) is change
     decision = gate(isolated_db, wf)
     assert decision.verdict.value == 'PASS', decision.evidence
     assert candidate['candidate_revision'] in decision.evidence[0]
@@ -100,9 +103,18 @@ def test_full_handoff_gate_auditor_acceptance(isolated_db, repo, monkeypatch):
     assert reviewer.run.input['candidate_id'] == candidate['candidate_id']
     assert candidate['candidate_revision'] in reviewer.task.prompt
     assert candidate['repository_path'] in reviewer.task.prompt
+    from promptpilot.worker import effective_prompt, parse_verdict
+    from promptpilot.herdr_exec import ensure_closing_verdict_contract
+
+    prompt = ensure_closing_verdict_contract(effective_prompt(reviewer.task))
+    assert 'ИТОГ: УЖЕ СДЕЛАНО' not in prompt
+    assert 'ИТОГ: ГОТОВО — АУДИТ ЗАВЕРШЁН: замечаний не найдено' in prompt
     candidates.preflight_task(reviewer.task)
-    finish(isolated_db, reviewer.task, 'AUDIT_FINDINGS_JSON: []\nAUDIT_VERDICT: PASS')
-    decision = workflows.parse_reviewer_report('AUDIT_FINDINGS_JSON: []\nAUDIT_VERDICT: PASS')
+    report_text = ('AUDIT_FINDINGS_JSON: []\nAUDIT_VERDICT: PASS\n'
+                   'ИТОГ: ГОТОВО — АУДИТ ЗАВЕРШЁН: замечаний не найдено')
+    assert parse_verdict(report_text) == 'ГОТОВО'
+    finish(isolated_db, reviewer.task, report_text)
+    decision = workflows.parse_reviewer_report(report_text)
     decision.expected_version = isolated_db.get_workflow(wf.id).state_version
     assert workflows.record_review(wf.id, decision).status.value == 'completed'
     report = workflows.workflow_report(wf.id)

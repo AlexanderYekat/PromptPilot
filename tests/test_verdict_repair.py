@@ -2,7 +2,11 @@ import json
 import subprocess as stdlib_subprocess
 from types import SimpleNamespace
 
+import pytest
+
 import promptpilot.worker as worker
+from promptpilot import workflows
+from promptpilot.herdr_exec import ensure_closing_verdict_contract
 from promptpilot.worker import VERDICT_REPAIR_PROMPT, _repair_verdict
 
 TASK = SimpleNamespace(id=1, model="glm-5.3-flash", effort=None)
@@ -79,3 +83,32 @@ def test_repair_verdict_returns_empty_when_model_stays_silent(monkeypatch):
     monkeypatch.setattr(worker.subprocess, "run", run)
 
     assert _repair_verdict(TASK, "claude", {}, "хвост", "/tmp") == ""
+
+
+@pytest.mark.parametrize("required", [True, False])
+@pytest.mark.parametrize("note", ["", "Проверь также граничный случай."])
+def test_worker_preserves_reviewer_contract_after_operator_note(monkeypatch, required, note):
+    monkeypatch.setattr(worker, "VERDICT_REQUIRED", required)
+    task = SimpleNamespace(prompt="Проверь код." + workflows.WORKFLOW_REVIEWER_VERDICT_INSTRUCTION,
+                           note=note)
+    prompt = ensure_closing_verdict_contract(worker.effective_prompt(task))
+    assert prompt.count('<promptpilot-workflow-contract') == 1
+    assert prompt.endswith(workflows.WORKFLOW_REVIEWER_VERDICT_INSTRUCTION)
+    assert "ИТОГ: УЖЕ СДЕЛАНО" not in prompt
+    if note:
+        assert prompt.index(note) < prompt.index('<promptpilot-workflow-contract')
+
+
+def test_repair_verdict_keeps_auditor_wording(monkeypatch):
+    calls = []
+    run, _ = _fake_run(stdout="ИТОГ: ГОТОВО — АУДИТ ЗАВЕРШЁН: замечаний не найдено",
+                       capture=calls)
+    monkeypatch.setattr(worker.subprocess, "run", run)
+    task = SimpleNamespace(**vars(TASK),
+                           prompt="Проверь код." + workflows.WORKFLOW_REVIEWER_VERDICT_INSTRUCTION)
+    assert _repair_verdict(task, "codex", {"prompt_stdin": True},
+                           "AUDIT_FINDINGS_JSON: []\nAUDIT_VERDICT: PASS", "/tmp") == "ГОТОВО"
+    prompt = calls[0][1]["input"]
+    assert "AUDIT_VERDICT: PASS" in prompt
+    assert "ИТОГ: ГОТОВО — АУДИТ ЗАВЕРШЁН: замечаний не найдено" in prompt
+    assert "ИТОГ: УЖЕ СДЕЛАНО" not in prompt

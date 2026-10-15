@@ -375,6 +375,8 @@ def prepare_dispatch(conn, workflow, round_row, dispatch, working_dir):
 CANDIDATE_JSON: {"candidate_revision":"<полный Git commit SHA>","no_changes":false}
 Все изменения реализации и тестов закоммитьте в ветку кандидата в указанной рабочей папке.
 Если изменений нет, передайте исходный SHA и no_changes:true. Пустой commit не нужен.
+no_changes:true означает сохранение исходной ревизии, а не отсутствие проверки.
+В отчёте перечислите выполненные проверки и их результаты; gate и независимый аудит обязательны.
 Существующие пользовательские документы сохраните без изменений. Не используйте reset/clean/stash.
 '''
     return {'candidate_baseline': baseline}, prompt

@@ -258,10 +258,12 @@ def test_answer_format_is_placed_exactly_once():
     assert workflows.DEFAULT_EXECUTOR_PROMPT == LEGACY_EXECUTOR
 
 
-def render(template, **values):
+def render(template, *, reviewer=False, **values):
     for name, value in values.items():
         template = template.replace("{{" + name + "}}", value)
-    return template.strip() + workflows.WORKFLOW_VERDICT_INSTRUCTION
+    instruction = (workflows.WORKFLOW_REVIEWER_VERDICT_INSTRUCTION if reviewer
+                   else workflows.WORKFLOW_VERDICT_INSTRUCTION)
+    return template.strip() + instruction
 
 
 def test_stage_without_own_prompts_keeps_the_builtin_text(isolated_db):
@@ -278,7 +280,7 @@ def test_stage_without_own_prompts_keeps_the_builtin_text(isolated_db):
 
     reviewer = pending(isolated_db)
     assert reviewer.prompt == render(
-        LEGACY_REVIEWER, **common, executor_report="EXEC-REPORT",
+        LEGACY_REVIEWER, reviewer=True, **common, executor_report="EXEC-REPORT",
         gate_evidence="Настроенных deterministic-команд нет", open_findings="[]")
     assert isolated_db.get_workflow(workflow.id).status.value == "reviewing"
 

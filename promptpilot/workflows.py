@@ -155,6 +155,24 @@ WORKFLOW_VERDICT_INSTRUCTION = """
 SUCCESS_VERDICTS = {"ГОТОВО", "УЖЕ СДЕЛАНО"}
 HUMAN_VERDICT = "НУЖЕН ЧЕЛОВЕК"
 
+WORKFLOW_REVIEWER_VERDICT_INSTRUCTION = """
+
+<promptpilot-workflow-contract version="w1-verdict-v1">
+Не завершай ответ уточняющим вопросом, если можешь продолжить самостоятельно.
+Итог описывает выполненный аудит, а не наличие изменений в коде.
+no_changes:true означает сохранение исходной ревизии кандидата; это не признак
+отсутствия проверки и не основание для PASS. Проверь результат по критериям этапа.
+После AUDIT_FINDINGS_JSON и AUDIT_VERDICT последней строкой ответа напиши:
+- при PASS без замечаний: ИТОГ: ГОТОВО — АУДИТ ЗАВЕРШЁН: замечаний не найдено
+- при PASS с закрытыми или принятыми замечаниями: ИТОГ: ГОТОВО — АУДИТ ЗАВЕРШЁН: результат принят, замечания перечислены выше
+- при REVISION_REQUIRED: ИТОГ: ГОТОВО — АУДИТ ЗАВЕРШЁН: требуется доработка, замечания перечислены выше
+- при HUMAN_REQUIRED: ИТОГ: НУЖЕН ЧЕЛОВЕК — для завершения аудита требуется конкретное решение или доступ
+- если аудит выполнить не удалось: ИТОГ: НЕ СМОГ — аудит не завершён, блокер доказан выше
+Статус ГОТОВО подтверждает завершение аудита; приёмку определяет AUDIT_VERDICT.
+Не используй для аудита итог «УЖЕ СДЕЛАНО».
+</promptpilot-workflow-contract>
+"""
+
 STAGE_PROMPTS_NOTE = (
     "executor_prompt и reviewer_prompt необязательны и содержат только указания "
     "этого этапа: код, название и проверяемую цель этапа (objective), разрешённые "
@@ -1052,8 +1070,11 @@ def dispatch_task(workflow_id: str,
         if external:
             return _open_external_run(conn, workflow, round_row, dispatch, working_dir,
                                       candidate_input=candidate_input, assignment=candidate_prompt)
+        verdict_instruction = (WORKFLOW_REVIEWER_VERDICT_INSTRUCTION
+                               if dispatch.role is WorkflowRole.REVIEWER
+                               else WORKFLOW_VERDICT_INSTRUCTION)
         task = db._insert_task(conn, TaskCreate(
-            prompt=candidate_prompt.rstrip() + WORKFLOW_VERDICT_INSTRUCTION,
+            prompt=candidate_prompt.rstrip() + verdict_instruction,
             working_dir=working_dir,
             provider=dispatch.provider,
             priority=dispatch.priority,

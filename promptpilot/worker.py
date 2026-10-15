@@ -180,6 +180,17 @@ VERDICT_REPAIR_PROMPT = (
 )
 
 
+def _workflow_verdict_instruction(task) -> str:
+    """Keep the workflow role's closing contract through worker prompt wrappers."""
+    from .workflows import WORKFLOW_REVIEWER_VERDICT_INSTRUCTION, WORKFLOW_VERDICT_INSTRUCTION
+
+    prompt = (getattr(task, "prompt", None) or "").rstrip()
+    for instruction in (WORKFLOW_REVIEWER_VERDICT_INSTRUCTION, WORKFLOW_VERDICT_INSTRUCTION):
+        if prompt.endswith(instruction.rstrip()):
+            return instruction
+    return ""
+
+
 def _repair_verdict(task, provider: str, provider_cfg: dict,
                     report_tail: str, run_dir: str) -> str:
     """One micro-request asking the same provider to restate the verdict.
@@ -191,6 +202,16 @@ def _repair_verdict(task, provider: str, provider_cfg: dict,
     falls back to its existing no-verdict behavior.
     """
     prompt = VERDICT_REPAIR_PROMPT.format(tail=(report_tail or "")[-4000:])
+    workflow_instruction = _workflow_verdict_instruction(task)
+    if workflow_instruction:
+        prompt = (
+            "Предыдущий ответ не содержал финальной строки вердикта. Конец отчёта:\n\n"
+            + (report_tail or "")[-4000:]
+            + "\n\nНе запускай никаких инструментов и ничего не меняй. "
+            "По уже выполненной работе ответь только одной финальной строкой ИТОГ "
+            "согласно контракту ниже; остальные строки отчёта не повторяй."
+            + workflow_instruction
+        )
     try:
         # Restating a verdict needs no tools; confine the micro-request when
         # the provider can be confined.
@@ -230,12 +251,17 @@ def effective_prompt(task) -> str:
     outrank everything above it.
     """
     prompt = task.prompt
+    workflow_instruction = _workflow_verdict_instruction(task)
+    if workflow_instruction:
+        prompt = prompt.rstrip()[:-len(workflow_instruction.rstrip())]
     note = (getattr(task, "note", None) or "").strip()
     if note:
         prompt += ("\n\n<приписка>\n"
                    "Это дописано человеком ПОСЛЕ постановки задачи выше и главнее её.\n"
                    f"{note}\n</приписка>")
-    if VERDICT_REQUIRED:
+    if workflow_instruction:
+        prompt += workflow_instruction
+    elif VERDICT_REQUIRED:
         prompt += VERDICT_INSTRUCTION
     return prompt
 
