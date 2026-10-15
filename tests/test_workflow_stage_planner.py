@@ -1,11 +1,18 @@
+import asyncio
 import json
 
+import httpx
+import pytest
+
 from promptpilot import workflows
+from promptpilot.api import app
 from promptpilot.models import (
     TaskStatus,
     WorkflowCreate,
     WorkflowPlanApproval,
     WorkflowPlanDispatch,
+    WorkflowStagePauseRequest,
+    WorkflowVersionRequest,
 )
 
 
@@ -72,6 +79,115 @@ def reviewer_revision():
         "AUDIT_VERDICT: REVISION_REQUIRED\n"
         "ИТОГ: ГОТОВО — нужны исправления"
     )
+
+
+def start_two_stages(db):
+    wf = create(db)
+    workflows.dispatch_planner(wf.id, WorkflowPlanDispatch(expected_version=wf.state_version))
+    finish_task(db, plan_result([
+        {'code': 'S1', 'title': 'First', 'objective': 'First'},
+        {'code': 'S2', 'title': 'Second', 'objective': 'Second', 'stage_type': 'integration'},
+    ]))
+    wf = db.get_workflow(wf.id)
+    workflows.approve_plan(wf.id, WorkflowPlanApproval(expected_version=wf.state_version))
+    return workflows.advance_workflow(wf.id)
+
+
+def pause_after(db, wf, enabled=True):
+    wf = db.get_workflow(wf.id)
+    return workflows.set_stage_pause(wf.id, WorkflowStagePauseRequest(
+        expected_version=wf.state_version, expected_pause_version=wf.pause_version,
+        enabled=enabled))
+
+
+def test_stage_pause_finishes_audit_and_survives_sync_until_explicit_resume(isolated_db):
+    wf = start_two_stages(isolated_db)
+    paused = pause_after(isolated_db, wf)
+    assert paused.state_version == wf.state_version
+    finish_task(isolated_db, 'S1 executor')
+    assert isolated_db.get_workflow(wf.id).status.value == 'reviewing'
+    finish_task(isolated_db, reviewer_pass())
+    waiting = isolated_db.get_workflow(wf.id)
+    assert waiting.status.value == 'paused_between_stages'
+    assert waiting.current_stage_id == wf.current_stage_id
+    assert waiting.current_round == 1
+    assert [s.status.value for s in isolated_db.list_workflow_stages(wf.id)] == ['completed', 'pending']
+    for _ in range(2):
+        workflows.sync_all_tasks()
+        workflows.advance_workflow(wf.id)
+    assert not isolated_db.list_tasks(status=TaskStatus.PENDING)
+    with pytest.raises(isolated_db.WorkflowConflictError):
+        workflows.resume_next_stage(wf.id, WorkflowVersionRequest(expected_version=0))
+    resumed = workflows.resume_next_stage(wf.id, WorkflowVersionRequest(expected_version=waiting.state_version))
+    assert resumed.current_round == 2
+    assert resumed.pause_after_stage_id is None
+    workflows.advance_workflow(wf.id)
+    assert len(isolated_db.list_tasks(status=TaskStatus.PENDING)) == 1
+    with pytest.raises(isolated_db.WorkflowConflictError):
+        workflows.resume_next_stage(wf.id, WorkflowVersionRequest(expected_version=waiting.state_version))
+
+
+def test_stage_pause_allows_revision_rounds_and_cancel_before_completion(isolated_db):
+    wf = start_two_stages(isolated_db)
+    pause_after(isolated_db, wf)
+    finish_task(isolated_db, 'executor')
+    finish_task(isolated_db, reviewer_revision())
+    revising = isolated_db.get_workflow(wf.id)
+    assert revising.status.value == 'executing'
+    assert revising.current_stage_id == wf.current_stage_id
+    assert revising.pause_after_stage_id == wf.current_stage_id
+    pause_after(isolated_db, revising, False)
+    finish_task(isolated_db, 'corrected executor')
+    finish_task(isolated_db, reviewer_pass())
+    assert isolated_db.get_workflow(wf.id).current_stage_id != wf.current_stage_id
+
+
+def test_pause_during_gate_does_not_invalidate_receipt(isolated_db, monkeypatch):
+    wf = start_two_stages(isolated_db)
+    run_gate = workflows._run_gate_commands
+
+    def with_pause(workflow):
+        pause_after(isolated_db, workflow)
+        return run_gate(workflow)
+
+    monkeypatch.setattr(workflows, '_run_gate_commands', with_pause)
+    finish_task(isolated_db, 'executor')
+    assert isolated_db.get_workflow(wf.id).status.value == 'reviewing'
+    finish_task(isolated_db, reviewer_pass())
+    assert isolated_db.get_workflow(wf.id).status.value == 'paused_between_stages'
+
+
+def test_pause_request_is_concurrent_safe_and_last_stage_finishes(isolated_db):
+    wf = start_two_stages(isolated_db)
+    requested = pause_after(isolated_db, wf)
+    with pytest.raises(isolated_db.WorkflowConflictError, match='pause changed'):
+        workflows.set_stage_pause(wf.id, WorkflowStagePauseRequest(
+            expected_version=wf.state_version, expected_pause_version=0, enabled=False))
+    pause_after(isolated_db, requested, False)
+    finish_task(isolated_db, 'executor S1')
+    finish_task(isolated_db, reviewer_pass())
+    pause_after(isolated_db, isolated_db.get_workflow(wf.id))
+    finish_task(isolated_db, 'executor S2')
+    finish_task(isolated_db, reviewer_pass())
+    assert isolated_db.get_workflow(wf.id).status.value == 'completed'
+
+
+def test_stage_pause_api_only_sets_intent_and_next_stage_requires_acceptance(isolated_db):
+    wf = start_two_stages(isolated_db)
+    tasks_before = [t.id for t in isolated_db.list_tasks()]
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+            response = await client.post(f'/api/workflows/{wf.id}/stage-pause', json={
+                'expected_version': wf.state_version, 'expected_pause_version': 0, 'enabled': True})
+            assert response.status_code == 200
+            assert response.json()['status'] == 'executing'
+            assert response.json()['state_version'] == wf.state_version
+            assert response.json()['pause_after_stage_id'] == wf.current_stage_id
+            assert (await client.post(f'/api/workflows/{wf.id}/next-stage', json={
+                'expected_version': wf.state_version})).status_code == 409
+    asyncio.run(scenario())
+    assert [t.id for t in isolated_db.list_tasks()] == tasks_before
 
 
 def test_planner_approval_and_two_stage_autonomous_lifecycle(isolated_db):

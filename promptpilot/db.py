@@ -187,6 +187,8 @@ CREATE TABLE IF NOT EXISTS workflows (
     status TEXT NOT NULL DEFAULT 'draft',
     current_round INTEGER NOT NULL DEFAULT 0,
     current_stage_id TEXT,
+    pause_after_stage_id TEXT,
+    pause_version INTEGER NOT NULL DEFAULT 0,
     state_version INTEGER NOT NULL DEFAULT 0,
     config_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
@@ -395,6 +397,8 @@ MIGRATIONS = [
     "ALTER TABLE notifications ADD COLUMN pane_id TEXT",
     "ALTER TABLE notifications ADD COLUMN machine TEXT",
     "ALTER TABLE workflows ADD COLUMN current_stage_id TEXT",
+    "ALTER TABLE workflows ADD COLUMN pause_after_stage_id TEXT",
+    "ALTER TABLE workflows ADD COLUMN pause_version INTEGER NOT NULL DEFAULT 0",
     """CREATE TABLE IF NOT EXISTS workflow_plans (
         workflow_id TEXT PRIMARY KEY REFERENCES workflows(id) ON DELETE RESTRICT,
         status TEXT NOT NULL DEFAULT 'draft', planner_task_id INTEGER,
@@ -1299,6 +1303,9 @@ def get_next_runnable(
     now = _now()
     busy = set(busy_keys or ())
     with _connect(immediate=True) as conn:
+        # Atomic with maintenance admission: a drain cannot miss a new claim.
+        if conn.execute("SELECT 1 FROM settings WHERE key='deployment_drain'").fetchone():
+            return None
         # The admission baton must reach a worker slot too. Otherwise an
         # endless stream of higher-priority runnable tasks can repeatedly be
         # claimed and denied while the selected waiter never reaches preflight.

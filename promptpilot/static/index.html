@@ -2303,6 +2303,7 @@ function workflowStatusInfo(status, reviewerDone = false) {
     executing: ['Исполнитель работает', 'Следующее действие: наблюдать за агентом; после успешного ответа начнутся проверки.'],
     gating: ['Автоматические проверки', 'Следующее действие: зафиксировать результат gate.'],
     reviewing: ['Независимое ревью', 'Следующее действие: запустить проверяющего.'],
+    paused_between_stages: ['Пауза между этапами', 'Текущий этап принят. Следующий начнётся только после вашего продолжения.'],
     revision_required: ['Нужны исправления', 'Следующее действие: открыть новый раунд доработок.'],
     awaiting_external: ['Ожидает внешнего результата', 'Этап выполняют вне PromptPilot. Следующее действие: сдать результат — дальше проверки и независимое ревью.'],
     awaiting_human: reviewerDone
@@ -2316,6 +2317,10 @@ function workflowStatusInfo(status, reviewerDone = false) {
 }
 
 function workflowOwnerInfo(wf, activeRun, reviewerDone) {
+  if (wf.status === 'paused_between_stages') return {
+    who: 'Вы', detail: 'этап завершён, проверки и аудит пройдены',
+    next: 'Продолжите, когда будете готовы начать следующий этап', color: 'var(--yellow)',
+  };
   if (wf.status === 'planning') return {
     who: 'Планировщик', detail: activeRun?.task_id ? `task #${activeRun.task_id} · разбивает задачу на этапы` : 'запускается',
     next: 'Дальше: ваше однократное утверждение плана', color: 'var(--accent)',
@@ -2575,6 +2580,16 @@ function workflowCandidateHtml(candidate, events, runs) {
     <details data-wf-detail="candidate"><summary>Подробности версии</summary><pre>${esc(JSON.stringify(candidate, null, 2))}</pre></details>`;
 }
 
+function workflowStagePauseHtml(wf, stages) {
+  const stage = stages.find(s => s.id === wf.current_stage_id);
+  if (!stage || ['completed','failed','cancelled','paused_between_stages'].includes(wf.status)) return '';
+  const requested = wf.pause_after_stage_id === stage.id;
+  return `<div class="wf-stage" style="border-color:var(--yellow)">
+    <button class="btn btn-sm btn-ghost" onclick="wfStagePause(${!requested})">${requested ? 'Отменить паузу после этапа' : 'Пауза после текущего этапа'}</button>
+    <div class="wf-meta">${requested ? `Пауза после ${esc(stage.code)} включена. ` : ''}Исполнитель, проверки, аудит и необходимые доработки текущего этапа смогут закончиться. ${requested ? 'Следующий этап будет ждать вашего продолжения.' : 'Эта кнопка остановит переход к следующему этапу.'}</div>
+  </div>`;
+}
+
 function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, plannerTask, orphanPane = null, candidates = []) {
   const terminal = ['completed','failed','cancelled'].includes(wf.status);
   const plannerRun = wf.status === 'planning' && plannerTask ? {role:'planner', task_id:plannerTask.id, status:plannerTask.status} : null;
@@ -2645,6 +2660,8 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       <select id="wfTarget"><option value="">загрузка herdr-сессий…</option></select>
       <button class="btn btn-sm btn-primary" onclick="wfDispatch('${role}')">Запустить ${role}</button>
     </div>`;
+  } else if (wf.status === 'paused_between_stages') {
+    action = `<div class="wf-actions"><button class="btn btn-sm btn-primary" onclick="wfNextStage()">Продолжить со следующего этапа</button></div>`;
   } else if (wf.status === 'gating') {
     action = `<div class="wf-form"><input class="wide" id="wfDecisionSummary" placeholder="Итог gate">
       <button class="btn btn-sm btn-primary" onclick="wfGate('PASS')">Gate PASS</button>
@@ -2715,6 +2732,7 @@ function renderWorkflowDetail(wf, rounds, runs, events, findings, plan, stages, 
       ${activeRun?.task_id ? `<button class="btn btn-sm btn-danger" onclick="wfStopTask(${activeRun.task_id})">Остановить task #${activeRun.task_id}</button>` : ''}
       ${!terminal ? `<button class="btn btn-sm btn-danger" onclick="wfCancel()">Отменить весь workflow</button>` : ''}
     </div>
+    ${workflowStagePauseHtml(wf, stages)}
     ${workflowSettingsHtml(wf)}
     ${workflowPlanHtml(wf, plan, stages, events)}
     ${action}
@@ -2996,6 +3014,11 @@ async function wfPlannerDispatch(regenerate = false) {
 }
 
 function wfAdvance() { return wfPost('advance', {}); }
+function wfStagePause(enabled) {
+  return wfPost('stage-pause', {expected_version:selectedWorkflowData.state_version,
+    expected_pause_version:selectedWorkflowData.pause_version || 0, enabled});
+}
+function wfNextStage() { return wfPost('next-stage', {expected_version:selectedWorkflowData.state_version}); }
 function wfDownloadReport(format) {
   const link = document.createElement('a');
   link.href = `${API}/workflows/${selectedWorkflowId}/report?format=${format}`;

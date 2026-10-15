@@ -138,6 +138,7 @@ class WorkflowStatus(str, Enum):
     REVIEWING = "reviewing"
     REVISION_REQUIRED = "revision_required"
     AWAITING_HUMAN = "awaiting_human"
+    PAUSED_BETWEEN_STAGES = "paused_between_stages"
     # A planned wait: the stage is being done outside PromptPilot (issue #122).
     # Unlike AWAITING_HUMAN nothing went wrong, and no process is held.
     AWAITING_EXTERNAL = "awaiting_external"
@@ -392,6 +393,8 @@ class WorkflowInDB(BaseModel):
     status: WorkflowStatus
     current_round: int = 0
     current_stage_id: Optional[str] = None
+    pause_after_stage_id: Optional[str] = None
+    pause_version: int = 0
     state_version: int = 0
     config: dict[str, Any] = Field(default_factory=normalize_workflow_config)
     created_at: datetime
@@ -402,6 +405,16 @@ class WorkflowInDB(BaseModel):
     @classmethod
     def validate_config(cls, value):
         return normalize_workflow_config(value)
+
+
+class WorkflowStagePauseRequest(BaseModel):
+    expected_version: int = Field(ge=0)
+    expected_pause_version: int = Field(ge=0)
+    enabled: bool
+
+
+class DeploymentDrainRequest(BaseModel):
+    token: str = Field(min_length=32, max_length=64, pattern=r'^[a-zA-Z0-9-]+$')
 
 
 class WorkflowRoundCreate(BaseModel):

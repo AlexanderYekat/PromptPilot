@@ -24,6 +24,7 @@ from . import pipeline_insights
 from .config import API_TOKEN, DB_DIR, DEFAULT_CLI, EFFORT_LEVELS, PIPELINE_SNAPSHOT_INTERVAL, get_provider_models, get_skills, load_providers, mask_secret_value, provider_available, RIGHTS_LEVELS, rights_supported, PROJECTS_ROOT
 from .models import (
     CostStats,
+    DeploymentDrainRequest,
     FindingStatus,
     Stats,
     TaskCreate,
@@ -50,6 +51,7 @@ from .models import (
     WorkflowRoundInDB,
     WorkflowRunInDB,
     WorkflowStageInDB,
+    WorkflowStagePauseRequest,
     WorkflowStartRequest,
     WorkflowStatus,
     WorkflowSetupCheck,
@@ -672,7 +674,7 @@ def api_run_workflow_gate(workflow_id: str, request: WorkflowVersionRequest):
             raise db.WorkflowNotFoundError(wid)
         if workflow.state_version != req.expected_version or workflow.status.value != 'gating':
             raise db.WorkflowConflictError('workflow changed concurrently or is not gating')
-        return workflows.record_gate(wid, workflows._run_gate_commands(workflow))
+        return workflows.run_gate(workflow)
     return _workflow_action(run, workflow_id, request)
 
 
@@ -1198,6 +1200,35 @@ def api_usage(hours: float = 5.0):
         return {"error": f"{type(e).__name__}: {e}", "cost": 0, "sessions": 0}
 
 
+@app.post('/api/workflows/{workflow_id}/stage-pause', response_model=WorkflowInDB)
+def api_workflow_stage_pause(workflow_id: str, request: WorkflowStagePauseRequest):
+    return _workflow_action(workflows.set_stage_pause, workflow_id, request)
+
+
+@app.post('/api/workflows/{workflow_id}/next-stage', response_model=WorkflowInDB)
+def api_workflow_next_stage(workflow_id: str, request: WorkflowVersionRequest):
+    resumed = _workflow_action(workflows.resume_next_stage, workflow_id, request)
+    return workflows.advance_workflow(resumed.id)
+
+
+@app.get('/api/maintenance')
+def api_maintenance_status():
+    from . import maintenance
+    return maintenance.status()
+
+
+@app.post('/api/maintenance/begin')
+def api_maintenance_begin(request: DeploymentDrainRequest):
+    from . import maintenance
+    return _workflow_action(maintenance.begin, request.token)
+
+
+@app.post('/api/maintenance/finish')
+def api_maintenance_finish(request: DeploymentDrainRequest):
+    from . import maintenance
+    return _workflow_action(maintenance.finish, request.token)
+
+
 @app.get("/api/worker/status")
 def api_worker_status():
     return db.worker_runtime_status()
@@ -1212,6 +1243,9 @@ def api_worker_pause():
 
 @app.post("/api/worker/resume")
 def api_worker_resume():
+    from . import maintenance
+    if maintenance.is_draining():
+        raise HTTPException(409, 'Обновление ожидает завершения проверок; очередь пока на паузе')
     db.set_setting("worker_paused", "0")
     pipeline_insights.invalidate_cache()
     return {"ok": True, "paused": False}

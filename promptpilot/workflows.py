@@ -14,7 +14,7 @@ import subprocess
 from collections import Counter
 from typing import Optional
 
-from . import db, workflow_candidates as candidates
+from . import db, maintenance, workflow_candidates as candidates
 from .models import (
     FindingStatus,
     FindingSeverity,
@@ -41,6 +41,7 @@ from .models import (
     WorkflowRunInDB,
     WorkflowStageInDB,
     WorkflowStageSpec,
+    WorkflowStagePauseRequest,
     WorkflowStartRequest,
     WorkflowStatus,
     WorkflowTaskDispatch,
@@ -106,11 +107,16 @@ ALLOWED_TRANSITIONS = {
         WorkflowStatus.CANCELLED,
     },
     WorkflowStatus.AWAITING_HUMAN: {
+        WorkflowStatus.PAUSED_BETWEEN_STAGES,
         WorkflowStatus.PLANNING,
         WorkflowStatus.QUEUED,
         WorkflowStatus.REVIEWING,
         WorkflowStatus.REVISION_REQUIRED,
         WorkflowStatus.COMPLETED,
+        WorkflowStatus.CANCELLED,
+    },
+    WorkflowStatus.PAUSED_BETWEEN_STAGES: {
+        WorkflowStatus.QUEUED,
         WorkflowStatus.CANCELLED,
     },
     WorkflowStatus.COMPLETED: set(),
@@ -1395,6 +1401,69 @@ def _upsert_review_finding(conn: sqlite3.Connection, workflow_id: str,
     return db._row_to_workflow_finding(row)
 
 
+def set_stage_pause(workflow_id: str, request: WorkflowStagePauseRequest) -> WorkflowInDB:
+    """Change only the stage-boundary intent, without invalidating an active gate.
+
+    This has its own optimistic version. The lifecycle version still protects
+    against requesting a pause after a different stage than the one displayed.
+    """
+    with db._connect(immediate=True) as conn:
+        workflow = _workflow_row(conn, workflow_id)
+        _require_version(workflow, request.expected_version)
+        if workflow['pause_version'] != request.expected_pause_version:
+            raise db.WorkflowConflictError('stage pause changed concurrently')
+        stage = conn.execute('SELECT * FROM workflow_stages WHERE id=?',
+                             (workflow['current_stage_id'],)).fetchone()
+        if (not stage or stage['status'] == 'completed'
+                or WorkflowStatus(workflow['status']) in TERMINAL_STATES):
+            raise db.WorkflowConflictError('there is no active stage to pause after')
+        target = stage['id'] if request.enabled else None
+        if workflow['pause_after_stage_id'] == target:
+            return db._row_to_workflow(workflow)
+        conn.execute('UPDATE workflows SET pause_after_stage_id=?, pause_version=pause_version+1, updated_at=? WHERE id=?',
+                     (target, db._now(), workflow_id))
+        db._append_workflow_event(conn, WorkflowEventCreate(
+            workflow_id=workflow_id,
+            event_type='stage.pause_requested' if request.enabled else 'stage.pause_cancelled',
+            idempotency_key=f"stage.pause:{workflow_id}:p{workflow['pause_version'] + 1}",
+            payload={'stage_id': stage['id'], 'stage_code': stage['code'], 'enabled': request.enabled}))
+        return db._row_to_workflow(_workflow_row(conn, workflow_id))
+
+
+def _advance_stage(conn, workflow, current_stage, next_stage, round_row):
+    conn.execute("UPDATE workflow_stages SET status='executing', started_at=? WHERE id=?",
+                 (db._now(), next_stage['id']))
+    conn.execute('UPDATE workflows SET current_stage_id=?, pause_after_stage_id=NULL, pause_version=pause_version+1 WHERE id=?',
+                 (next_stage['id'], workflow['id']))
+    new_round = _insert_round(
+        conn, workflow['id'], workflow['current_round'] + 1,
+        base_sha=round_row['candidate_sha'], stage_id=next_stage['id'])
+    return _transition(
+        conn, _workflow_row(conn, workflow['id']), WorkflowStatus.QUEUED,
+        'stage.advanced',
+        {'completed_stage_id': current_stage['id'], 'completed_stage_code': current_stage['code'],
+         'next_stage_id': next_stage['id'], 'next_stage_code': next_stage['code']},
+        round_id=new_round['id'])
+
+
+def resume_next_stage(workflow_id: str, request: WorkflowVersionRequest) -> WorkflowInDB:
+    with db._connect(immediate=True) as conn:
+        workflow = _workflow_row(conn, workflow_id)
+        _require_version(workflow, request.expected_version)
+        if workflow['status'] != WorkflowStatus.PAUSED_BETWEEN_STAGES.value:
+            raise db.WorkflowConflictError('workflow is not paused between stages')
+        stage = conn.execute('SELECT * FROM workflow_stages WHERE id=?',
+                             (workflow['current_stage_id'],)).fetchone()
+        round_row = _current_round_row(conn, workflow)
+        if not stage or stage['status'] != 'completed' or round_row['status'] != 'completed':
+            raise db.WorkflowConflictError('current stage has not passed review')
+        next_stage = conn.execute("SELECT * FROM workflow_stages WHERE workflow_id=? AND position>? AND status='pending' ORDER BY position LIMIT 1",
+                                  (workflow_id, stage['position'])).fetchone()
+        if not next_stage:
+            raise db.WorkflowConflictError('there is no next stage')
+        return db._row_to_workflow(_advance_stage(conn, workflow, stage, next_stage, round_row))
+
+
 @candidates.guard_boundary
 def record_review(workflow_id: str,
                   decision: WorkflowReviewDecision) -> WorkflowInDB:
@@ -1498,30 +1567,15 @@ def record_review(workflow_id: str,
                     (workflow_id, current_stage["position"]),
                 ).fetchone()
                 if next_stage:
-                    conn.execute(
-                        """UPDATE workflow_stages SET status='executing',
-                           started_at=? WHERE id=?""",
-                        (now, next_stage["id"]),
-                    )
-                    conn.execute(
-                        "UPDATE workflows SET current_stage_id=? WHERE id=?",
-                        (next_stage["id"], workflow_id),
-                    )
-                    new_round = _insert_round(
-                        conn, workflow_id, workflow["current_round"] + 1,
-                        base_sha=round_row["candidate_sha"],
-                        stage_id=next_stage["id"],
-                    )
-                    workflow = _workflow_row(conn, workflow_id)
-                    workflow = _transition(
-                        conn, workflow, WorkflowStatus.QUEUED,
-                        "stage.advanced",
-                        {"completed_stage_id": current_stage["id"],
-                         "completed_stage_code": current_stage["code"],
-                         "next_stage_id": next_stage["id"],
-                         "next_stage_code": next_stage["code"]},
-                        round_id=new_round["id"],
-                    )
+                    if workflow['pause_after_stage_id'] == current_stage['id']:
+                        workflow = _transition(
+                            conn, workflow, WorkflowStatus.PAUSED_BETWEEN_STAGES,
+                            'stage.paused', {'stage_id': current_stage['id'],
+                                             'stage_code': current_stage['code'],
+                                             'next_stage_code': next_stage['code']},
+                            round_id=round_row['id'])
+                    else:
+                        workflow = _advance_stage(conn, workflow, current_stage, next_stage, round_row)
                 else:
                     workflow = _transition(
                         conn, workflow, WorkflowStatus.COMPLETED,
@@ -2292,6 +2346,13 @@ def _run_gate_command_windows(argv: list[str], cwd: str, timeout: int, *, env=No
     return subprocess.CompletedProcess(argv, proc.returncode, stdout or "", stderr or "")
 
 
+def run_gate(workflow: WorkflowInDB) -> WorkflowInDB:
+    # Keep the activity registered through receipt application, not just the
+    # subprocess. Restarting between those two writes strands a claimed gate.
+    with maintenance.gate_activity(workflow.id):
+        return record_gate(workflow.id, _run_gate_commands(workflow))
+
+
 def _run_gate_commands(workflow: WorkflowInDB) -> WorkflowGateDecision:
     if candidates.config(workflow).candidate.enabled:
         return candidates.run_gates(workflow, _run_gate_command_windows)
@@ -2454,6 +2515,8 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
         config = _config_for(workflow)
         if not config.automation.enabled or workflow.status in TERMINAL_STATES:
             return workflow
+        if maintenance.is_draining():
+            return workflow
         try:
             if workflow.status is WorkflowStatus.AWAITING_PLAN_APPROVAL:
                 if config.planning.require_approval:
@@ -2486,9 +2549,8 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
             if workflow.status is WorkflowStatus.GATING:
                 if not config.automation.auto_gate:
                     return workflow
-                decision = _run_gate_commands(workflow)
-                workflow = record_gate(workflow.id, decision)
-                if decision.verdict is GateVerdict.HUMAN_REQUIRED:
+                workflow = run_gate(workflow)
+                if workflow.status is WorkflowStatus.AWAITING_HUMAN:
                     return workflow
                 continue
 
@@ -2566,6 +2628,8 @@ def advance_workflow(workflow_id: str, max_actions: int = 12) -> WorkflowInDB:
                 continue
 
             return workflow
+        except maintenance.MaintenanceActive:
+            return db.get_workflow(workflow_id)
         except db.WorkflowConflictError as exc:
             # Retry only actual optimistic-version races. A semantic conflict
             # (for example PASS with an open blocker) requires human review.
