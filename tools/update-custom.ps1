@@ -8,7 +8,7 @@ $taskRoot = Split-Path -Parent $PSScriptRoot
 $api = 'http://127.0.0.1:8421/api'
 $manifestPath = Join-Path $taskRoot '_local\trial-processes.json'
 $pointerPath = Join-Path $taskRoot '_local\trial-release.json'
-$servicesBefore = @(Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json)
+$servicesBefore = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
 $previous = Get-Content -LiteralPath $pointerPath -Raw | ConvertFrom-Json
 $sha = & git -C $taskRoot rev-parse --verify "$Ref^{commit}"
 if ($LASTEXITCODE) { throw 'Cannot resolve candidate.' }
@@ -39,7 +39,8 @@ function Assert-LegacyIdle {
     if ((Invoke-RestMethod "$api/stats").running) { throw 'Old release still has running tasks.' }
     $offset = 0
     do {
-        $items = @(Invoke-RestMethod "$api/workflows?limit=100&offset=$offset" -TimeoutSec 10)
+        $items = Invoke-RestMethod "$api/workflows?limit=100&offset=$offset" -TimeoutSec 10
+        $items = @($items)
         if (@($items | Where-Object { $_.status -in @('planning','queued','executing','gating','reviewing','revision_required') }).Count) {
             throw 'Old release still has a workflow handoff or gate; it cannot be restarted safely.'
         }
@@ -95,6 +96,17 @@ try {
     & "$PSScriptRoot\start-custom.ps1" -Ref $sha -Worker:$hadWorker
     $release = Get-Content -LiteralPath $pointerPath -Raw | ConvertFrom-Json
     if ($release.commit -ne $sha) { throw 'Unexpected release pointer.' }
+    $null = Invoke-RestMethod "$api/maintenance" -TimeoutSec 10
+    if ($hadWorker) {
+        for ($attempt=0; $attempt -lt 20; $attempt++) {
+            $workerReady = Invoke-RestMethod "$api/worker/status" -TimeoutSec 10
+            if ($workerReady.state -eq 'online' -and $workerReady.pid -ne $workerBefore.pid) { break }
+            Start-Sleep -Seconds 1
+        }
+        if ($workerReady.state -ne 'online' -or $workerReady.pid -eq $workerBefore.pid) {
+            throw 'New worker heartbeat is missing; retain admission barrier and roll back.'
+        }
+    }
     # From here, a finish request can succeed even if its HTTP response is lost.
     # Never roll back by killing a worker that may have resumed admission.
     $restarted = $true

@@ -57,7 +57,7 @@ function global:Get-CimInstance {
 }
 function global:Invoke-RestMethod {
     param([string]$Uri, [string]$Method, [string]$ContentType, [string]$Body, [int]$TimeoutSec)
-    if ($Uri.EndsWith('/worker/status')) { return @{state='online';paused=$false} }
+    if ($Uri.EndsWith('/worker/status')) { return @{state='online';paused=$false;pid=(99+$global:stopCount)} }
     if ($Uri.EndsWith('/maintenance/begin')) {
         $global:drain=@{token=($Body | ConvertFrom-Json).token}
     } elseif ($Uri.EndsWith('/maintenance/finish')) {
@@ -89,3 +89,45 @@ catch { $failed=$true }
         assert actual['polls'] >= 3
         assert actual['stopped'] == 1
         assert not actual['gate_active']
+
+
+@pytest.mark.parametrize('blocked', [False, True])
+def test_legacy_preflight_checks_json_arrays_and_all_pages(tmp_path, blocked):
+    shell = shutil.which('pwsh') or shutil.which('powershell')
+    if not shell:
+        pytest.skip('PowerShell is unavailable')
+    updater = (Path(__file__).parents[1] / 'tools/update-custom.ps1').read_text()
+    guard = updater.split('function Assert-LegacyIdle {', 1)[1].split('\n$draining =', 1)[0]
+    harness = tmp_path / 'legacy.ps1'
+    harness.write_text('''
+param([int]$Blocked)
+$ErrorActionPreference='Stop'
+$hadWorker=$false
+$api='http://fake/api'
+$global:pages=0
+function Invoke-RestMethod {
+    param([string]$Uri, [int]$TimeoutSec)
+    if ($Uri.EndsWith('/worker/status')) { return @{state='offline'} }
+    if ($Uri.EndsWith('/stats')) { return @{running=0} }
+    $global:pages++
+    if ($global:pages -eq 1) {
+        $items = @(1..100 | ForEach-Object { [pscustomobject]@{status='completed'} })
+    } else {
+        $status = if ($Blocked) { 'gating' } else { 'awaiting_human' }
+        $items = @([pscustomobject]@{status='completed'}, [pscustomobject]@{status=$status})
+    }
+    # Invoke-RestMethod emits the JSON array as one pipeline object.
+    return ,$items
+}
+function Assert-LegacyIdle {
+''' + guard + '''
+$failed=$false
+try { Assert-LegacyIdle } catch { $failed=$true }
+@{failed=$failed;pages=$global:pages} | ConvertTo-Json -Compress
+''')
+    result = subprocess.run([shell, '-NoProfile', '-NonInteractive', '-File', str(harness),
+                             '-Blocked', str(int(blocked))], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual = json.loads(result.stdout.strip())
+    assert actual['pages'] == 2
+    assert actual['failed'] == blocked
