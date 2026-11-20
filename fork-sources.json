@@ -12,7 +12,7 @@
       "name": "Уровни прав задач",
       "initial_commit": "43ded680b9ced02f2f1c602cc991e8ba75574476",
       "accepted_commit": "43ded680b9ced02f2f1c602cc991e8ba75574476",
-      "pr_state": "open",
+      "pr_state": "merged",
       "maintained": true
     },
     {
@@ -20,8 +20,8 @@
       "pr": 135,
       "name": "Маршруты заявок",
       "initial_commit": "81dc8eb307c66c5899c6388366053a8b4a16c5dd",
-      "accepted_commit": "81dc8eb307c66c5899c6388366053a8b4a16c5dd",
-      "pr_state": "open",
+      "accepted_commit": "67ca2c4ba9e7d9a0b2d72e73131d09278399396a",
+      "pr_state": "merged",
       "maintained": true
     },
     {
@@ -29,8 +29,8 @@
       "pr": 136,
       "name": "Коннекторы маршрутов",
       "initial_commit": "4b4393d7c6d5e9d5ed88f180cba55fa7f591b1af",
-      "accepted_commit": "4b4393d7c6d5e9d5ed88f180cba55fa7f591b1af",
-      "pr_state": "open",
+      "accepted_commit": "263fb4efc8efaaef76603250b0b08cabb686d748",
+      "pr_state": "merged",
       "maintained": true
     },
     {
@@ -38,13 +38,13 @@
       "pr": 137,
       "name": "External execution",
       "initial_commit": "aa55a853e33101c7bad3f27b482b2a6bb7983504",
-      "accepted_commit": "aa55a853e33101c7bad3f27b482b2a6bb7983504",
-      "pr_state": "open",
+      "accepted_commit": "20f23099820b74ee06e9f97a88eb0ccaf01a3367",
+      "pr_state": "merged",
       "maintained": true
     }
   ],
   "schema_version": 1,
-  "accepted_upstream_commit": "b2b3a87ebcc27b98ccda22f936c62776cb65f509",
+  "accepted_upstream_commit": "e05466e97b1499b1c6734371a1dd770e9de33612",
   "runtime_python": "3.12",
-  "checked_at": "2026-10-05"
+  "checked_at": "2026-11-20"
 }
