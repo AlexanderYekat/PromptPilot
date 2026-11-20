@@ -4,10 +4,35 @@ import sqlite3
 from contextlib import closing
 
 import pytest
+from click.testing import CliRunner
 
 from promptpilot import config, db, workflows
+from promptpilot.cli import cli
 from promptpilot.models import TaskStatus, WorkflowExternalResult, WorkflowHumanInput
+from tools.custom_runtime import seed
 import test_workflow_external as external
+
+
+def test_seeded_external_demo_accepts_cli_submission_and_queues_supported_reviewer(isolated_db, tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "DB_DIR", tmp_path)
+    monkeypatch.setenv("PP_FLOWS_DIR", str(tmp_path / "flows"))
+    seed()
+
+    runner = CliRunner()
+    assignment = runner.invoke(cli, ["workflow", "external", "demo-external", "--json"])
+    assert assignment.exit_code == 0, assignment.output
+    assignment_path = tmp_path / "assignment.json"
+    assignment_path.write_text(assignment.output, encoding="utf-8-sig")
+    submitted = runner.invoke(cli, ["workflow", "submit", "demo-external", "--assignment",
+                                    str(assignment_path), "--text", "Готовая инструкция", "--performer", "Автор"])
+
+    assert submitted.exit_code == 0, submitted.output
+    workflow = isolated_db.get_workflow_by_ref("demo-external")
+    assert workflow.status.value == "reviewing", isolated_db.list_workflow_events(workflow.id)[-3:]
+    reviewer, = isolated_db.list_tasks(status=TaskStatus.PENDING)
+    assert (reviewer.provider, reviewer.rights) == ("claude", "read")
+    assert config.rights_supported(config.load_providers()[reviewer.provider], reviewer.rights)
+    assert isolated_db.is_paused()
 
 
 def test_external_revision_keeps_rights_notes_and_previous_result(isolated_db, monkeypatch):

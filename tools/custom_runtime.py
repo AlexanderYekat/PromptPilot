@@ -120,10 +120,10 @@ def seed():
             "Reviewer должен потребовать доработку, если отсутствует любой из этих четырёх пунктов.",
             repository_path=str(workspace), candidate_branch="main",
             config={"automation": {"enabled": True}, "roles": {
-                "executor": {"provider": "codex", "rights": "read"},
-                "reviewer": {"provider": "codex", "rights": "read", "task_timeout": 180}},
+                "executor": {"provider": "claude", "rights": "read"},
+                "reviewer": {"provider": "claude", "rights": "read", "task_timeout": 180}},
                 "stage": {"code": "EXTERNAL", "title": "Внешняя инструкция", "execution_mode": "external"},
-                "gate": {"commands": []}, "limits": {"max_rounds": 6}}))
+                "gate": {"enabled": False}, "limits": {"max_rounds": 6}}))
         wf = workflows.start_workflow(wf.id, WorkflowStartRequest(expected_version=wf.state_version))
         workflows.request_external(wf.id, wf.state_version)
     result = {"workflow": wf.id, "flow_item": item["id"],
