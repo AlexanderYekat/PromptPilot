@@ -6,7 +6,7 @@ import pytest
 
 from promptpilot import workflows
 from promptpilot.api import app
-from promptpilot.models import WorkflowCreate, WorkflowStartRequest
+from promptpilot.models import TaskStatus, WorkflowCreate, WorkflowStartRequest
 
 
 def request(method, path, **kwargs):
@@ -58,12 +58,19 @@ def test_operator_resume_during_reconciliation_is_not_paused_again(
     response = request("POST", f"/api/workflows/{workflow.id}/advance")
     assert response.status_code == 200
     assert len(resumed) == 1
-    assert response.json()["status"] == "queued"
+    assert response.json()["status"] == "executing"
     current = isolated_db.get_workflow(workflow.id)
-    assert current.state_version == resumed[0]["state_version"]
-    assert current.status.value == "queued"
+    assert current.state_version == resumed[0]["state_version"] == response.json()["state_version"]
+    assert current.status.value == "executing"
+    assert current.current_round == workflow.current_round
+    pending = isolated_db.list_tasks(status=TaskStatus.PENDING)
+    assert len(pending) == 1
     events = isolated_db.list_workflow_events(workflow.id, limit=1000)
-    assert events[-1].event_type == "human.resumed"
+    resumed_events = [event for event in events if event.event_type == "human.resumed"]
+    assert len(resumed_events) == 1
+    assert events[-1].event_type == "executor.dispatched"
+    assert events[-1].payload["task_id"] == pending[0].id
+    assert resumed_events[0].seq < events[-1].seq
     assert not any(event.event_type == "automation.paused" for event in events)
 
 

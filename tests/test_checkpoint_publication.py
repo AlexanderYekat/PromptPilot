@@ -474,7 +474,8 @@ def test_source_acceptance_retains_real_git_index_and_ref_fences(isolated_db, tm
         thread.join(30)
     assert not thread.is_alive() and not errors, errors
     assert len(results)==1 and results[0].status_code==200, results
-    assert db.get_workflow(wf.id).status.value == 'queued'
+    assert results[0].json()['status'] == db.get_workflow(wf.id).status.value == 'executing'
+    assert len(db.list_tasks(status=TaskStatus.PENDING)) == 1
     assert _types(db,wf).count('stage.checkpoint') == _types(db,wf).count('stage.advanced') == 1
 
 

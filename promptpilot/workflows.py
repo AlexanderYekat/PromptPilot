@@ -603,7 +603,6 @@ def _render_planner_prompt(workflow: WorkflowInDB, custom_prompt: str = "") -> s
                       lambda match: _context_text(values.get(match.group(1), match.group(0))), rendered)
     if custom_prompt.strip():
         rendered += "\n\nДополнительные указания пользователя:\n" + _context_text(custom_prompt.strip())
-    rendered += "\n\nДополнительные указания пользователя:\n" + custom_prompt.strip()
     rendered += ('\nФиксация версии кандидата: ' + ('включена' if candidates.config(workflow).candidate.enabled else 'выключена')
                  + '. PROMPTPILOT_CANDIDATE_SHA/ID/REPOSITORY доступны gate только при включённой фиксации. '
                  'Не предполагай их наличие. Все роли должны использовать одну локальную папку без автоматического worktree.')
