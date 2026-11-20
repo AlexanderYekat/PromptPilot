@@ -55,16 +55,26 @@ def test_timeout_release_does_not_cancel_gate_or_allow_restart(isolated_db):
 def test_gate_receipt_is_applied_before_activity_is_released(isolated_db, monkeypatch):
     wf = isolated_db.create_workflow(WorkflowCreate(
         slug='drain-receipt', objective='gate', repository_path=str(isolated_db.DB_DIR),
-        candidate_branch='candidate'))
+        candidate_branch='candidate', config={'gate': {'enabled': False}}))
+    workflows.start_workflow(wf.id, WorkflowStartRequest(expected_version=0))
+    with isolated_db._connect(immediate=True) as conn:
+        conn.execute("UPDATE workflows SET status='gating' WHERE id=?", (wf.id,))
+        conn.execute("UPDATE workflow_rounds SET status='gating' WHERE workflow_id=?", (wf.id,))
+    wf = isolated_db.get_workflow(wf.id)
 
-    def record(workflow_id, decision):
-        assert not maintenance.begin(TOKEN)['safe_to_restart']
-        assert maintenance.status()['active_gates'][0]['workflow_id'] == workflow_id
-        return wf
+    # Check from a second transaction after settlement but before projection.
+    from promptpilot import gate_execution
+    project = gate_execution._project_settled_gate
 
-    monkeypatch.setattr(workflows, '_run_gate_commands', lambda w: object())
-    monkeypatch.setattr(workflows, 'record_gate', record)
-    assert workflows.run_gate(wf) == wf
+    def project_while_draining(execution_id):
+        result = maintenance.begin(TOKEN)
+        assert not result['safe_to_restart']
+        assert result['active_gates'][0]['workflow_id'] == wf.id
+        assert result['active_gates'][0]['state'] == 'SETTLED'
+        return project(execution_id)
+
+    monkeypatch.setattr(gate_execution, '_project_settled_gate', project_while_draining)
+    assert workflows.run_gate(wf).status.value == 'reviewing'
     assert maintenance.status()['safe_to_restart']
 
 
@@ -80,7 +90,7 @@ def test_drain_defers_automation_without_error_pause(isolated_db):
 
 def test_maintenance_api_is_token_scoped_and_blocks_resume(isolated_db):
     async def scenario():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://localhost') as client:
             response = await client.post('/api/maintenance/begin', json={'token': TOKEN})
             assert response.status_code == 200
             assert response.json()['safe_to_restart']

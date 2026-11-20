@@ -183,6 +183,31 @@ def add(prompt, file_path, priority, scheduled_at, working_dir, provider, max_re
     click.echo(click.style(f"\n{len(prompts)} task(s) added.", fg="green"))
 
 
+@cli.command("task-progress")
+@click.option('--task-id', type=int, envvar='PP_TASK_ID', required=True)
+@click.option('--started-at', envvar='PP_TASK_STARTED_AT', required=True)
+@click.option('--stage', required=True)
+@click.option('--status', type=click.Choice(['running', 'waiting', 'completed', 'failed']), default='running')
+@click.option('--passed', type=click.IntRange(min=0))
+@click.option('--failed', type=click.IntRange(min=0), default=0)
+@click.option('--skipped', type=click.IntRange(min=0), default=0)
+@click.option('--total', type=click.IntRange(min=0))
+@click.option('--wait-reason', default='')
+def task_progress_cmd(task_id, started_at, stage, status, passed, failed, skipped, total, wait_reason):
+    """Report observed progress of this running attempt to the local dashboard."""
+    from .task_progress import publish
+    if (passed is None) != (total is None):
+        raise click.ClickException('--passed and --total must be supplied together')
+    if total is None and (failed or skipped):
+        raise click.ClickException('test counters require --passed and --total')
+    tests = dict(passed=passed, failed=failed, skipped=skipped, total=total) if total is not None else None
+    try:
+        publish(task_id, started_at, stage, status, tests=tests, wait_reason=wait_reason)
+    except (OSError, ValueError, TypeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo('Progress recorded (observation only).')
+
+
 @cli.command("list")
 @click.option("-s", "--status", type=click.Choice([s.value for s in TaskStatus]), help="Filter by status")
 @click.option("-n", "--limit", default=20, help="Number of tasks to show")
@@ -642,7 +667,8 @@ def workflow_dispatch(reference, role, prompt, file_path, provider, model,
 @click.argument("reference")
 @click.option("--request", "hand_out", is_flag=True,
               help="Выдать задание сейчас (для ручного режима: workflow в queued)")
-def workflow_external(reference, hand_out):
+@click.option("--json", "as_json", is_flag=True, help="Save the assignment and its immutable submission token as JSON")
+def workflow_external(reference, hand_out, as_json):
     """Задание стадии, которую выполняют вне PromptPilot (issue #122)."""
     from . import workflows
 
@@ -653,6 +679,9 @@ def workflow_external(reference, hand_out):
     if assignment is None:
         raise click.ClickException(
             f"у текущего раунда нет внешнего задания (workflow {item.status.value})")
+    if as_json:
+        click.echo(assignment.model_dump_json(indent=2))
+        return
     click.echo(f"# {assignment.stage_code} {assignment.stage_title} · раунд "
                f"{assignment.round_no}, попытка {assignment.attempt_no} · {assignment.status.value}")
     click.echo(assignment.assignment)
@@ -665,10 +694,12 @@ def workflow_external(reference, hand_out):
 @click.option("-t", "--text", default="", help="Результат текстом")
 @click.option("--comment", default="", help="Комментарий к результату")
 @click.option("--performer", default="", help="Кто выполнил: человек или инструмент")
-def workflow_submit(reference, file_path, text, comment, performer):
+@click.option("--assignment", "assignment_path", required=True,
+              type=click.Path(exists=True, dir_okay=False), help="JSON saved with workflow external --json")
+def workflow_submit(reference, file_path, text, comment, performer, assignment_path):
     """Сдать результат внешней стадии: дальше gate и независимое ревью."""
     from . import workflows
-    from .models import WorkflowExternalResult
+    from .models import WorkflowExternalAssignment, WorkflowExternalResult
 
     if file_path:
         with open(file_path, encoding="utf-8-sig") as handle:
@@ -676,9 +707,17 @@ def workflow_submit(reference, file_path, text, comment, performer):
     if not text.strip():
         raise click.ClickException("пустой результат: -f файл или -t текст")
     item = _workflow_or_exit(reference)
+    try:
+        with open(assignment_path, encoding="utf-8-sig") as handle:
+            assignment = WorkflowExternalAssignment.model_validate_json(handle.read())
+    except (OSError, ValueError) as exc:
+        raise click.ClickException(f"Invalid assignment file: {exc}") from exc
+    if assignment.workflow_id != item.id:
+        raise click.ClickException("Assignment belongs to another workflow")
     submitted = _workflow_call_cli(workflows.submit_external_result, item.id,
                                    WorkflowExternalResult(
-                                       expected_version=item.state_version, result=text,
+                                       expected_version=assignment.expected_version, run_id=assignment.run_id,
+                                       input_sha256=assignment.input_sha256, result=text,
                                        comment=comment, performer=performer))
     advanced = workflows.advance_workflow(submitted.id)
     click.echo(f"Workflow {advanced.slug}: {advanced.status.value}")
@@ -708,6 +747,30 @@ def workflow_gate(reference, verdict, gate_id, summary, evidence):
         ),
     )
     click.echo(f"Workflow {updated.slug}: {updated.status.value}")
+
+
+@workflow_group.command("recover-gate")
+@click.argument("reference")
+@click.option("--execution-id", required=True)
+@click.option("--recovery-nonce", required=True)
+@click.option("--expected-version", required=True, type=click.IntRange(min=0))
+@click.option("--reason", required=True)
+@click.option("--acknowledge-gate-effects-reviewed", is_flag=True, required=True,
+              help="I checked that old processes stopped and reviewed effects/checkout. "
+                   "The server cannot verify this acknowledgement.")
+def workflow_recover_gate(reference, execution_id, recovery_nonce, expected_version,
+                          reason, acknowledge_gate_effects_reviewed):
+    """Resolve one UNKNOWN execution and await a fresh gate, without spawning."""
+    from .gate_execution import recover_unknown_gate
+    from .models import WorkflowGateRecovery
+
+    item = _workflow_or_exit(reference)
+    updated = _workflow_call_cli(recover_unknown_gate, item.id, WorkflowGateRecovery(
+        execution_id=execution_id, recovery_nonce=recovery_nonce,
+        expected_version=expected_version, reason=reason,
+        acknowledge_gate_effects_reviewed=acknowledge_gate_effects_reviewed,
+    ))
+    click.echo(f"Workflow {updated.slug}: {updated.status.value}; next advance starts a new gate")
 
 
 @workflow_group.command("review")
@@ -975,54 +1038,93 @@ def flows_add(flow_name, title, text, file_path):
     click.echo(f"Заявка #{item['id']} заведена; её поведёт `pp flows run`.")
 
 
-def _flow_decision(item_id, decision, note):
+def _flow_version(item_id, observed):
+    from . import flows
+    if observed is not None:
+        return observed
+    item = _flow_call_cli(flows.get_item, item_id)
+    if item is None:
+        raise click.ClickException("Flow item not found")
+    return item["version"]
+
+
+def _flow_decision(item_id, decision, note, observed):
     from . import flows
 
-    item = _flow_call_cli(flows.decide, item_id, decision, note, "cli")
+    item = _flow_call_cli(flows.decide, item_id, decision, note, "cli",
+                          expected_version=_flow_version(item_id, observed))
     click.echo(_flow_line(item))
 
 
 @flows_group.command("approve")
 @click.argument("item_id", type=int)
 @click.option("--note", default="", help="Указание к решению — попадёт в следующие шаги")
-def flows_approve(item_id, note):
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+def flows_approve(item_id, note, expected_version):
     """Одобрить согласование, которого ждёт заявка."""
-    _flow_decision(item_id, "approve", note)
+    _flow_decision(item_id, "approve", note, expected_version)
 
 
 @flows_group.command("reject")
 @click.argument("item_id", type=int)
 @click.option("--note", default="", help="Причина")
-def flows_reject(item_id, note):
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+def flows_reject(item_id, note, expected_version):
     """Отклонить согласование, которого ждёт заявка."""
-    _flow_decision(item_id, "reject", note)
+    _flow_decision(item_id, "reject", note, expected_version)
 
 
 @flows_group.command("retry")
 @click.argument("item_id", type=int)
-def flows_retry(item_id):
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+@click.option("--confirm-command-stopped", is_flag=True, help="Only after verifying previous execution stopped")
+@click.option("--confirm-side-effect-reviewed", is_flag=True, help="Only after inspecting uncertain external delivery; retry may resend")
+@click.option("--note", default="", help="Reason for verified recovery")
+def flows_retry(item_id, expected_version, confirm_command_stopped, note, confirm_side_effect_reviewed):
     """Повторить шаг, на котором заявка остановилась (после исчерпанных повторов — ещё круг)."""
     from . import flows
 
-    click.echo(_flow_line(_flow_call_cli(flows.retry, item_id, "cli")))
+    click.echo(_flow_line(_flow_call_cli(flows.retry, item_id, "cli",
+                                          expected_version=_flow_version(item_id, expected_version),
+                                          confirm_command_stopped=confirm_command_stopped,
+                                          confirm_side_effect_reviewed=confirm_side_effect_reviewed, note=note)))
 
 
 @flows_group.command("skip")
 @click.argument("item_id", type=int)
-def flows_skip(item_id):
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+@click.option("--confirm-command-stopped", is_flag=True, help="Only after verifying previous execution stopped")
+@click.option("--confirm-side-effect-reviewed", is_flag=True, help="Only after inspecting uncertain external delivery; retry may resend")
+@click.option("--note", default="", help="Reason for verified recovery")
+def flows_skip(item_id, expected_version, confirm_command_stopped, note, confirm_side_effect_reviewed):
     """Пропустить шаг, на котором заявка остановилась."""
     from . import flows
 
-    click.echo(_flow_line(_flow_call_cli(flows.skip, item_id, "cli")))
+    click.echo(_flow_line(_flow_call_cli(flows.skip, item_id, "cli",
+                                          expected_version=_flow_version(item_id, expected_version),
+                                          confirm_command_stopped=confirm_command_stopped,
+                                          confirm_side_effect_reviewed=confirm_side_effect_reviewed, note=note)))
 
 
 @flows_group.command("cancel")
 @click.argument("item_id", type=int)
-def flows_cancel(item_id):
+@click.option("--expected-version", type=click.IntRange(min=0), default=None,
+              help="Observed version; default: fetch current state and submit with CAS")
+@click.option("--confirm-command-stopped", is_flag=True, help="Only after verifying previous execution stopped")
+@click.option("--confirm-side-effect-reviewed", is_flag=True, help="Only after inspecting uncertain external delivery; retry may resend")
+@click.option("--note", default="", help="Reason for verified recovery")
+def flows_cancel(item_id, expected_version, confirm_command_stopped, note, confirm_side_effect_reviewed):
     """Снять заявку (и остановить задачу её шага)."""
     from . import flows
 
-    click.echo(_flow_line(_flow_call_cli(flows.cancel, item_id, "cli")))
+    click.echo(_flow_line(_flow_call_cli(flows.cancel, item_id, "cli",
+                                          expected_version=_flow_version(item_id, expected_version),
+                                          confirm_command_stopped=confirm_command_stopped,
+                                          confirm_side_effect_reviewed=confirm_side_effect_reviewed, note=note)))
 
 
 @flows_group.command("run")
@@ -1161,6 +1263,16 @@ def pipelinectl(args):
     """Run the bundled project pipeline adapter."""
     from .project_pipeline import run
     raise SystemExit(run(list(args)))
+
+
+@cli.command(name="bot-vk")
+def bot_vk():
+    """Start the VK community bot (requires PP_VK_TOKEN and PP_VK_GROUP_ID)."""
+    from .bot_vk import run_vk_bot
+    try:
+        run_vk_bot()
+    except SystemExit as e:
+        raise click.ClickException(str(e))
 
 
 @cli.command()

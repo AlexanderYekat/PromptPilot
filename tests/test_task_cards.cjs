@@ -28,6 +28,7 @@ function load(start, end) {
   assert.ok(from >= 0 && to > from);
   vm.runInContext(html.slice(from, to), context);
 }
+load('function visibleResult(', '// --- Parse result text');
 load('function taskDisplayTitle(', 'function providerOptions(');
 load('function verdictIcon(', 'async function saveNote(');
 load('async function retryTask(', 'async function cancelTask(');

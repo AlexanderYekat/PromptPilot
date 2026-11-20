@@ -17,12 +17,14 @@ The rules of engagement live here once instead of in every intake script:
 
 import email
 import imaplib
+import hashlib
 import json
 import os
 import re
 import smtplib
 import subprocess
 import tempfile
+import ssl
 import time
 from email import policy
 from email.header import decode_header
@@ -34,6 +36,10 @@ from urllib.parse import quote
 
 class ConnectorError(RuntimeError):
     """The outside service refused or is unreachable; the step decides what next."""
+
+class DeliveryUncertain(ConnectorError):
+    """The server may have accepted the message; automatic resend is unsafe."""
+
 
 # Cyrillic look-alikes of Latin capitals: [КТ] typed on a Russian layout and
 # [KT] are the same marker.
@@ -101,16 +107,20 @@ def dkim_passed(msg, authserv: str, domain: str) -> bool:
     Only the header whose authserv-id is the configured server counts: a
     sender can write an Authentication-Results header of its own.
     """
-    signer = re.compile(r"header\.(?:d=|i=@?)(?:[\w-]+\.)*" + re.escape(domain) + r"\b")
+    domain = domain.strip().lower().rstrip(".")
+    if not domain:
+        return False
+    signer = re.compile(r"header\.(?:d=|i=@?)(?:[\w-]+\.)*"
+                        + re.escape(domain) + r"(?![\w.-])")
     for header in msg.get_all("Authentication-Results") or []:
         value = " ".join(str(header).split()).lower()
         server, _, results = value.partition(";")
-        if server.strip() != authserv.lower():
+        if server.strip() != authserv.strip().lower():
             continue
-        for clause in results.split(";"):
-            clause = clause.strip()
-            if clause.startswith("dkim=pass") and signer.search(clause):
-                return True
+        # The receiving server prepends its result. Never override its failure
+        # with an older header supplied in the original message.
+        return any(clause.strip().startswith("dkim=pass") and signer.search(clause.strip())
+                   for clause in results.split(";"))
     return False
 
 
@@ -212,15 +222,19 @@ def letter_request(msg, source) -> dict:
     }
 
 
+def _uid_payload(client, uid: bytes, parts: str) -> bytes | None:
+    typ, data = client.uid("fetch", uid, parts)
+    if typ != "OK":
+        raise RuntimeError("IMAP UID FETCH failed")
+    for value in data or []:
+        if isinstance(value, tuple) and len(value) > 1 and isinstance(value[1], bytes):
+            return value[1]
+    return None  # Expunged between UID SEARCH and FETCH; do not mark it seen.
+
+
 def poll_mailbox(source, seen: set, credentials: tuple[str, str], *,
                  connect=None, keep_attachments: bool = False) -> tuple[list[dict], list[str]]:
-    """New requests from the mailbox and the Message-IDs judged this time.
-
-    Nothing is marked read (BODY.PEEK). A letter seen before costs one small
-    fetch of its Message-ID; a new one is judged by its headers, and only a
-    letter that passes letter_rejection is fetched whole. Judged ids are
-    returned so the caller never judges a rejected letter again either.
-    """
+    """Use stable UIDs; sequence numbers are never durable message identity."""
     user, password = credentials
     client = (connect or _connect_imap)(source, user, password)
     requests, judged = [], []
@@ -229,20 +243,42 @@ def poll_mailbox(source, seen: set, credentials: tuple[str, str], *,
             typ, _ = client.select(folder, readonly=True)
             if typ != "OK":
                 continue
-            typ, data = client.search(None, "ALL")
-            for num in (data[0] or b"").split():
-                typ, md = client.fetch(num, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
-                probe = email.message_from_bytes(md[0][1], policy=policy.default)
-                message_id = (probe.get("Message-ID") or "").strip() or f"<{folder}-{num.decode()}>"
+            _, values = client.response("UIDVALIDITY")
+            validity = next((value.decode("ascii") for value in values or []
+                             if isinstance(value, bytes) and value.isdigit() and len(value) <= 10
+                             and 0 < int(value) < 2**32), None)
+            typ, data = client.uid("search", None, "ALL")
+            if typ != "OK":
+                raise RuntimeError("IMAP UID SEARCH failed")
+            for uid in (data[0] or b"").split():
+                if not uid.isdigit() or len(uid) > 10 or not 0 < int(uid) < 2**32:
+                    raise RuntimeError("Malformed IMAP UID")
+                raw = _uid_payload(client, uid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])")
+                if raw is None:
+                    continue
+                probe = email.message_from_bytes(raw, policy=policy.default)
+                message_id = (probe.get("Message-ID") or "").strip()
+                if not message_id:
+                    if validity is None:
+                        raise RuntimeError("IMAP server did not prove UIDVALIDITY for a message without Message-ID")
+                    identity = json.dumps([source.host.lower(), source.port, user, folder,
+                                           validity, uid.decode("ascii")],
+                                          ensure_ascii=False, separators=(",", ":"))
+                    message_id = "<imap-uid:" + hashlib.sha256(identity.encode("utf-8")).hexdigest() + ">"
                 if message_id in seen:
                     continue
-                judged.append(message_id)
-                typ, md = client.fetch(num, "(BODY.PEEK[HEADER])")
-                header = email.message_from_bytes(md[0][1], policy=policy.default)
-                if letter_rejection(header, source):
+                raw = _uid_payload(client, uid, "(BODY.PEEK[HEADER])")
+                if raw is None:
                     continue
-                typ, md = client.fetch(num, "(BODY.PEEK[])")
-                full = email.message_from_bytes(md[0][1], policy=policy.default)
+                header = email.message_from_bytes(raw, policy=policy.default)
+                if letter_rejection(header, source):
+                    judged.append(message_id)
+                    continue
+                raw = _uid_payload(client, uid, "(BODY.PEEK[])")
+                if raw is None:
+                    continue
+                full = email.message_from_bytes(raw, policy=policy.default)
+                judged.append(message_id)
                 if letter_rejection(full, source):
                     continue
                 request = letter_request(full, source)
@@ -262,7 +298,8 @@ def poll_mailbox(source, seen: set, credentials: tuple[str, str], *,
 
 def _connect_imap(source, user: str, password: str):
     imaplib.Commands["ID"] = ("AUTH", "SELECTED", "NONAUTH")
-    client = imaplib.IMAP4_SSL(source.host, source.port)
+    client = imaplib.IMAP4_SSL(source.host, source.port,
+                                ssl_context=ssl.create_default_context(), timeout=30)
     client.login(user, password)
     try:
         # Mail.ru drops clients that do not identify themselves (RFC 2971).
@@ -315,7 +352,8 @@ def write_json_feed(path: str, entries: list[dict]) -> bool:
 # --- GitLab ------------------------------------------------------------------------
 
 def _curl(cmd: list[str], data: bytes | None) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, input=data, capture_output=True, timeout=180)
+    return subprocess.run(cmd, input=data, capture_output=True, timeout=180,
+                          creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
 
 
 def gitlab_request(connection, method: str, path: str, payload: dict | None = None):
@@ -366,7 +404,19 @@ def gitlab_issues(connection, source) -> list[dict]:
     query = "state=opened&per_page=100&order_by=created_at&sort=asc"
     if source.labels:
         query += "&labels=" + quote(",".join(source.labels), safe=",")
-    issues = gitlab_request(connection, "GET", f"/issues?{query}")
+    issues = []
+    deadline = time.monotonic() + 300
+    for page in range(1, 101):
+        if time.monotonic() > deadline:
+            raise ConnectorError("GitLab intake time budget exhausted; narrow the input labels before retrying")
+        batch = gitlab_request(connection, "GET", f"/issues?{query}&page={page}")
+        if not isinstance(batch, list):
+            raise ConnectorError("GitLab issue listing is not a list")
+        issues.extend(batch)
+        if len(batch) < 100:
+            break
+    else:
+        raise ConnectorError("GitLab intake exceeds 100 pages; narrow the input labels before retrying")
     requests = []
     for issue in issues if isinstance(issues, list) else []:
         labels = issue.get("labels") or []
@@ -467,15 +517,21 @@ def send_reply(source, request: dict, *, text: str, subject: str, smtp_host: str
         message["References"] = message_id
     message.set_content(text.strip() + "\n")
     factory = smtp_factory or smtplib.SMTP_SSL
-    last_error = None
-    for attempt in range(2):  # mail.ru turns automation away in waves
-        try:
-            with factory(smtp_host, smtp_port, timeout=30) as smtp:
-                smtp.login(user, password)
-                smtp.send_message(message)
-            return recipient
-        except (OSError, smtplib.SMTPException) as exc:
-            last_error = exc
-            if attempt == 0:
-                time.sleep(5)
-    raise ConnectorError(f"SMTP: {type(last_error).__name__}: {last_error}")
+    sending = False
+    accepted = False
+    try:
+        with factory(smtp_host, smtp_port, timeout=30, context=ssl.create_default_context()) as smtp:
+            smtp.login(user, password)
+            sending = True
+            smtp.send_message(message)
+            accepted = True
+        return recipient
+    except (OSError, smtplib.SMTPException) as exc:
+        if accepted:
+            return recipient  # A failed QUIT cannot retract the accepted DATA.
+        definitive = isinstance(exc, (smtplib.SMTPRecipientsRefused,
+                                      smtplib.SMTPSenderRefused, smtplib.SMTPDataError))
+        error = f"SMTP: {type(exc).__name__}: {exc}"
+        if sending and not definitive:
+            raise DeliveryUncertain(error) from exc
+        raise ConnectorError(error) from exc

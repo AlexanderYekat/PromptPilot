@@ -20,7 +20,7 @@ from promptpilot.models import (
 def post(workflow, *, resume=True, note="", path="human-input"):
     async def send():
         async with httpx.AsyncClient(
-            transport=httpx.ASGITransport(app=app), base_url="http://testserver"
+            transport=httpx.ASGITransport(app=app), base_url="http://localhost"
         ) as client:
             return await client.post(f"/api/workflows/{workflow.id}/{path}", json={
                 "expected_version": workflow.state_version,

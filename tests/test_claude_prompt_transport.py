@@ -12,22 +12,28 @@ from promptpilot.models import TaskCreate
 
 
 @pytest.mark.parametrize("provider", ["claude", "claude-z"])
+@pytest.mark.parametrize("restricted", [False, True])
 def test_claude_prompt_uses_stdin_with_model_effort_and_resume(
-        provider, tmp_path, monkeypatch):
+        provider, tmp_path, monkeypatch, restricted):
     monkeypatch.setattr(config, "DB_DIR", tmp_path)
     prompt = 'Прочитай документы\n"quoted" & %PATH% <tag>\n' * 2000
     command = config.build_cmd(
         provider, prompt, model="opus", effort="high", session_id="session-1",
-        rights="read", guard=False,
+        rights="read" if restricted else None, skip_permissions=not restricted,
+        guard=False,
     )
 
     assert config.load_providers()[provider]["prompt_stdin"] is True
     assert len(" ".join(command)) < 2000
     assert prompt not in command
     for option, value in [("--model", "opus"), ("--effort", "high"),
-                          ("--resume", "session-1"), ("--tools", "Read,Glob,Grep")]:
+                          ("--resume", "session-1")]:
         assert command[command.index(option) + 1] == value
-    assert "--restricted" in command
+    if restricted:
+        assert command[command.index("--tools") + 1] == "Read,Glob,Grep"
+        assert "--restricted" in command
+    else:
+        assert "--dangerously-skip-permissions" in command
 
 
 def fake_claude(tmp_path, monkeypatch, script):

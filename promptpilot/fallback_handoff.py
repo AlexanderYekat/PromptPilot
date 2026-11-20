@@ -119,6 +119,28 @@ def validate_health(health: dict) -> None:
     reviewing = queues["review_candidates"]
     content = queues["content_review_candidates"]
     merging = queues["merge_executable"]
+    parallel = health.get("parallel_review_candidates", [])
+    if not isinstance(parallel, list):
+        raise PipelineError("fallback parallel REVIEW allowlist is invalid")
+    content_keys = set()
+    for item in health["content_review_candidates"]:
+        depth = item.get("review_depth")
+        if type(depth) is int and depth >= 0:
+            content_keys.add((item["number"], item["head"], item["stage"], depth))
+    parallel_numbers = set()
+    for item in parallel:
+        exact = identity(item)
+        depth = item.get("review_depth")
+        if (exact["stage"] != "review" or type(depth) is not int
+                or not 0 <= depth < 2
+                or (exact["number"], exact["head"], exact["stage"], depth)
+                not in content_keys or exact["number"] in parallel_numbers):
+            raise PipelineError("fallback parallel REVIEW contradicts content backlog")
+        parallel_numbers.add(exact["number"])
+    if parallel and (owner is None or owner["stage"] not in INTEGRATION_REVIEW_STAGES):
+        raise PipelineError("fallback parallel REVIEW has no integration-review owner")
+    if owner is not None and owner["number"] in parallel_numbers:
+        raise PipelineError("fallback parallel REVIEW includes its integration owner")
     if owner is not None and owner["stage"] in INTEGRATION_REVIEW_STAGES:
         if reviewing != [owner] or merging:
             raise PipelineError("fallback integration REVIEW contradicts executable queues")
@@ -298,7 +320,7 @@ def validate_lease(lease: dict, stage: str) -> None:
                 "pipeline target reservation contradicts fallback lease")
 
 
-def gate(gh, config: dict, stage: str, lease_value: str, *, config_path=None) -> dict:
+def gate(gh, config: dict, stage: str, lease_value: str, *, config_path=None, meter=None) -> dict:
     """Fresh global scheduling gate; zero GitHub writes and no re-election."""
     from . import project_pipeline as pp
 
@@ -314,6 +336,7 @@ def gate(gh, config: dict, stage: str, lease_value: str, *, config_path=None) ->
     check_config()
     checkout = lease.get("health_checkout")
     health = pp.run_health(config, config_path=config_path,
+                          **({"meter": meter} if meter is not None else {}),
                           **({"working_dir": checkout} if checkout is not None else {}))
     check_config()  # run_health may fast-forward and reload the project config
     validate_lease(lease, stage)  # scan time counts toward expiry
@@ -332,6 +355,9 @@ def gate(gh, config: dict, stage: str, lease_value: str, *, config_path=None) ->
             "target_reservation": lease["target_reservation"],
             "pipeline_replicas": lease.get("pipeline_replicas", 1),
         }, config)
+    from .review_routing_policy import require_legacy
+    require_legacy(gh,config,int(lease['target']['number']))
+    validate_lease(lease,stage)
     return {"action": "validated", "stage": stage, "repository": lease["repository"],
             "target": lease["target"], "mutation_authorized": False,
             "reason": "fresh scheduling gate passed; full repository mutation gates still required"}

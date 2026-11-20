@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import time
 import unicodedata
 import uuid
@@ -40,9 +41,10 @@ from telegram.ext import (
     filters,
 )
 
-from . import db, epf_tools, pipeline_insights
+from . import db, epf_tools, pipeline_insights, result_files, codex_app_server, codex_bridge, codex_telegram
 from .config import (
     DEFAULT_CLI, HERDR_RENOTIFY_COOLDOWN, HERDR_WATCH, HERDR_WATCH_INTERVAL, LOG_PROMPTS,
+    ensure_herdr_launch_provider, herdr_launch_kind,
     get_provider_models, get_proxy_url, get_skills, load_machines, load_providers,
     load_providers_detailed, mask_proxy_url, pickable_providers,
     PROJECTS_ROOT, TASK_PASSWORD, EFFORT_LEVELS,
@@ -57,7 +59,7 @@ logger = logging.getLogger(__name__)
 (ASK_PASSWORD, ASK_PROMPT, ASK_PROVIDER, ASK_PRIORITY, ASK_DIR, ASK_DIR_MANUAL,
  ASK_SCHEDULE, ASK_REPLY, ASK_SKILL_ARGS, ASK_MODEL, ASK_RECURRENCE,
  ASK_HERDR_REPLY, ASK_HERDR_TARGET, ASK_MACHINE, ASK_CONFIRM, ASK_EXTRAS,
- ASK_EFFORT, ASK_LAST) = range(18)
+ ASK_EFFORT, ASK_LAST, ASK_HERDR_AGENT, ASK_DIR_CREATE) = range(20)
 
 # 1С-доработка (epf_conv): отдельная нумерация, чтобы не пересекаться
 # с состояниями мастера задач
@@ -219,7 +221,7 @@ def _task_detail_keyboard(task) -> InlineKeyboardMarkup:
         action_row.append(InlineKeyboardButton("🔁 Повторить", callback_data=f"rerun:{task.id}"))
     if action_row:
         rows.append(action_row)
-    if task.result and len(task.result) > 800:
+    if task.result or task.error:
         rows.append([InlineKeyboardButton("📄 Полный вывод", callback_data=f"full_result:{task.id}")])
     final_row = [InlineKeyboardButton("← К списку", callback_data="tasklist")]
     if status != "running":
@@ -290,6 +292,20 @@ def require_auth(func):
     return wrapper
 
 
+async def _check_task_creation_access(update: Update) -> bool:
+    """Recheck current access after awaited work, immediately before enqueue."""
+    user, chat = update.effective_user, update.effective_chat
+    if user is not None and is_authorized(user.id) and chat is not None and chat.type == "private":
+        return True
+    query = update.callback_query
+    message = update.message or (query.message if query else None)
+    if message:
+        await message.reply_text("Нет доступа. Задача не создана.")
+    elif query:
+        await query.answer("Нет доступа.", show_alert=True)
+    return False
+
+
 # Password gate for task creation (PP_TASK_PASSWORD). Entering it correctly in
 # the add-task flow authorizes the user for a while, so the skill/reply shortcuts
 # can require it too instead of silently bypassing the password.
@@ -311,8 +327,9 @@ def _pw_grant(user_id: int):
 _WIZARD_KEYS = ("new_prompt", "new_provider", "new_priority", "new_dir", "new_schedule",
                 "new_recurrence", "new_detached", "new_keep_pane", "new_model", "new_effort",
                 "new_skip_permissions", "new_skill_name", "new_herdr_target", "new_machine",
-                "new_worktree", "pw_attempts", "model_list", "herdr_targets",
+                "new_worktree", "pw_attempts", "model_list", "herdr_targets", "herdr_new_providers",
                 "last_settings", "dir_base", "dir_subs", "dir_page", "dir_hist",
+                "dir_create_base", "dir_create_path", "dir_create_token",
                 "att_media_group")
 
 
@@ -564,7 +581,7 @@ async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     icon = STATUS_ICON.get(task.status.value, "•")
     created = _local_str(task.created_at)
     completed = _local_str(task.completed_at) if task.completed_at else None
-    provider_str = _esc(task.provider) if task.provider else "claude \\(по умолчанию\\)"
+    provider_str = _esc(_provider_label(task.provider)) if task.provider else "claude \\(по умолчанию\\)"
 
     proj = _project_name(task.working_dir)
     status_ru = STATUS_RU.get(task.status.value, task.status.value)
@@ -601,7 +618,7 @@ async def cb_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text += f"\n\n*Промпт:*\n{_esc(task.prompt[:500])}"
 
     if task.result:
-        result_text = task.result.split("\n--- Meta ---")[0].strip()
+        result_text = result_files.visible_result(task.result.split("\n--- Meta ---")[0]).strip()
         if result_text:
             text += f"\n\n*Результат:*\n{_esc(result_text[:800])}"
         if "--- Meta ---" in task.result:
@@ -740,6 +757,8 @@ async def cb_rerun_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _pw_ok(query.from_user.id):
         await query.answer("Сначала введите пароль через ➕ Добавить задачу.", show_alert=True)
         return
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
     new = db.create_task(TaskCreate(
         prompt=task.prompt,
         working_dir=task.working_dir,
@@ -773,7 +792,7 @@ async def cb_full_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Вывода нет.", show_alert=True)
         return
     await query.answer()
-    content = task.result or task.error
+    content = result_files.visible_result(task.result or task.error)
     buf = io.BytesIO(content.encode("utf-8"))
     buf.name = f"task_{task_id}.md"
     await query.message.reply_document(
@@ -1483,18 +1502,26 @@ async def add_task_got_password(update: Update, context: ContextTypes.DEFAULT_TY
     return ASK_PROMPT
 
 
-def _provider_buttons(machine: str = None):
+def _provider_label(provider: str) -> str:
+    return load_providers().get(provider, {}).get("herdr_source") or provider
+
+
+def _available_providers(machine: str = None):
     if machine:
         # Availability is decided by the machine's own probe — a provider may
         # be installed there and missing here (and vice versa).
         allowed = set(load_machines().get(machine, {}).get("providers") or [])
-        providers = {n: i for n, i in load_providers().items()
-                     if n in allowed and not i.get("hidden")}
-    else:
-        providers = pickable_providers()
+        return {n: i for n, i in load_providers().items()
+                if n in allowed and not i.get("hidden")}
+    return pickable_providers()
+
+
+def _provider_buttons(machine: str = None):
+    providers = _available_providers(machine)
     row, buttons = [], []
-    for name in providers:
-        row.append(InlineKeyboardButton(name, callback_data=f"pickprov:{name}"))
+    for name, info in providers.items():
+        label = "🖥 Окна Herdr" if info.get("session_target") else name
+        row.append(InlineKeyboardButton(label, callback_data=f"pickprov:{name}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -1504,16 +1531,14 @@ def _provider_buttons(machine: str = None):
 
 
 # Which wizard choices are worth remembering between tasks. Schedule and
-# recurrence are task-specific; a herdr target names a live session.
+# recurrence are task-specific; saved herdr targets are checked before reuse.
 _LAST_FIELDS = ("new_machine", "new_provider", "new_model", "new_effort", "new_dir",
                 "new_priority", "new_skip_permissions", "new_keep_pane", "new_worktree",
-                "new_detached")
+                "new_detached", "new_herdr_target")
 
 
 def _save_last_settings(chat_id: int, context):
     ud = context.user_data
-    if ud.get("new_herdr_target"):
-        return
     try:
         db.set_setting(f"tg_last_wizard:{chat_id}",
                        json.dumps({k: ud.get(k) for k in _LAST_FIELDS}))
@@ -1530,7 +1555,12 @@ def _load_last_settings(chat_id: int) -> Optional[dict]:
 
 
 def _last_settings_line(last: dict) -> str:
-    parts = [last.get("new_provider") or f"{DEFAULT_CLI} (по умолчанию)"]
+    provider = last.get("new_provider")
+    parts = [_provider_label(provider) if provider else f"{DEFAULT_CLI} (по умолчанию)"]
+    if last.get("new_herdr_target"):
+        parts.append(f"сессия {last['new_herdr_target']}")
+    elif load_providers().get(provider, {}).get("herdr_source"):
+        parts.append("новое окно Herdr")
     if last.get("new_model"):
         parts.append(last["new_model"])
     if last.get("new_effort"):
@@ -1559,7 +1589,8 @@ async def _after_prompt(message, context: ContextTypes.DEFAULT_TYPE):
     # The user almost always runs the next task with the same provider and
     # folder — offer last time's settings before walking every step again.
     last = _load_last_settings(message.chat_id)
-    if last and not load_providers().get(last.get("new_provider") or DEFAULT_CLI, {}).get("session_target"):
+    if last and (last.get("new_herdr_target") or not load_providers().get(
+            last.get("new_provider") or DEFAULT_CLI, {}).get("session_target")):
         context.user_data["last_settings"] = last
         await message.reply_text(
             "Как в прошлый раз?\n" + _last_settings_line(last),
@@ -1645,6 +1676,7 @@ async def cb_last_use(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     last = context.user_data.pop("last_settings", None) or {}
     for key in _LAST_FIELDS:
+        context.user_data.pop(key, None)
         if key in last:
             context.user_data[key] = last[key]
     # The saved provider may be gone from providers.json by now
@@ -1653,6 +1685,18 @@ async def cb_last_use(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for key in _LAST_FIELDS:
             context.user_data.pop(key, None)
         return await _ask_machine_or_provider(query.edit_message_text, context)
+    machine = context.user_data.get("new_machine")
+    if machine and machine not in load_machines():
+        for key in _LAST_FIELDS:
+            context.user_data.pop(key, None)
+        await query.message.reply_text(
+            "Машина из прошлой задачи больше не зарегистрирована. Выберите настройки заново.")
+        return await _ask_machine_or_provider(query.edit_message_text, context)
+    if context.user_data.get("new_herdr_target"):
+        return await _confirm_herdr_target(query, context)
+    provider = context.user_data.get("new_provider") or DEFAULT_CLI
+    if load_providers().get(provider, {}).get("session_target"):
+        return await _show_herdr_targets(query, context)
     if context.user_data.get("new_worktree") and not _worktree_available(context):
         context.user_data["new_worktree"] = False
     return await _show_confirm(query.edit_message_text, context)
@@ -1747,51 +1791,18 @@ async def add_task_got_provider(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     provider = query.data.split(":", 1)[1] or None
     context.user_data["new_provider"] = provider
+    for key in ("new_herdr_target", "herdr_targets", "herdr_new_providers", "new_model", "new_effort"):
+        context.user_data.pop(key, None)
 
     if load_providers().get(provider or DEFAULT_CLI, {}).get("session_target"):
-        machine = context.user_data.get("new_machine")
-        host = _machine_remote(machine)
-        data = await _herdr_json("agent", "list", host=host)
-        agents = ((data or {}).get("result") or {}).get("agents") or []
-        agents = [a for a in agents if a.get("pane_id")]
-        if not agents:
-            # Keep the wizard (and the typed prompt) alive: let the user open
-            # a pane and tap the provider again, or pick another one.
-            where = f" на машине {machine}" if machine else ""
-            buttons = _provider_buttons(machine)
-            await query.edit_message_text(
-                f"Нет открытых herdr-сессий{where}.\n"
-                "Открой панель с агентом и выбери провайдера ещё раз:",
-                reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
-            )
-            return ASK_PROVIDER
-        ws = await _herdr_json("workspace", "list", host=host)
-        ws_labels = {w.get("workspace_id"): w.get("label") or w.get("workspace_id")
-                     for w in ((ws or {}).get("result") or {}).get("workspaces") or []}
-        multi_ws = len(set(a.get("workspace_id") for a in agents)) > 1
-        status_icon = {"blocked": "⏸", "done": "✅", "working": "🔄"}
+        return await _show_herdr_targets(query, context)
 
-        def _label(a):
-            icon = status_icon.get(a.get("agent_status"), "•")
-            what = (a.get("terminal_title_stripped") or a.get("name") or a.get("pane_id") or "")[:35]
-            wsl = ws_labels.get(a.get("workspace_id"), "")
-            return f"{icon} {wsl}: {what}" if multi_ws and wsl else f"{icon} {what}"
+    return await _ask_provider_model(query, context)
 
-        # Selection by index into a cached list: an agent name in callback_data
-        # can pass 64 bytes, and Telegram then rejects the WHOLE keyboard.
-        targets = [a.get("name") or a.get("pane_id") for a in agents]
-        context.user_data["herdr_targets"] = targets
-        buttons = [[InlineKeyboardButton(_label(a), callback_data=f"hst_i:{i}")]
-                   for i, a in enumerate(agents[:20])]
-        if len(agents) > 20:
-            buttons.append([InlineKeyboardButton(
-                f"… ещё {len(agents) - 20} — сузь список, закрыв лишние панели",
-                callback_data="hst_more")])
-        await query.edit_message_text("В какую сессию отправить промпт?",
-                                      reply_markup=InlineKeyboardMarkup(buttons))
-        return ASK_HERDR_TARGET
 
+async def _ask_provider_model(query, context):
     import asyncio
+    provider = context.user_data.get("new_provider")
     models = await asyncio.to_thread(get_provider_models, provider or DEFAULT_CLI)
     if models:
         context.user_data["model_list"] = models
@@ -1799,6 +1810,103 @@ async def add_task_got_provider(update: Update, context: ContextTypes.DEFAULT_TY
         return ASK_MODEL
 
     return await _ask_dir(query, context)
+
+
+async def _show_herdr_targets(query, context):
+    machine = context.user_data.get("new_machine")
+    host = _machine_remote(machine)
+    data = await _herdr_json("agent", "list", host=host)
+    agents = ((data or {}).get("result") or {}).get("agents") or []
+    agents = [a for a in agents if a.get("pane_id")]
+    ws_labels = {}
+    if agents:
+        ws = await _herdr_json("workspace", "list", host=host)
+        ws_labels = {w.get("workspace_id"): w.get("label") or w.get("workspace_id")
+                     for w in ((ws or {}).get("result") or {}).get("workspaces") or []}
+    multi_ws = len(set(a.get("workspace_id") for a in agents)) > 1
+    status_icon = {"blocked": "⏸", "done": "✅", "working": "🔄"}
+
+    def label(agent):
+        icon = status_icon.get(agent.get("agent_status"), "•")
+        what = (agent.get("terminal_title_stripped") or agent.get("name") or agent["pane_id"])[:35]
+        workspace = ws_labels.get(agent.get("workspace_id"), "")
+        return f"{icon} {workspace}: {what}" if multi_ws and workspace else f"{icon} {what}"
+
+    # Use indices: long agent names exceed Telegram's 64-byte callback limit.
+    context.user_data["herdr_targets"] = [a.get("name") or a["pane_id"] for a in agents]
+    buttons = [[InlineKeyboardButton("➕ Новое окно", callback_data="hst_new")]]
+    buttons += [[InlineKeyboardButton(label(a), callback_data=f"hst_i:{i}")]
+                for i, a in enumerate(agents[:20])]
+    if len(agents) > 20:
+        buttons.append([InlineKeyboardButton(
+            f"… ещё {len(agents) - 20} — сузь список, закрыв лишние панели",
+            callback_data="hst_more")])
+    buttons.append([InlineKeyboardButton(BACK_LABEL, callback_data="hst_back")])
+    text = "В какое окно Herdr отправить задачу?"
+    if not agents:
+        text = ("Нет открытых окон Herdr. Можно создать новое." if data is not None else
+                "Не удалось получить окна Herdr. Можно попробовать создать новое.")
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    return ASK_HERDR_TARGET
+
+
+def _herdr_new_choices(machine=None):
+    providers = _available_providers(machine)
+    if not any(info.get("executor") == "herdr" for info in providers.values()):
+        return {}
+    return {name: info for name, info in providers.items() if herdr_launch_kind(name, info)}
+
+
+async def cb_herdr_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    choices = _herdr_new_choices(context.user_data.get("new_machine"))
+    if not choices:
+        await query.answer("Нет доступных агентов для нового окна Herdr на этой машине.", show_alert=True)
+        return ASK_HERDR_TARGET
+    await query.answer()
+    context.user_data.pop("new_herdr_target", None)
+    context.user_data["herdr_new_providers"] = list(choices)
+    buttons = [[InlineKeyboardButton(name, callback_data=f"hnew_i:{i}")]
+               for i, name in enumerate(choices)]
+    buttons.append([InlineKeyboardButton(BACK_LABEL, callback_data="hnew_back")])
+    await query.edit_message_text("Выберите агента для нового окна Herdr:",
+                                  reply_markup=InlineKeyboardMarkup(buttons))
+    return ASK_HERDR_AGENT
+
+
+@require_auth
+async def cb_herdr_new_agent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    choices = context.user_data.get("herdr_new_providers") or []
+    idx = int(query.data.split(":")[1])
+    available = _herdr_new_choices(context.user_data.get("new_machine"))
+    if idx >= len(choices) or choices[idx] not in available:
+        await query.answer("Список агентов устарел — выберите новое окно заново.", show_alert=True)
+        return ASK_HERDR_AGENT
+    await query.answer()
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
+    try:
+        provider = ensure_herdr_launch_provider(choices[idx])
+    except (OSError, ValueError):
+        logger.exception("Не удалось настроить запуск нового окна Herdr")
+        await query.message.reply_text("Не удалось подготовить новое окно Herdr. Попробуйте ещё раз.")
+        return ASK_HERDR_AGENT
+    context.user_data["new_provider"] = provider
+    for key in ("new_herdr_target", "new_model", "new_effort", "model_list"):
+        context.user_data.pop(key, None)
+    return await _ask_provider_model(query, context)
+
+
+async def cb_herdr_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("herdr_new_providers", None)
+    if query.data == "hnew_back":
+        return await _show_herdr_targets(query, context)
+    buttons = _provider_buttons(context.user_data.get("new_machine"))
+    await query.edit_message_text("Выберите провайдера:", reply_markup=InlineKeyboardMarkup(buttons))
+    return ASK_PROVIDER
 
 
 async def add_task_got_herdr_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1813,6 +1921,23 @@ async def add_task_got_herdr_target(update: Update, context: ContextTypes.DEFAUL
         return ASK_HERDR_TARGET
     await query.answer()
     context.user_data["new_herdr_target"] = targets[idx]
+    return await _confirm_herdr_target(query, context)
+
+
+async def _confirm_herdr_target(query, context):
+    ud = context.user_data
+    target = ud["new_herdr_target"]
+    data = await _herdr_json("agent", "get", target, host=_machine_remote(ud.get("new_machine")))
+    agent = ((data or {}).get("result") or {}).get("agent") or {}
+    if not agent.get("pane_id"):
+        ud.pop("new_herdr_target", None)
+        ud.pop("new_dir", None)
+        await query.message.reply_text(
+            "Не удалось найти Herdr-сессию. Выберите окно для задачи заново.")
+        return await _show_herdr_targets(query, context)
+    # A live session owns its directory; an older wizard must not override it.
+    ud["new_dir"] = agent.get("cwd") or agent.get("foreground_cwd") or None
+    ud["new_worktree"] = False
     return await _show_confirm(query.edit_message_text, context)
 
 
@@ -1950,8 +2075,28 @@ def _manual_dir_prompt() -> str:
 
 
 def _clear_dir_nav(context):
-    for k in ("dir_base", "dir_subs", "dir_page", "dir_hist"):
+    for k in ("dir_base", "dir_subs", "dir_page", "dir_hist",
+              "dir_create_base", "dir_create_path", "dir_create_token"):
         context.user_data.pop(k, None)
+
+
+def _dir_create_buttons(context):
+    if context.user_data.get("new_machine"):
+        return []
+    return [[InlineKeyboardButton("➕ Новая папка", callback_data="dir_new")]]
+
+
+def _resolve_local_dir(context, text):
+    path = os.path.expanduser(text.strip())
+    if not path:
+        raise ValueError("Введите имя папки или полный путь.")
+    if not os.path.isabs(path):
+        if os.path.splitdrive(path)[0]:
+            raise ValueError("Укажите полный путь с диском или имя новой папки.")
+        base = (context.user_data.get("dir_create_base") or context.user_data.get("dir_base")
+                or PROJECTS_ROOT or os.path.expanduser("~"))
+        path = os.path.join(base, path)
+    return os.path.abspath(path)
 
 
 def _dir_screen(context):
@@ -1997,6 +2142,7 @@ def _dir_screen(context):
         buttons.append(nav)
     if not at_root:
         buttons.append([InlineKeyboardButton(BACK_LABEL, callback_data="dir_up")])
+    buttons += _dir_create_buttons(context)
     buttons.append([
         InlineKeyboardButton("✏️ Ввести вручную", callback_data="dir:__manual__"),
         InlineKeyboardButton("⏭ Пропустить", callback_data="dir:__skip__"),
@@ -2036,6 +2182,7 @@ async def _ask_dir(query, context):
         context.user_data["dir_hist"] = hist
         buttons = [[InlineKeyboardButton(_short_dir(d), callback_data=f"dirh:{i}")]
                    for i, d in enumerate(hist)]
+        buttons += _dir_create_buttons(context)
         buttons.append([
             InlineKeyboardButton("✏️ Ввести вручную", callback_data="dir:__manual__"),
             InlineKeyboardButton("⏭ Пропустить", callback_data="dir:__skip__"),
@@ -2046,7 +2193,9 @@ async def _ask_dir(query, context):
         )
         return ASK_DIR
 
-    await query.edit_message_text(_manual_dir_prompt())
+    rows = _dir_create_buttons(context)
+    await query.edit_message_text(_manual_dir_prompt(),
+                                  reply_markup=InlineKeyboardMarkup(rows) if rows else None)
     return ASK_DIR_MANUAL
 
 
@@ -2140,25 +2289,115 @@ async def add_task_got_dir_btn(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text("Директория: не указана")
         return await _after_dir_from_query(query, context)
     if value == "__manual__":
-        await query.edit_message_text(_manual_dir_prompt())
+        for key in ("dir_create_base", "dir_create_path", "dir_create_token"):
+            context.user_data.pop(key, None)
+        rows = _dir_create_buttons(context)
+        await query.edit_message_text(_manual_dir_prompt(),
+                                      reply_markup=InlineKeyboardMarkup(rows) if rows else None)
         return ASK_DIR_MANUAL
     return await _pick_dir(query, context, os.path.join(PROJECTS_ROOT, value))
 
 
 async def add_task_got_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     path = os.path.expanduser(update.message.text.strip())
+    for key in ("dir_create_path", "dir_create_token"):
+        context.user_data.pop(key, None)
     # A local path can be checked right now — a typo caught here beats a task
     # that fails at start. A remote machine's filesystem is not ours to ask.
-    if path and not context.user_data.get("new_machine") and not os.path.isdir(path):
-        await update.message.reply_text(
-            f"Каталог не найден: {path}\nВведите ещё раз или /skip:")
-        return ASK_DIR_MANUAL
+    if path and not context.user_data.get("new_machine"):
+        try:
+            path = _resolve_local_dir(context, path)
+        except ValueError as exc:
+            await update.message.reply_text(str(exc))
+            return ASK_DIR_MANUAL
+        if not os.path.isdir(path):
+            if os.path.exists(path):
+                await update.message.reply_text(f"Это файл, а нужна папка: {path}\nВведите другой путь:")
+                return ASK_DIR_MANUAL
+            token = uuid.uuid4().hex[:12]
+            context.user_data.update(dir_create_path=path, dir_create_token=token)
+            await update.message.reply_text(
+                f"Каталог не найден: {path}\nСоздать его и использовать для задачи?",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📁 Создать и выбрать", callback_data=f"dir_make:{token}")],
+                    [InlineKeyboardButton("✏️ Другой путь", callback_data="dir:__manual__")],
+                ]))
+            return ASK_DIR_MANUAL
     context.user_data["new_dir"] = path or None
+    _clear_dir_nav(context)
     return await _after_dir(update, context)
+
+
+async def cb_dir_create_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if context.user_data.get("new_machine"):
+        await query.answer("Создание папки доступно для локальной машины.", show_alert=True)
+        return None
+    await query.answer()
+    base = context.user_data.get("dir_base") or PROJECTS_ROOT or os.path.expanduser("~")
+    context.user_data["dir_create_base"] = base
+    context.user_data.pop("dir_create_path", None)
+    context.user_data.pop("dir_create_token", None)
+    await query.edit_message_text(
+        f"Новая папка внутри: {base}\nВведите имя папки или полный путь:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(BACK_LABEL, callback_data="dir_create_back")]]))
+    return ASK_DIR_CREATE
+
+
+async def _create_and_pick_dir(update, context, path, retry_state):
+    import asyncio
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
+    query = update.callback_query or _MsgSend(update.message)
+    if context.user_data.get("new_machine"):
+        await query.message.reply_text("Создание папки доступно для локальной машины.")
+        return retry_state
+    try:
+        await asyncio.to_thread(os.makedirs, path, exist_ok=True)
+    except (OSError, ValueError) as exc:
+        await query.message.reply_text(f"Не удалось создать папку: {exc}\nВведите другой путь:")
+        return retry_state
+    return await _pick_dir(query, context, path)
+
+
+@require_auth
+async def add_task_got_new_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        path = _resolve_local_dir(context, update.message.text)
+    except ValueError as exc:
+        await update.message.reply_text(str(exc))
+        return ASK_DIR_CREATE
+    return await _create_and_pick_dir(update, context, path, ASK_DIR_CREATE)
+
+
+@require_auth
+async def cb_dir_create_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    path = context.user_data.get("dir_create_path")
+    token = query.data.split(":", 1)[1]
+    if not path or token != context.user_data.get("dir_create_token"):
+        await query.answer("Этот путь уже не выбран. Введите путь заново.", show_alert=True)
+        return ASK_DIR_MANUAL
+    await query.answer()
+    return await _create_and_pick_dir(update, context, path, ASK_DIR_MANUAL)
+
+
+async def cb_dir_create_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    for key in ("dir_create_base", "dir_create_path", "dir_create_token"):
+        context.user_data.pop(key, None)
+    if context.user_data.get("dir_base"):
+        text, kb = _dir_screen(context)
+        await query.edit_message_text(text, reply_markup=kb)
+        return ASK_DIR
+    return await _ask_dir(query, context)
 
 
 async def add_task_skip_dir(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_dir"] = None
+    _clear_dir_nav(context)
     return await _after_dir(update, context)
 
 
@@ -2195,7 +2434,8 @@ def _wizard_summary(context) -> str:
     prompt = ud.get("new_prompt", "")
     if len(prompt) > 200:
         prompt = prompt[:200] + "…"
-    prov = ud.get("new_provider") or f"{DEFAULT_CLI} (по умолчанию)"
+    provider = ud.get("new_provider")
+    prov = _provider_label(provider) if provider else f"{DEFAULT_CLI} (по умолчанию)"
     model = f" · {ud['new_model']}" if ud.get("new_model") else ""
     if ud.get("new_effort"):
         model += f" · эффорт {ud['new_effort']}"
@@ -2214,6 +2454,8 @@ def _wizard_summary(context) -> str:
     if ud.get("new_herdr_target"):
         lines.append(f"🖥 Сессия: {ud['new_herdr_target']}")
     else:
+        if load_providers().get(provider or DEFAULT_CLI, {}).get("executor") == "herdr":
+            lines.append("🖥 Новое окно Herdr")
         lines.append(f"📂 {ud.get('new_dir') or 'директория не указана'}")
     sched = ud.get("new_schedule")
     when = _local_str(sched) if sched else "сейчас"
@@ -2261,6 +2503,7 @@ async def _show_confirm(send, context):
     return ASK_CONFIRM
 
 
+@require_auth
 async def cb_wiz_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2280,7 +2523,7 @@ async def cb_wiz_run(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_reply_markup(reply_markup=None)
     except BadRequest:
         pass
-    return await _finish_add_task_from_query(query, context)
+    return await _finish_add_task_from_query(update, context)
 
 
 async def cb_wiz_drop_attachments(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2297,7 +2540,10 @@ async def cb_wiz_drop_machine(update: Update, context: ContextTypes.DEFAULT_TYPE
     ud.pop("new_machine", None)
     ud.pop("new_herdr_target", None)
     # Провайдер выбирался из списка той машины — локально его может не быть
-    if ud.get("new_provider") and ud["new_provider"] not in pickable_providers():
+    provider = ud.get("new_provider")
+    source = load_providers().get(provider, {}).get("herdr_source")
+    if provider and provider not in pickable_providers() and not (
+            source and source in _herdr_new_choices()):
         ud.pop("new_provider", None)
         ud.pop("new_model", None)
         ud.pop("new_effort", None)
@@ -2593,8 +2839,11 @@ async def add_task_got_recurrence(update: Update, context: ContextTypes.DEFAULT_
     return await _show_extras(update.message.reply_text, context)
 
 
-async def _finish_add_task_from_query(query, context):
+async def _finish_add_task_from_query(update, context):
     """Called after inline button — uses query.message for reply."""
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
+    query = update.callback_query
     from .models import TaskCreate
     _save_last_settings(query.message.chat_id, context)
     prompt = context.user_data.pop("new_prompt", "")
@@ -2640,7 +2889,7 @@ async def _finish_add_task_from_query(query, context):
     att_str = f"\nВложения: {len(attachments)}" if attachments else ""
     await query.message.reply_text(
         f"✅ Задача #{task.id} добавлена!\n"
-        f"Провайдер: {provider or f'{DEFAULT_CLI} (по умолчанию)'}\n"
+        f"Провайдер: {_provider_label(provider) if provider else f'{DEFAULT_CLI} (по умолчанию)'}\n"
         f"Директория: {working_dir or 'не указана'}{wt_str}{att_str}\n"
         f"Запуск: {sched_str}{skip_str}{detached_str}",
         reply_markup=_main_menu(),
@@ -2722,6 +2971,7 @@ async def cb_reply_task_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ASK_REPLY
 
 
+@require_auth
 async def reply_got_password(update: Update, context: ContextTypes.DEFAULT_TYPE):
     entered = update.message.text.strip()
     try:
@@ -2750,13 +3000,24 @@ async def reply_got_password(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ASK_REPLY
 
 
+@require_auth
 async def reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     prompt = update.message.text
     parent_id = context.user_data.pop("reply_task_id", None)
     session_id = context.user_data.pop("reply_session_id", None)
     provider = context.user_data.pop("reply_provider", None)
     working_dir = context.user_data.pop("reply_dir", None)
-    skip_permissions = context.user_data.pop("reply_skip_permissions", False)
+    context.user_data.pop("reply_skip_permissions", None)  # legacy dialog data
+    parent = db.get_task(parent_id) if parent_id is not None else None
+    if parent is None:
+        await update.message.reply_text(
+            "Исходная задача больше недоступна. Продолжение не создано.",
+            reply_markup=_main_menu(),
+        )
+        return ConversationHandler.END
+
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
 
     task = db.create_task(TaskCreate(
         prompt=prompt,
@@ -2765,7 +3026,8 @@ async def reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         priority=5,
         session_id=session_id,
         parent_task_id=parent_id,
-        skip_permissions=skip_permissions,
+        skip_permissions=parent.skip_permissions,
+        rights=parent.rights,
         tg_chat_id=update.effective_chat.id,
     ))
 
@@ -3076,7 +3338,7 @@ def _machine_remote(machine: str):
     return machine_remote(m) if m and m.get("host") else None
 
 
-async def _herdr_cli(*args, host=None, timeout=15):
+async def _herdr_cli(*args, host=None, timeout=15, allow_error=False):
     """Run a herdr CLI command (locally or on `host`). Raw stdout or None."""
     import asyncio
     from .herdr_exec import herdr_argv
@@ -3089,17 +3351,19 @@ async def _herdr_cli(*args, host=None, timeout=15):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             stdin=asyncio.subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except (FileNotFoundError, OSError, asyncio.TimeoutError):
         return None
-    if proc.returncode != 0:
+    if proc.returncode != 0 and not allow_error:
         return None
     return (out or err or b"").decode("utf-8", "replace")
 
 
-async def _herdr_json(*args, host=None, timeout=15):
-    raw = await _herdr_cli(*args, host=host, timeout=timeout)
+async def _herdr_json(*args, host=None, timeout=15, allow_error=False):
+    options = {'allow_error': True} if allow_error else {}
+    raw = await _herdr_cli(*args, host=host, timeout=timeout, **options)
     if raw is None:
         return None
     try:
@@ -3129,6 +3393,11 @@ def _herdr_blocked_keyboard(ref: str) -> list:
     ]
 
 
+def _herdr_done_keyboard(ref: str):
+    return [[InlineKeyboardButton("\U0001f4fa \u042d\u043a\u0440\u0430\u043d", callback_data=f"hd_screen:{ref}"),
+             InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}")]]
+
+
 def _screen_chrome(line: str) -> bool:
     """Terminal-UI furniture worth dropping on a phone: the full-width rules
     Claude Code draws around its input box eat a third of the message and wrap
@@ -3137,6 +3406,132 @@ def _screen_chrome(line: str) -> bool:
     return (s.count("─") >= 8 or s == "❯"
             or "? for shortcuts" in s or "· /effort" in s
             or "Enter to select" in s or "Esc to cancel" in s)
+
+
+def _codex_question_pending(text: str) -> bool:
+    return bool(re.search(r'^\s*(?:[?❓•·]\s*)?[1-9]\d*\s+questions?\b', text, re.I | re.M)
+                and re.search(r'^\s*(?:[•·]\s*)?queued follow-up inputs\b|^\s*shift\s*\+\s*\S+\s+to answer',
+                              text, re.I | re.M))
+
+
+def _question_keyboard(ref):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton('↑ Предыдущий', callback_data=f'hd_qkey:up:{ref}'),
+         InlineKeyboardButton('↓ Следующий', callback_data=f'hd_qkey:down:{ref}')],
+        [InlineKeyboardButton('✓ Выбрать', callback_data=f'hd_qkey:enter:{ref}'),
+         InlineKeyboardButton('Закрыть', callback_data=f'hd_qkey:esc:{ref}')],
+        [InlineKeyboardButton('Обновить вопрос', callback_data=f'hd_qkey:refresh:{ref}')],
+    ])
+
+
+def _question_text(raw):
+    lines = [line.rstrip() for line in raw.splitlines() if not _screen_chrome(line)]
+    return '\n'.join(lines).strip() or 'Вопрос больше не отображается.'
+
+
+def _question_preview(raw):
+    # Codex opens the dialog at the bottom of the viewport. Keep that region
+    # in the preview; the full text above remains the stale-button identity.
+    return _question_text(raw)[-3500:]
+
+
+async def _show_herdr_question(query, context, ref, pane, host):
+    import hashlib
+    raw = await _herdr_cli('agent', 'read', pane, '--source', 'visible', '--format', 'text', host=host)
+    if raw is None:
+        await query.message.reply_text('Не удалось прочитать вопрос. Нажмите «Обновить вопрос».',
+                                       reply_markup=_question_keyboard(ref))
+        return
+    context.user_data.setdefault('herdr_question_views', {})[ref] = {
+        'digest': hashlib.sha256(_question_text(raw).encode()).hexdigest(),
+        'endpoint': list(host) if host else None, 'expires_at': time.time() + 600,
+    }
+    await query.message.reply_text('❓ Вопрос агента\n\n' + _question_preview(raw),
+                                   reply_markup=_question_keyboard(ref))
+
+
+@require_auth
+async def cb_herdr_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    ref = query.data.split(':', 1)[1]
+    target = await _hd_ref_or_alert(query, ref)
+    if target is None:
+        return
+    machine, pane, host = target
+    snapshot = None
+    if codex_telegram.enabled():
+        data = await _herdr_json("agent", "get", pane, host=host)
+        agent = ((data or {}).get("result") or {}).get("agent") or {}
+        snapshot = await codex_telegram.view(agent, host)
+    if snapshot and snapshot[3]:
+        if not await _check_herdr_reply_access(update):
+            return
+        await query.answer()
+        await codex_telegram.show_questions(update, snapshot[0], snapshot[3], ref, pane, machine, host)
+        return
+    raw = await _herdr_cli('agent', 'read', pane, '--source', 'visible', '--format', 'text', host=host)
+    if not raw or not _codex_question_pending(raw):
+        await query.answer('Свёрнутого вопроса уже нет. Обновите окно.', show_alert=True)
+        return
+    if not await _check_herdr_reply_access(update):
+        return
+    result = await _herdr_json('agent', 'send-keys', pane, 'shift+up', host=host)
+    if not result or not result.get('result'):
+        await query.answer('Не удалось открыть вопрос.', show_alert=True)
+        return
+    await query.answer('Открываю вопрос')
+    await asyncio.sleep(0.25)
+    await _show_herdr_question(query, context, ref, pane, host)
+
+
+@require_auth
+async def cb_herdr_question_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    import hashlib
+    query = update.callback_query
+    _, key, ref = query.data.split(':', 2)
+    if key not in {'up', 'down', 'enter', 'esc', 'refresh'}:
+        await query.answer('Неизвестное действие.', show_alert=True)
+        return
+    target = await _hd_ref_or_alert(query, ref)
+    if target is None:
+        return
+    _, pane, host = target
+    view = context.user_data.get('herdr_question_views', {}).get(ref)
+    if (not view or time.time() > view['expires_at']
+            or view['endpoint'] != (list(host) if host else None)):
+        await query.answer('Откройте вопрос заново: эти кнопки устарели.', show_alert=True)
+        return
+    raw = await _herdr_cli('agent', 'read', pane, '--source', 'visible', '--format', 'text', host=host)
+    if raw is None:
+        await query.answer('Не удалось прочитать текущий вопрос.', show_alert=True)
+        return
+    if hashlib.sha256(_question_text(raw).encode()).hexdigest() != view['digest']:
+        await query.answer('Содержимое изменилось. Проверьте обновлённый вопрос.')
+        await _show_herdr_question(query, context, ref, pane, host)
+        return
+    if not await _check_herdr_reply_access(update):
+        return
+    if key != 'refresh':
+        result = await _herdr_json('agent', 'send-keys', pane, key, host=host)
+        if not result or not result.get('result'):
+            await query.answer('Не удалось передать выбор.', show_alert=True)
+            return
+        await asyncio.sleep(0.25)
+    await query.answer()
+    if key in {'enter', 'esc'}:
+        context.user_data['herdr_question_views'].pop(ref, None)
+        await query.message.reply_text('Выбор передан агенту.' if key == 'enter' else 'Вопрос закрыт.')
+        return
+    await _show_herdr_question(query, context, ref, pane, host)
+
+
+async def _dispatch_question_callback(update, context):
+    from telegram.ext import ApplicationHandlerStop
+    handler = cb_herdr_question if update.callback_query.data.startswith('hd_question:') else cb_herdr_question_key
+    await handler(update, context)
+    # These controls also work during a wizard; don't let a later group treat
+    # the same click as an unknown/stale callback.
+    raise ApplicationHandlerStop
 
 
 async def _herdr_screen_tail(pane_id: str, machine: str = "", lines_n: int = 10) -> str:
@@ -3149,7 +3544,15 @@ async def _herdr_screen_tail(pane_id: str, machine: str = "", lines_n: int = 10)
     lines = [l.rstrip() for l in raw.splitlines() if not _screen_chrome(l)]
     while lines and not lines[-1]:
         lines.pop()
-    tail = lines[-lines_n:]
+    # Keep the pending-question summary even when terminal padding or a long
+    # footer would push it outside the usual preview. Its presence controls
+    # the Open question button, so clipping it silently removes that action.
+    if _codex_question_pending(raw):
+        question = next(line for line in raw.splitlines()
+                        if re.search(r'\b[1-9]\d*\s+questions?\b', line, re.I))
+        return "Queued follow-up inputs\n" + question[:120] + "\nОткройте вопрос кнопкой ниже."
+    else:
+        tail = lines[-lines_n:]
     # An agent that cleared its screen leaves the tail as blank padding; drop
     # the leading gap and collapse runs so the card isn't mostly whitespace.
     out = []
@@ -3172,12 +3575,12 @@ async def _herdr_notify(bot, pane_id: str, status: str, agent: dict, machine: st
         buttons = _herdr_blocked_keyboard(ref)
         if tail:
             text += f"\n\n{tail}"
+        if _codex_question_pending(tail):
+            buttons = [[InlineKeyboardButton('❓ Открыть вопрос', callback_data=f'hd_question:{ref}')],
+                       [InlineKeyboardButton('📺 Экран', callback_data=f'hd_screen:{ref}')]]
     else:
         text = f"✅ herdr{where}: {label} в панели {pane_id} завершил работу"
-        buttons = [
-            [InlineKeyboardButton("📺 Экран", callback_data=f"hd_screen:{ref}"),
-             InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}")],
-        ]
+        buttons = _herdr_done_keyboard(ref)
     title = (agent.get("terminal_title_stripped") or "").strip()
     if title and status != "blocked":
         text += f"\n{title[:120]}"
@@ -3196,8 +3599,9 @@ def _is_local_host(host: str) -> bool:
     """A machine whose ssh host is this very box talks to the SAME herdr
     server, so polling it duplicates every local pane — twice in the windows
     list, and two identical notifications per blocked dialog."""
+    import socket
     h = (host or "").split("@")[-1].strip().lower()
-    return h in _LOCAL_HOSTS or h == os.uname().nodename.lower()
+    return h in _LOCAL_HOSTS or h == socket.gethostname().lower()
 
 
 def _herdr_watch_targets():
@@ -3224,13 +3628,51 @@ async def _herdr_watch_loop(bot):
             logger.warning("herdr watch tick упал: %s", e)
 
 
+async def _native_file_watch_loop():
+    """Requested reply files still work when general agent notices are disabled."""
+    while True:
+        await asyncio.sleep(HERDR_WATCH_INTERVAL)
+        try:
+            for machine, host in _herdr_watch_targets():
+                source = _herdr_watch_source(machine, host)
+                if not db.has_setting_prefix('result-files.native.' + source + '.'):
+                    continue
+                data = await _herdr_json('agent', 'list', host=host)
+                agents = ((data or {}).get('result') or {}).get('agents')
+                if isinstance(agents, list):
+                    db.queue_native_file_manifests(source, agents)
+        except Exception as exc:
+            logger.warning('Reply-file watch failed: %s', exc)
+
+
+def _herdr_completion_sequence(agent):
+    value = agent.get("completion_seq")
+    return agent.get("state_change_seq") if value is None else value
+
+
+def _herdr_watch_source(machine, host):
+    import hashlib
+    return hashlib.sha256(json.dumps([machine, host], sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _herdr_completion_notice(machine, pane, agent):
+    where = f" \u043d\u0430 {machine}" if machine else ""
+    title = str(agent.get("terminal_title_stripped") or "").strip()[:120]
+    return f"\u2705 herdr{where}: {_herdr_agent_label(agent)} \u0432 \u043f\u0430\u043d\u0435\u043b\u0438 {pane} \u0437\u0430\u0432\u0435\u0440\u0448\u0438\u043b \u0440\u0430\u0431\u043e\u0442\u0443" + (f"\n{title}" if title else "")
+
+
 async def _herdr_watch_tick(bot, notified, initialized):
         seen = set()
         for machine, host in _herdr_watch_targets():
             data = await _herdr_json("agent", "list", host=host)
             if data is None:
                 continue  # herdr not installed / server down / ssh — stay quiet
-            agents = ((data.get("result") or {}).get("agents")) or []
+            agents = (data.get("result") or {}).get("agents")
+            if not isinstance(agents, list):
+                continue  # A failed/unknown response cannot establish a baseline.
+
+            db.queue_native_file_manifests(_herdr_watch_source(machine, host), agents)
+
             current = {}
             for a in agents:
                 pane = a.get("pane_id")
@@ -3238,6 +3680,16 @@ async def _herdr_watch_tick(bot, notified, initialized):
                 if not pane or name.startswith("pp-t"):
                     continue  # PromptPilot's own tasks notify via the worker
                 current[pane] = a
+            completions = [
+                {"pane": pane, "terminal_id": agent.get("terminal_id"),
+                 "agent_session": agent.get("agent_session"),
+                 "sequence": _herdr_completion_sequence(agent),
+                 "message": _herdr_completion_notice(machine, pane, agent)}
+                for pane, agent in current.items()
+                if agent.get("agent_status") == "done" and _herdr_completion_sequence(agent) is not None
+            ]
+            db.queue_herdr_completions(_herdr_watch_source(machine, host), completions,
+                                      [int(chat) for chat in list_authorized()], machine=machine, present_panes=list(current))
             seen.update((machine, pane) for pane in current)
             now = time.monotonic()
             for pane, a in current.items():
@@ -3245,9 +3697,10 @@ async def _herdr_watch_tick(bot, notified, initialized):
                 status = a.get("agent_status")
                 if status in ("blocked", "done"):
                     prev = notified.get(key)  # (status, screen tail, seen at, completion seq)
-                    completion_seq = (
-                        a.get("completion_seq") or a.get("state_change_seq")
-                    ) if status == "done" else None
+                    completion_seq = _herdr_completion_sequence(a) if status == "done" else None
+                    if status == "done" and completion_seq is not None:
+                        notified[key] = (status, "", now, completion_seq)
+                        continue  # Delivery was durably queued with the cursor above.
                     if status == "done" and machine not in initialized:
                         # On bot startup, old kept sessions are already done.
                         # Remember them without re-announcing every task.
@@ -3366,16 +3819,73 @@ async def cb_herdr_screen(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 @require_auth
+async def cb_herdr_output(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Export available pane history, including sessions without a task row."""
+    import io
+    query = update.callback_query
+    target = await _hd_ref_or_alert(query, query.data.split(":", 1)[1])
+    if target is None:
+        return
+    machine, pane, host = target
+    await query.answer()
+    snapshot = None
+    if codex_telegram.enabled():
+        data = await _herdr_json("agent", "get", pane, host=host)
+        agent = ((data or {}).get("result") or {}).get("agent") or {}
+        snapshot = await codex_telegram.view(agent, host)
+    if snapshot:
+        result = next((codex_bridge.final_text(turn) for turn in snapshot[2]
+                       if turn.get("status") == "completed" and codex_bridge.final_text(turn)), "")
+        if result:
+            document = io.BytesIO(result.encode("utf-8"))
+            document.name = "codex_result.md"
+            await query.message.reply_document(document=document, caption="Последний завершённый ответ Codex")
+            return
+    raw = await _herdr_cli("agent", "read", pane, "--source", "recent-unwrapped",
+                           "--lines", "1000", "--format", "text", host=host, timeout=30)
+    if not raw:
+        await query.message.reply_text("Вывода пока нет или окно уже закрыто.")
+        return
+    buf = io.BytesIO(raw.encode("utf-8"))
+    buf.name = "herdr_" + re.sub(r"[^\w-]", "_", pane) + ".txt"
+    await query.message.reply_document(
+        document=buf,
+        caption=f"Вывод окна {pane}{f' ({machine})' if machine else ''}. "
+                "Доступная история терминала: до 1000 строк.",
+    )
+
+
+async def _check_herdr_reply_access(update: Update) -> bool:
+    """Use current private-chat authorization, including after awaited callbacks."""
+    user, chat = update.effective_user, update.effective_chat
+    if user is not None and is_authorized(user.id) and chat is not None and chat.type == "private":
+        return True
+    query = update.callback_query
+    message = update.message or (query.message if query else None)
+    if message:
+        await message.reply_text("Нет доступа. Команда не отправлена.")
+    elif query:
+        await query.answer("Нет доступа.", show_alert=True)
+    return False
+
+
 async def cb_herdr_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("herdr_reply_pane", None)
+    context.user_data.pop("herdr_reply_host", None)
+    context.user_data.pop("herdr_reply_machine", None)
+    if not await _check_herdr_reply_access(update):
+        return ConversationHandler.END
     query = update.callback_query
     ref = await _hd_ref_or_alert(query, query.data.split(":", 1)[1])
     if ref is None:
         return ConversationHandler.END
     machine, pane, host = ref
+    await query.answer()
+    if not await _check_herdr_reply_access(update):
+        return ConversationHandler.END
     context.user_data["herdr_reply_pane"] = pane
     context.user_data["herdr_reply_host"] = host
     context.user_data["herdr_reply_machine"] = machine
-    await query.answer()
     where = f" на {machine}" if machine else ""
     await query.message.reply_text(f"Текст для агента в панели {pane}{where} (или /cancel):")
     return ASK_HERDR_REPLY
@@ -3401,28 +3911,171 @@ async def _log_pane_prompt(pane: str, machine: str, host, text: str):
         logger.warning("prompt_log: запись не удалась: %s", e)
 
 
+def _native_same_terminal(before, after):
+    identity = before.get('terminal_id') or before.get('agent_session')
+    return bool(identity and identity == (after.get('terminal_id') or after.get('agent_session'))
+                and before.get('pane_id') == after.get('pane_id'))
+
+
+def _native_reply_started(before, after):
+    if not _native_same_terminal(before, after):
+        return False
+    if after.get('agent_status') == 'working' and before.get('agent_status') != 'working':
+        return True
+    old, new = before.get('completion_seq'), after.get('completion_seq')
+    return type(old) is int and type(new) is int and new > old
+
+
+async def _submit_native_reply(pane, prompt, before, host, allowed):
+    """Distinguish pasted text from a started turn; never paste the request twice."""
+    if before.get('agent_status') == 'blocked':
+        return 'blocked'
+    if before.get('agent_status') not in ('idle', 'done', 'working'):
+        return 'unconfirmed'
+    reply = await _herdr_json('agent', 'prompt', pane, prompt, '--wait', '--until',
+                              'working', '--timeout', '7000', host=host,
+                              timeout=12, allow_error=True)
+    if not await allowed():
+        return 'denied'
+    result = (reply or {}).get('result')
+    after = result.get('agent', {}) if isinstance(result, dict) else {}
+    if _native_reply_started(before, after):
+        return 'started'
+    if (isinstance(result, dict) and before.get('agent_status') == 'working'
+            and after.get('agent_status') == 'working' and _native_same_terminal(before, after)):
+        return 'busy'
+    if ((reply or {}).get('error') or {}).get('code') != 'agent_prompt_stalled':
+        return 'unconfirmed'
+    state = await _herdr_json('agent', 'get', pane, host=host)
+    current = ((state or {}).get('result') or {}).get('agent') or {}
+    if not await allowed():
+        return 'denied'
+    if _native_reply_started(before, current):
+        return 'started'
+    sequence = before.get('state_change_seq')
+    # Recover only the exact unchanged idle input box. Never press Enter in a
+    # permission dialog, a replacement terminal, or a turn that already moved.
+    if (current.get('agent_status') not in ('idle', 'done')
+            or before.get('agent_status') not in ('idle', 'done')
+            or not _native_same_terminal(before, current)
+            or type(sequence) is not int or current.get('state_change_seq') != sequence
+            or before.get('agent') != 'codex'):
+        return 'unconfirmed'
+    # Same non-character paste boundary as Herdr's upstream Windows Codex fix:
+    # https://github.com/herdrdev/herdr/pull/3961 . Right commits the buffered
+    # paste before Enter, instead of racing another bare Enter against it.
+    sent = await _herdr_json('agent', 'send-keys', pane, 'right', 'enter', host=host)
+    if not sent or not sent.get('result'):
+        return 'unconfirmed'
+    for _ in range(8):
+        await asyncio.sleep(.35)
+        state = await _herdr_json('agent', 'get', pane, host=host)
+        after = ((state or {}).get('result') or {}).get('agent') or {}
+        if _native_reply_started(before, after):
+            return 'started'
+        if not _native_same_terminal(before, after) or after.get('agent_status') == 'blocked':
+            break
+    return 'unconfirmed'
+
+
 async def herdr_reply_got_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    token = context.user_data.pop("codex_answer_token", None)
+    if token:
+        if not await _check_herdr_reply_access(update):
+            return ConversationHandler.END
+        await codex_telegram.answer(update, context, token, text=update.message.text)
+        return ConversationHandler.END
     pane = context.user_data.pop("herdr_reply_pane", None)
     host = context.user_data.pop("herdr_reply_host", None)
     machine = context.user_data.pop("herdr_reply_machine", "")
     if not pane:
         return ConversationHandler.END
-    res = await _herdr_json("agent", "prompt", pane, update.message.text, host=host)
-    if res and res.get("result"):
-        await update.message.reply_text("Отправлено ✓")
+    if not await _check_herdr_reply_access(update):
+        return ConversationHandler.END
+    data = await _herdr_json('agent', 'get', pane, host=host)
+    result = (data or {}).get('result')
+    agent = result.get('agent') if isinstance(result, dict) else None
+    delivery = result_files.native_context(agent, machine, host, update.effective_chat.id) if isinstance(agent, dict) else None
+    if not await _check_herdr_reply_access(update):
+        return ConversationHandler.END
+    prompt = (result_files.native_instruction(delivery) if delivery else '') + update.message.text
+    if not isinstance(agent, dict):
+        await update.message.reply_text('Сессия недоступна; запрос не отправлен.')
+        return ConversationHandler.END
+    async def allowed():
+        return await _check_herdr_reply_access(update)
+    dialog = await asyncio.to_thread(codex_bridge.resolve, agent, host)
+    if not await allowed():
+        return ConversationHandler.END
+    if agent.get("agent_status") == "blocked":
+        dialog = None  # Keep the existing permission-dialog guard on free-text replies.
+    if dialog:
+        try:
+            turn_id, steered = await asyncio.to_thread(dialog.send, prompt)
+        except codex_app_server.Unconfirmed:
+            await update.message.reply_text("Codex мог получить запрос. Проверьте окно перед повторной отправкой.")
+            return ConversationHandler.END
+        except codex_app_server.RPCError:
+            await update.message.reply_text("Codex не принял запрос. Обновите окно и проверьте ожидающий вопрос.")
+            return ConversationHandler.END
+        except codex_app_server.Unavailable:
+            pass  # No mutation was sent: keep the existing herdr path available.
+        else:
+            codex_telegram.track(dialog, turn_id, pane, machine, host, update.effective_chat.id, delivery)
+            await update.message.reply_text("Уточнение добавлено в текущую работу ✓" if steered else "Запрос запущен ✓")
+            if LOG_PROMPTS:
+                await _log_pane_prompt(pane, machine, host, update.message.text)
+            return ConversationHandler.END
+    submitted = await _submit_native_reply(pane, prompt, agent, host, allowed)
+    if submitted in ('started', 'busy'):
+        if delivery:
+            db.save_native_file_context(_herdr_watch_source(machine, host), delivery)
+        await update.message.reply_text('Запрос запущен ✓' if submitted == 'started'
+                                       else 'Передано в работающую сессию. Выполнение этого сообщения отдельно пока не подтверждено.')
         if LOG_PROMPTS:
             await _log_pane_prompt(pane, machine, host, update.message.text)
-    else:
-        await update.message.reply_text("Не удалось отправить — агент ещё существует?")
+    elif submitted == 'blocked':
+        await update.message.reply_text('Сессия ожидает подтверждения. Запрос не вставлен; сначала ответьте на диалог в сессии.')
+    elif submitted != 'denied':
+        await update.message.reply_text('Не удалось подтвердить запуск запроса. Текст мог остаться в поле ввода; проверьте экран сессии. Повторная вставка не выполнялась.')
     return ConversationHandler.END
 
 
 async def herdr_reply_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("codex_answer_token", None)
     context.user_data.pop("herdr_reply_pane", None)
     context.user_data.pop("herdr_reply_host", None)
     context.user_data.pop("herdr_reply_machine", None)
     await update.message.reply_text("Отменено.")
     return ConversationHandler.END
+
+
+@require_auth
+async def cb_codex_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    from telegram.ext import ApplicationHandlerStop
+    query = update.callback_query
+    if query.data.startswith("cx_result:"):
+        await codex_telegram.output(update, query.data.split(":", 1)[1])
+    else:
+        await query.answer()
+        _, token, option = query.data.split(":", 2)
+        await codex_telegram.answer(update, context, token, option=int(option))
+    raise ApplicationHandlerStop
+
+
+@require_auth
+async def cb_codex_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    token = query.data.split(":", 1)[1]
+    if not await _check_herdr_reply_access(update):
+        return ConversationHandler.END
+    if not await codex_telegram.current_question(update, token):
+        await query.answer("Вопрос устарел. Откройте его заново.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data["codex_answer_token"] = token
+    await query.message.reply_text("Введите ответ на вопрос Codex (или /cancel):")
+    return ASK_HERDR_REPLY
 
 
 # ---------------------------------------------------------------------------
@@ -3556,13 +4209,35 @@ async def _render_window_card(query, context, idx: int) -> str:
     if tid:
         lines.append(f"Задача PromptPilot: #{tid}")
     lines.append(f"Панель: {w['pane_id']}")
-    tail = await _herdr_screen_tail(w["pane_id"], w["machine"], lines_n=12)
+    snapshot = await codex_telegram.view(agent, host)
+    if snapshot:
+        _, thread, turns, questions = snapshot
+        if questions:
+            lines[0] = f"❓ {_herdr_agent_label(agent)} — ожидает ответа"
+            tail = "\n\n".join(q["text"] + "\n" + "\n".join(
+                f"{i + 1}. {v}" for i, v in enumerate(q["options"])) for q in questions)
+        elif (thread.get("status") or {}).get("type") == "active":
+            if w["status"] == "blocked":
+                tail = await _herdr_screen_tail(w["pane_id"], w["machine"], lines_n=12)
+            else:
+                lines[0] = f"🔄 {_herdr_agent_label(agent)} — выполняется"
+                tail = "Codex выполняет запрос."
+        else:
+            lines[0] = f"💤 {_herdr_agent_label(agent)} — готов к новому запросу"
+            tail = next((codex_bridge.final_text(t) for t in turns if codex_bridge.final_text(t)), "")
+    else:
+        tail = await _herdr_screen_tail(w["pane_id"], w["machine"], lines_n=12)
     if tail:
         lines.append(f"\n{tail}")
 
     ref = f"{w['machine']}:{w['pane_id']}"
     rows = [[InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}")]]
-    if w["status"] == "blocked":
+    rows.append([InlineKeyboardButton("📺 Экран", callback_data=f"hd_screen:{ref}"),
+                 InlineKeyboardButton("📄 Вывод файлом", callback_data=f"hd_output:{ref}")])
+    if (snapshot and snapshot[3]) or _codex_question_pending(tail):
+        lines.append("\n❓ Агент задал вопрос. Откройте его кнопкой ниже, чтобы увидеть текст и варианты ответа.")
+        rows.insert(0, [InlineKeyboardButton('❓ Открыть вопрос', callback_data=f'hd_question:{ref}')])
+    elif w["status"] == "blocked":
         rows.append([InlineKeyboardButton("✅ Enter", callback_data=f"hd_enter:{ref}"),
                      InlineKeyboardButton("2", callback_data=f"hd_key:2:{ref}"),
                      InlineKeyboardButton("3", callback_data=f"hd_key:3:{ref}"),
@@ -3626,18 +4301,22 @@ def _silent_completion(task) -> bool:
     )
 
 
-def _flow_keyboard(flow_ref: str) -> InlineKeyboardMarkup:
-    """Buttons of a flow notification: an approval ("<item>:<step>") or a stuck item ("<item>:")."""
-    item_id, _, step_id = flow_ref.partition(":")
-    if step_id:
+def _flow_keyboard(flow_ref: str) -> InlineKeyboardMarkup | None:
+    parts = flow_ref.split(":")
+    if len(parts) != 3 or not parts[0].isdigit() or not parts[2].isdigit():
+        return None  # Old notifications cannot acquire a new occurrence token.
+    item_id, kind, version = parts
+    if kind == "approval":
         return InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Одобрить", callback_data=f"flowdec:{item_id}:{step_id}:a"),
-            InlineKeyboardButton("✖ Отклонить", callback_data=f"flowdec:{item_id}:{step_id}:r"),
+            InlineKeyboardButton("✅ Одобрить", callback_data=f"flowdec2:{item_id}:{version}:a"),
+            InlineKeyboardButton("✖ Отклонить", callback_data=f"flowdec2:{item_id}:{version}:r"),
         ]])
+    if kind != "action":
+        return None
     return InlineKeyboardMarkup([[
-        InlineKeyboardButton("🔁 Повторить", callback_data=f"flowact:{item_id}:retry"),
-        InlineKeyboardButton("⏭ Пропустить", callback_data=f"flowact:{item_id}:skip"),
-        InlineKeyboardButton("✖ Снять", callback_data=f"flowact:{item_id}:cancel"),
+        InlineKeyboardButton("🔁 Повторить", callback_data=f"flowact2:{item_id}:{version}:retry"),
+        InlineKeyboardButton("⏭ Пропустить", callback_data=f"flowact2:{item_id}:{version}:skip"),
+        InlineKeyboardButton("✖ Снять", callback_data=f"flowact2:{item_id}:{version}:cancel"),
     ]])
 
 
@@ -3654,16 +4333,20 @@ async def cb_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     who = f"telegram:{user.username or user.id}"
     try:
-        if parts[0] == "flowdec":
-            _, item_id, step_id, verdict = parts
+        if parts[0] in {"flowdec", "flowact"}:
+            raise flows.FlowError("Кнопка устарела. Откройте заявку заново.")
+        if parts[0] == "flowdec2":
+            _, item_id, version, verdict = parts
             decision = "approve" if verdict == "a" else "reject"
-            await asyncio.to_thread(flows.decide, int(item_id), decision, "", who, step_id)
+            await asyncio.to_thread(flows.decide, int(item_id), decision, "", who,
+                                    expected_version=int(version))
             word = "одобрено" if decision == "approve" else "отклонено"
         else:
-            _, item_id, action = parts
+            _, item_id, version, action = parts
             call = {"retry": flows.retry, "skip": flows.skip, "cancel": flows.cancel}[action]
-            await asyncio.to_thread(call, int(item_id), who)
-            word = FLOW_ACTION_WORDS[action]
+            action_result = await asyncio.to_thread(call, int(item_id), who, expected_version=int(version))
+            word = ("остановка запрошена" if action == "cancel" and action_result["status"] == "cancelling"
+                    else FLOW_ACTION_WORDS[action])
     except flows.FlowError as exc:
         await query.answer(str(exc)[:190], show_alert=True)
         return
@@ -3673,6 +4356,61 @@ async def cb_flow(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(f"Заявка #{item_id}: {word}.")
     except BadRequest:
         pass
+
+
+def _file_remote(machine):
+    if machine and machine not in load_machines():
+        raise result_files.RejectedFile("The result-file machine is no longer registered")
+    return _machine_remote(machine) if machine else None
+
+
+def _result_file_notifications(task):
+    try:
+        specs = result_files.specs(task)
+        if not specs:
+            return []
+        remote = _file_remote(task.machine)
+        endpoint = list(remote) if remote else None
+        return [{"kind": "result.file", "message": json.dumps({
+            **spec, "endpoint": endpoint, "expires_at": time.time() + 86400,
+        }, ensure_ascii=False)} for spec in specs]
+    except result_files.RejectedFile as exc:
+        logger.warning("task %s result files rejected: %s", task.id, exc)
+        return [{"kind": "result.file.error", "message":
+                 f"⚠️ Файлы задачи #{task.id} не приложены. Попросите агента подготовить их для отправки повторно."}]
+
+
+async def _send_result_file(bot, note):
+    import hashlib
+    import io
+    payload = json.loads(note["message"])
+    if time.time() > payload["expires_at"]:
+        raise result_files.RejectedFile("Result-file delivery expired after 24 hours")
+    remote = _file_remote(note.get("machine"))
+    if payload["endpoint"] != (list(remote) if remote else None):
+        raise result_files.RejectedFile("The result-file machine endpoint has changed")
+    data = await asyncio.to_thread(result_files.read_bytes, payload, remote)
+    if payload.get('expected_sha256') and hashlib.sha256(data).hexdigest() != payload['expected_sha256']:
+        raise result_files.RejectedFile('Result file changed after completion')
+    with io.BytesIO(data) as stream:
+        await bot.send_document(
+            chat_id=note["tg_chat_id"], document=stream, filename=payload["name"],
+            caption=f"📎 Результат задачи #{note['task_id']}" if note.get('task_id') else '📎 Файл результата',
+        )
+
+
+async def _expand_result_manifest(note):
+    context = json.loads(note['message'])
+    if time.time() > context['expires_at']:
+        raise result_files.RejectedFile('Result-file delivery expired after 24 hours')
+    remote = _file_remote(note.get('machine'))
+    if context['endpoint'] != (list(remote) if remote else None):
+        raise result_files.RejectedFile('The result-file machine endpoint has changed')
+    specs = await asyncio.to_thread(result_files.manifest_specs, context, remote)
+    db.expand_file_manifest(note['id'], [
+        {**spec, 'endpoint': context['endpoint'], 'expires_at': context['expires_at']}
+        for spec in specs
+    ])
 
 
 async def _notify_loop(bot):
@@ -3696,15 +4434,50 @@ async def _notify_loop(bot):
             continue
         for note in notes:
             try:
+                if note.get("kind") in {'result.file', 'result.manifest'}:
+                    try:
+                        if note['kind'] == 'result.manifest':
+                            await _expand_result_manifest(note)
+                        else:
+                            await _send_result_file(bot, note)
+                    except result_files.RejectedFile as exc:
+                        logger.warning("task %s result file rejected: %s", note['task_id'], exc)
+                        await bot.send_message(chat_id=note["tg_chat_id"],
+                                               text="⚠️ Файл результата не приложен. Попросите агента подготовить его для отправки повторно.")
+                    db.mark_notification_sent(note["id"])
+                    continue
                 kb = None
-                if note.get("flow_ref"):
+                note_text = note["message"]
+                if note.get("kind") == "codex.question":
+                    record = db.get_setting(codex_telegram.QUESTION_PREFIX + note_text)
+                    record = json.loads(record) if record else None
+                    if not record or record.get("used") or record["expires_at"] < time.time():
+                        db.mark_notification_sent(note["id"])
+                        continue
+                    note_text, kb = codex_telegram.question_message(record, note["message"])
+                elif note.get("kind") == "codex.done":
+                    payload = json.loads(note_text)
+                    note_text = payload["text"]
+                    ref = f"{note.get('machine') or ''}:{note['pane_id']}"
+                    kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("📄 Полный ответ", callback_data=f"cx_result:{payload['token']}")],
+                        [InlineKeyboardButton(REPLY_LABEL, callback_data=f"hd_reply:{ref}")]])
+                elif note.get("flow_ref"):
                     kb = _flow_keyboard(note["flow_ref"])
                 elif note.get("pane_id"):
                     # A blocked own task: same confirm/screen/reply buttons the
                     # foreign-agent watcher gets — not just an ssh suggestion.
                     ref = f"{note.get('machine') or ''}:{note['pane_id']}"
-                    kb = InlineKeyboardMarkup(_herdr_blocked_keyboard(ref))
-                await bot.send_message(chat_id=note["tg_chat_id"], text=_clip(note["message"]),
+                    kb = InlineKeyboardMarkup(_herdr_done_keyboard(ref) if note.get("kind") == "herdr.done"
+                                              else _herdr_blocked_keyboard(ref))
+                    if note.get("kind") != "herdr.done":
+                        tail = await _herdr_screen_tail(note["pane_id"], note.get("machine") or "")
+                        if tail:
+                            note_text += "\n\n" + tail
+                        if _codex_question_pending(tail):
+                            kb = InlineKeyboardMarkup([[
+                                InlineKeyboardButton("❓ Открыть вопрос", callback_data=f"hd_question:{ref}")]])
+                await bot.send_message(chat_id=note["tg_chat_id"], text=_clip(note_text),
                                        reply_markup=kb)
                 db.mark_notification_sent(note["id"])
             except (Forbidden, BadRequest) as e:
@@ -3733,7 +4506,7 @@ async def _notify_loop(bot):
                     icon, status_word = "✅", "выполнена"
                     body = ""
                     if task.result:
-                        preview = task.result.split("\n--- Meta ---")[0].strip()
+                        preview = result_files.visible_result(task.result.split("\n--- Meta ---")[0]).strip()
                         if preview:
                             body = f"\n\n{preview[:600]}"
                         meta_lines = []
@@ -3758,6 +4531,8 @@ async def _notify_loop(bot):
                 if task.session_id:
                     note_rows[0].append(InlineKeyboardButton(REPLY_LABEL, callback_data=f"reply_task:{task.id}"))
                 note_rows.append([InlineKeyboardButton("🔁 Повторить", callback_data=f"rerun:{task.id}")])
+                if task.result or task.error:
+                    note_rows.append([InlineKeyboardButton("📄 Полный вывод", callback_data=f"full_result:{task.id}")])
                 note_kb = InlineKeyboardMarkup(note_rows)
                 # Agents answer in Markdown; raw «**жирный**» in the preview
                 # reads as noise. Try to render it, fall back to plain text on
@@ -3768,7 +4543,11 @@ async def _notify_loop(bot):
                 except BadRequest:
                     await bot.send_message(chat_id=task.tg_chat_id, text=text,
                                            reply_markup=note_kb)
-                db.mark_notified(task.id)
+                file_notes = _result_file_notifications(task) if task.status.value == "completed" else []
+                if file_notes:
+                    db.mark_notified_with_files(task, file_notes)
+                else:
+                    db.mark_notified(task.id)
                 if task.status.value == "completed":
                     # 1С-доработка: у задач из /epf собираем и присылаем .epf.
                     # Для обычных задач get_epf_job_by_task пуст — это no-op.
@@ -3897,6 +4676,7 @@ async def epf_got_task(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return EPF_ASK_BASE
 
 
+@require_auth
 async def epf_base_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Выбор базы (epfb:<key>), пагинация (epfb:list:N) и запуск пре-фазы."""
     query = update.callback_query
@@ -3986,6 +4766,8 @@ async def epf_base_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for key in ("epf_file", "epf_name", "epf_task", "epf_bases"):
             context.user_data.pop(key, None)
 
+    if not await _check_task_creation_access(update):
+        return ConversationHandler.END
     task = db.create_task(TaskCreate(
         prompt=task_text,
         working_dir=str(project_dir),
@@ -4191,8 +4973,11 @@ def run_bot():
         except Exception as e:
             logger.warning("set_my_commands failed: %s", e)
         asyncio.create_task(_notify_loop(application.bot))
+        asyncio.create_task(codex_telegram.watch_loop())
         if HERDR_WATCH:
             asyncio.create_task(_herdr_watch_loop(application.bot))
+        else:
+            asyncio.create_task(_native_file_watch_loop())
 
     # The wizard survives a bot restart: without persistence every inline
     # button of a half-finished wizard died silently after redeploy.
@@ -4249,8 +5034,15 @@ def run_bot():
                 att_midway,
             ],
             ASK_HERDR_TARGET: [
+                CallbackQueryHandler(cb_herdr_new, pattern=r"^hst_new$"),
+                CallbackQueryHandler(cb_herdr_back, pattern=r"^hst_back$"),
                 CallbackQueryHandler(add_task_got_herdr_target,
                                      pattern=r"^(hst_i:\d+|hst_more)$"),
+                att_midway,
+            ],
+            ASK_HERDR_AGENT: [
+                CallbackQueryHandler(cb_herdr_new_agent, pattern=r"^hnew_i:\d+$"),
+                CallbackQueryHandler(cb_herdr_back, pattern=r"^hnew_back$"),
                 att_midway,
             ],
             ASK_MODEL: [
@@ -4263,6 +5055,7 @@ def run_bot():
                 att_midway,
             ],
             ASK_DIR: [
+                CallbackQueryHandler(cb_dir_create_start, pattern=r"^dir_new$"),
                 CallbackQueryHandler(cb_dir_nav, pattern=r"^dirn:\d+$"),
                 CallbackQueryHandler(cb_dir_pick_idx, pattern=r"^dirp:\d+$"),
                 CallbackQueryHandler(cb_dir_here, pattern=r"^dir_here$"),
@@ -4273,8 +5066,16 @@ def run_bot():
                 att_midway,
             ],
             ASK_DIR_MANUAL: [
+                CallbackQueryHandler(cb_dir_create_start, pattern=r"^dir_new$"),
+                CallbackQueryHandler(cb_dir_create_confirm, pattern=r"^dir_make:[a-f0-9]{12}$"),
+                CallbackQueryHandler(add_task_got_dir_btn, pattern=r"^dir:__manual__$"),
                 CommandHandler("skip", add_task_skip_dir),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_dir),
+                att_midway,
+            ],
+            ASK_DIR_CREATE: [
+                CallbackQueryHandler(cb_dir_create_back, pattern=r"^dir_create_back$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, add_task_got_new_dir),
                 att_midway,
             ],
             ASK_CONFIRM: [
@@ -4355,7 +5156,8 @@ def run_bot():
 
     herdr_reply_conv = ConversationHandler(
         entry_points=[
-            CallbackQueryHandler(cb_herdr_reply_start, pattern=r"^hd_reply:")
+            CallbackQueryHandler(cb_herdr_reply_start, pattern=r"^hd_reply:"),
+            CallbackQueryHandler(cb_codex_text, pattern=r"^cx_text:"),
         ],
         states={
             ASK_HERDR_REPLY: [
@@ -4402,7 +5204,11 @@ def run_bot():
     # herdr bridge buttons must outrank active ConversationHandlers (group 0)
     app.add_handler(CallbackQueryHandler(cb_herdr_enter, pattern=r"^hd_enter:"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_herdr_screen, pattern=r"^hd_screen:"), group=-1)
+    app.add_handler(CallbackQueryHandler(cb_herdr_output, pattern=r"^hd_output:"), group=-1)
+    app.add_handler(CallbackQueryHandler(cb_codex_action, pattern=r"^cx_(?:answer|result):"), group=-1)
     app.add_handler(CallbackQueryHandler(cb_herdr_key, pattern=r"^hd_key:"), group=-1)
+    app.add_handler(CallbackQueryHandler(_dispatch_question_callback, pattern=r'^hd_question:'), group=-1)
+    app.add_handler(CallbackQueryHandler(_dispatch_question_callback, pattern=r'^hd_qkey:'), group=-1)
 
     # windows screen buttons live in cards that outlive any active wizard
     app.add_handler(CallbackQueryHandler(cb_window, pattern=r"^win_i:\d+$"), group=-1)
@@ -4423,7 +5229,7 @@ def run_bot():
         cb_report_refresh,
         pattern=r"^report:refresh:(24|168|720):[A-Za-z0-9_.-]+$"), group=-1)
     app.add_handler(CallbackQueryHandler(
-        cb_flow, pattern=r"^(flowdec:\d+:[a-z0-9_]+:[ar]|flowact:\d+:(retry|skip|cancel))$"),
+        cb_flow, pattern=r"^(flowdec2:\d+:\d+:[ar]|flowact2:\d+:\d+:(retry|skip|cancel)|flowdec:\d+:[a-z0-9_]+:[ar]|flowact:\d+:(retry|skip|cancel))$"),
         group=-1)
 
     app.add_handler(CommandHandler("start", cmd_start))
@@ -4527,4 +5333,4 @@ def run_bot():
     app.add_error_handler(error_handler)
 
     logger.info("PromptPilot Telegram bot started.")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=False)

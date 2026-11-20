@@ -30,7 +30,7 @@ def config(max_revisions=3, max_rounds=10, require_approval=True):
             "executor": {"provider": None},
             "reviewer": {"provider": None},
         },
-        "gate": {"commands": []},
+        "gate": {"enabled": False, "commands": []},
         "limits": {"max_rounds": max_rounds},
     }
 
@@ -146,9 +146,9 @@ def test_pause_during_gate_does_not_invalidate_receipt(isolated_db, monkeypatch)
     wf = start_two_stages(isolated_db)
     run_gate = workflows._run_gate_commands
 
-    def with_pause(workflow):
+    def with_pause(workflow, *, snapshot):
         pause_after(isolated_db, workflow)
-        return run_gate(workflow)
+        return run_gate(workflow, snapshot=snapshot)
 
     monkeypatch.setattr(workflows, '_run_gate_commands', with_pause)
     finish_task(isolated_db, 'executor')
@@ -177,7 +177,7 @@ def test_stage_pause_api_only_sets_intent_and_next_stage_requires_acceptance(iso
     tasks_before = [t.id for t in isolated_db.list_tasks()]
 
     async def scenario():
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://test') as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://localhost') as client:
             response = await client.post(f'/api/workflows/{wf.id}/stage-pause', json={
                 'expected_version': wf.state_version, 'expected_pause_version': 0, 'enabled': True})
             assert response.status_code == 200
@@ -223,6 +223,9 @@ def test_planner_approval_and_two_stage_autonomous_lifecycle(isolated_db):
     )
     assert approved.status.value == "queued"
     assert approved.current_stage_id == stages[0].id
+    assert isolated_db.save_memory(workflow.id, "global.md", "keep")[0]
+    assert isolated_db.save_memory(workflow.id, "stage.md", "temporary", scope_stage=stages[0].id)[0]
+    assert isolated_db.save_memory(workflow.id, "final.md", "final", scope_stage=stages[1].code)[0]
     workflows.advance_workflow(workflow.id)
 
     executor = isolated_db.list_tasks(status=TaskStatus.PENDING)[0]
@@ -237,9 +240,12 @@ def test_planner_approval_and_two_stage_autonomous_lifecycle(isolated_db):
     current_stage = isolated_db.get_workflow_stage(second.current_stage_id)
     assert current_stage.code == "FINAL"
     assert isolated_db.list_workflow_stages(workflow.id)[0].status.value == "completed"
+    assert {row["name"] for row in isolated_db.list_memory(workflow.id)} == {"global.md", "final.md"}
+    assert not isolated_db.save_memory(workflow.id, "late.md", "no", scope_stage=stages[0].id)[0]
 
     finish_task(isolated_db, "executor FINAL")
     finish_task(isolated_db, reviewer_pass())
+    assert [row["name"] for row in isolated_db.list_memory(workflow.id)] == ["global.md"]
     completed = isolated_db.get_workflow(workflow.id)
     assert completed.status.value == "completed"
     assert all(

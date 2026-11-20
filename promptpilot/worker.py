@@ -20,9 +20,9 @@ from . import db, worktree
 from .config import (BASE_DELAY, CONCURRENCY, DEFAULT_CLI, MAX_DELAY, MIN_FREE_MB,
                      POLL_INTERVAL, TASK_TIMEOUT, VERDICT_REPAIR,
                      VERDICT_REPAIR_TIMEOUT, VERDICT_REQUIRED, RightsUnsupported,
-                     build_cmd, get_provider_env, load_providers, rights_args,
-                     rights_supported, provider_is_claude)
+                     build_cmd, get_provider_env, load_providers, rights_args, provider_is_claude)
 from .process_tree import OwnedProcess, ProcessTreeError
+from .task_identity import apply_task_markers
 
 # Our quota is spent — the wait is measured in hours and nothing else will get
 # through either.
@@ -143,7 +143,6 @@ ENV_FAILURE_RE = re.compile(
 VERDICTS = (
     "ГОТОВО", "УЖЕ СДЕЛАНО", "НУЖЕН ЧЕЛОВЕК", "НЕ СМОГ", "ПУСТО",
 )
-VERDICT_RE = re.compile(r"^[ \t>*#-]*ИТОГ:\s*(" + "|".join(VERDICTS) + r")\b", re.M | re.I)
 
 VERDICT_INSTRUCTION = (
     "\n\nПоследней строкой ответа напиши ровно одну из:\n"
@@ -157,13 +156,12 @@ VERDICT_INSTRUCTION = (
 
 
 def parse_verdict(text: str) -> str:
-    """The task's own last word, or "" if it never said one.
+    """Read the five ordinary verdicts only from an explicit final line."""
+    from .herdr_exec import WORKFLOW_CLOSING_VERDICT_RE
 
-    Last match wins: the agent may quote the format earlier while explaining
-    itself, and only the closing line is the verdict.
-    """
-    matches = VERDICT_RE.findall(text or "")
-    return matches[-1].upper() if matches else ""
+    lines = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    match = WORKFLOW_CLOSING_VERDICT_RE.fullmatch(lines[-1]) if lines else None
+    return match.group(1).upper() if match else ""
 
 
 VERDICT_REPAIR_PROMPT = (
@@ -213,13 +211,13 @@ def _repair_verdict(task, provider: str, provider_cfg: dict,
             + workflow_instruction
         )
     try:
-        # Restating a verdict needs no tools; confine the micro-request when
-        # the provider can be confined.
+        # Restating a verdict never needs tools. The canonical provider
+        # builder refuses an unsupported narrow mode before spawning anything.
         cmd = build_cmd(provider, prompt,
                         model=getattr(task, "model", None),
                         effort=getattr(task, "effort", None),
                         guard=True,
-                        rights="none" if rights_supported(provider_cfg, "none") else None)
+                        rights="none")
         prompt_stdin = prompt if provider_cfg.get("prompt_stdin") else None
         env = get_provider_env(provider)
         env.pop("PP_TASK_ID", None)
@@ -237,9 +235,15 @@ def _repair_verdict(task, provider: str, provider_cfg: dict,
     except Exception as exc:
         print(f"  !! Verdict repair request failed: {type(exc).__name__}: {exc}")
         return ""
+    if result.returncode != 0:
+        return ""
     stdout = result.stdout or ""
     if is_stream_json(stdout):
-        stdout = parse_stream_json(stdout).get("text", "")
+        parsed = parse_stream_json(stdout)
+        meta = parsed.get("meta", {})
+        if meta.get("is_error") or str(meta.get("subtype") or "").startswith("error"):
+            return ""
+        stdout = parsed.get("text", "")
     return parse_verdict(stdout)
 
 
@@ -250,10 +254,13 @@ def effective_prompt(task) -> str:
     already set, usually because the run was going the wrong way, so it has to
     outrank everything above it.
     """
+    from .result_files import prompt_instruction
+
     prompt = task.prompt
     workflow_instruction = _workflow_verdict_instruction(task)
     if workflow_instruction:
         prompt = prompt.rstrip()[:-len(workflow_instruction.rstrip())]
+    prompt += prompt_instruction(task)
     note = (getattr(task, "note", None) or "").strip()
     if note:
         prompt += ("\n\n<приписка>\n"
@@ -580,11 +587,21 @@ def parse_stream_json(stdout: str) -> dict:
             meta["is_error"] = event.get("is_error")
             meta["subtype"] = event.get("subtype")
             usage = event.get("usage", {})
-            meta["input_tokens"] = usage.get("input_tokens")
+            inputs = [usage.get("input_tokens"), usage.get("cache_read_input_tokens", 0),
+                      usage.get("cache_creation_input_tokens", 0)]
+            meta["input_tokens"] = (sum(inputs) if all(type(n) is int and n >= 0 for n in inputs)
+                                    else None)
+            meta["cached_input_tokens"] = inputs[1]
+            meta["cache_creation_input_tokens"] = inputs[2]
             meta["output_tokens"] = usage.get("output_tokens")
             model_usage = event.get("modelUsage", {})
-            if model_usage:
+            if len(model_usage) == 1:
                 meta["model"] = list(model_usage.keys())[0]
+            elif len(model_usage) > 1:
+                meta.pop("model", None)
+            # Aggregated multi-model usage and cache-write TTL mixtures cannot
+            # be honestly priced from these compact counters.
+            meta["cost_attributable"] = len(model_usage) <= 1 and not inputs[2]
             # Extract result text (always for errors, fallback for empty output)
             if event.get("result"):
                 if event.get("is_error") or not text_parts:
@@ -1037,11 +1054,13 @@ def _forget_provider_tree(task_id: int, tree: OwnedProcess) -> None:
 
 def _close_registered_provider_tree(task_id: int) -> bool:
     """Stop a child before any caller can release its exact target lease."""
+    from .review_routing_control import close_controls
+    control_error=close_controls(task_id)
     key = _provider_tree_key(task_id)
     with _active_provider_trees_lock:
         tree = _active_provider_trees.get(key)
     if tree is None:
-        return True
+        return not control_error
     try:
         _stop_owned_process(tree)
     except Exception as exc:
@@ -1051,7 +1070,44 @@ def _close_registered_provider_tree(task_id: int) -> bool:
         )
         return False
     _forget_provider_tree(task_id, tree)
-    return True
+    return not control_error
+
+
+SPAWN_RETRY_DELAY_S = 20.0
+
+
+class _SpawnCancelled(Exception):
+    """Cancellation observed before a provider process was created."""
+
+
+def _start_owned_with_spawn_retry(build, cmd, attempts=2,
+                                  delay_s=None, sleep=None, exists=None, cancel_check=None):
+    """U16: FileNotFoundError у СУЩЕСТВУЮЩЕГО исполняемого файла — транзиентное
+    давление ресурсов (255MB Electron-бинарник goose.exe при параллельных
+    тяжёлых задачах; инцидент 2026-10-03: ревью-слоты падали «CLI not found»,
+    одиночный запуск того же провайдера проходил). Один повтор через паузу;
+    действительно отсутствующий CLI падает сразу, без ожидания."""
+    import os as _os
+    delay_s = SPAWN_RETRY_DELAY_S if delay_s is None else delay_s
+    sleep = time.sleep if sleep is None else sleep
+    exists = _os.path.isfile if exists is None else exists
+    def check_cancel():
+        if cancel_check is not None and cancel_check():
+            raise _SpawnCancelled()
+    try:
+        return build()
+    except FileNotFoundError:
+        exe = str(cmd[0]) if cmd else ""
+        if attempts <= 1 or not exe or not exists(exe):
+            raise
+        remaining = delay_s
+        while remaining > 0:
+            check_cancel()
+            interval = min(0.25, remaining) if cancel_check is not None else remaining
+            sleep(interval)
+            remaining -= interval
+        check_cancel()
+        return build()
 
 
 def _effective_timeout(task):
@@ -1139,6 +1195,8 @@ def _maybe_recur(task, failed: bool = False):
     """Enqueue the next occurrence of a recurring task."""
     if not task.recurrence:
         return
+    if db.workorder_recurrence_forbidden(task.id):
+        return
     repeat_guard = _pipeline_repeat_guard(task)
     if repeat_guard and repeat_guard.get("suppress_recurrence"):
         return
@@ -1155,11 +1213,14 @@ def _maybe_recur(task, failed: bool = False):
     if not next_dt:
         return
     from .models import TaskCreate
-    # The prompt as stored, never the one this run was handed: a one-off note
-    # must not be baked into every future occurrence.
-    stored = db.get_task(task.id)
+    # The current series template owns future instructions. A running
+    # occurrence keeps its original prompt for audit, while later occurrences
+    # must retain edits made to the template during that run. Legacy tasks
+    # without a series still use stored text rather than a one-off run note.
+    stored = db.get_task(task.id) if not series else None
     db.create_series_occurrence_if_idle(TaskCreate(
-        prompt=(stored.prompt if stored else task.prompt),
+        prompt=(series["prompt"] if series else
+                stored.prompt if stored else task.prompt),
         working_dir=task.working_dir,
         provider=series["provider"] if series else task.provider,
         priority=series["priority"] if series else task.priority,
@@ -1313,6 +1374,7 @@ def _finalize_herdr_outcome(task, outcome: dict, *, provider_cfg: dict,
         lambda: _mark_completed(
             task, outcome["output"], exit_code=0,
             verdict=verdict or None,
+            report_text=outcome.get("report_text"),
         ),
         f"завершение herdr-задачи #{task.id}",
     )
@@ -1411,6 +1473,13 @@ def _execute_herdr_task(task, provider_cfg, host=None, machine=None, prompt_over
             lambda: db.set_worktree(task.id, path, branch),
             f"сохранение worktree задачи #{task.id}",
         )
+        # Снимок фактического дерева старта рана (см. _execute_task_body):
+        # база доказательств no-diff/чекпоинта — дерево, где работает агент.
+        try:
+            from . import workflows as _workflows
+            _workflows.record_run_snapshot(task.id, path)
+        except Exception as exc:  # noqa: BLE001 — телеметрия
+            print(f"  !! run.snapshot #{task.id}: {exc}", flush=True)
         print(f"  -> Worktree {path} ({branch})")
 
     def on_started(_pane_id):
@@ -1541,7 +1610,7 @@ def _mark_cancelled(task, *args, **kwargs):
     return db.mark_cancelled(task.id, *args, **kwargs)
 
 
-def _execute_task_body(task, admission_complete=None):
+def _execute_task_body(task, admission_complete=None, workorder_check=None):
     """Run CLI with the task's prompt."""
     prompt_constraint = None
     if task.series_id:
@@ -1600,6 +1669,8 @@ def _execute_task_body(task, admission_complete=None):
             route = pipeline_insights.execution_route(
                 task, agent_prompt, getattr(task, "working_dir", None),
                 retain_budget=True)
+        except ProviderOwnershipError:
+            raise
         except Exception as exc:
             route = {
                 "action": "defer", "mode": "skill", "defer_for": "5m",
@@ -1667,11 +1738,17 @@ def _execute_task_body(task, admission_complete=None):
             )
             print(f"  -> Pipeline preflight completed without agent: {reason}")
             return
+        if route.get('technical_fix') is not None:
+            if workorder_check is not None:
+                raise RuntimeError('technical FIX cannot substitute a workorder execution factory')
+            from .review_routing_worker import execute as execute_technical_fix
+            return execute_technical_fix(task,route)
         agent_prompt = route["prompt"]
         if prompt_constraint and prompt_constraint not in agent_prompt:
             agent_prompt += "\n\n" + prompt_constraint
         raw_replicas = route.get("pipeline_replicas")
-        if type(raw_replicas) is int and 2 <= raw_replicas <= 16:
+        minimum_replicas = 1 if route.get("review_routing_protocol") == "review-routing-v1" else 2
+        if type(raw_replicas) is int and minimum_replicas <= raw_replicas <= 16:
             pipeline_replicas = str(raw_replicas)
         raw_data_dir = route.get("pipeline_data_dir")
         if (pipeline_replicas is not None and isinstance(raw_data_dir, str)
@@ -1741,6 +1818,8 @@ def _execute_task_body(task, admission_complete=None):
     provider = task.provider or DEFAULT_CLI
 
     provider_cfg = load_providers().get(provider, {})
+    if workorder_check is not None:
+        provider_cfg = workorder_check.provider_snapshot(task, provider_cfg)
     if pipeline_replicas is not None:
         actual_ownership_kind = (
             "herdr" if provider_cfg.get("executor") == "herdr" else "headless")
@@ -1836,10 +1915,22 @@ def _execute_task_body(task, admission_complete=None):
         wt_note = "\n\n" + worktree.summary(wt["path"], wt["branch"], wt["copied"])
         print(f"  -> Worktree {wt['path']} ({wt['branch']})")
 
+    # Доказательная база рана (no-diff/чекпоинт): снимок ФАКТИЧЕСКОГО дерева
+    # старта — в worktree, если он создан. Диспатч-снимок берётся раньше, из
+    # working_dir: между диспатчем и стартом воркера ветка успела уйти, и
+    # сравнение «до/после» без снимка старта приписывало сдвиг ветки
+    # исполнителю.
     try:
+        from . import workflows as _workflows
+        _workflows.record_run_snapshot(task.id, run_dir)
+    except Exception as exc:  # noqa: BLE001 — телеметрия, не ломать запуск
+        print(f"  !! run.snapshot #{task.id}: {exc}", flush=True)
+
+    try:
+        snapshot_args = ({"provider_snapshot": provider_cfg} if workorder_check is not None else {})
         cmd = build_cmd(provider, agent_prompt, skip_permissions=task.skip_permissions,
                         session_id=task.session_id, model=task.model, guard=not machine,
-                        effort=task.effort, rights=getattr(task, "rights", None))
+                        effort=task.effort, rights=getattr(task, "rights", None), **snapshot_args)
     except RightsUnsupported as exc:
         # Fail closed: a run that asked for narrow rights must not start wide.
         _mark_failed(task, f"Права «{task.rights}»: {exc}", exit_code=-1)
@@ -1847,14 +1938,14 @@ def _execute_task_body(task, admission_complete=None):
         return
     prompt_stdin = agent_prompt if provider_cfg.get("prompt_stdin") else None
 
-    env = get_provider_env(provider)
+    env = get_provider_env(provider, **snapshot_args)
     # Marks the run in its own environment, inherited by the agent process. That
     # is what lets a live run be found by process rather than by our bookkeeping.
     env.pop("PP_PIPELINE_REPLICAS", None)
     env.pop("PP_TASK_STARTED_AT", None)
     env.pop("PP_PROVIDER_OWNERSHIP_KIND", None)
     env.pop("PP_PIPELINE_TARGET_TOKEN", None)
-    env["PP_TASK_ID"] = str(task.id)
+    apply_task_markers(env, task)
     if pipeline_replicas is not None:
         env["PP_PIPELINE_REPLICAS"] = pipeline_replicas
         env["PP_TASK_STARTED_AT"] = pipeline_task_started_at
@@ -1872,7 +1963,7 @@ def _execute_task_body(task, admission_complete=None):
         # The marker rides the local ssh process too, so a live remote run is
         # found by live_task_ids() and recover_running() won't relaunch it into
         # a second concurrent run in the same remote directory.
-        env["PP_TASK_ID"] = str(task.id)
+        apply_task_markers(env, task)
     else:
         # On Windows, .cmd/.bat wrappers (e.g. npm-installed CLIs like qwen) are
         # invisible to subprocess without shell=True.  shutil.which() resolves the
@@ -1920,17 +2011,33 @@ def _execute_task_body(task, admission_complete=None):
     if callable(target_heartbeat):
         target_heartbeat(force=True)
     try:
-        tree = OwnedProcess.start(
+        if workorder_check is not None:
+            for key in list(env):
+                if key.startswith("WORKORDERS_") or key in {"PP_API_TOKEN", "PP_TG_TOKEN"}:
+                    env.pop(key)
+        def launch_owned():
+            if workorder_check is not None:
+                workorder_check(task, force=True, provider_cfg=provider_cfg, cmd=cmd)
+            return OwnedProcess.start(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="surrogateescape",
+                cwd=run_dir,
+                stdin=subprocess.PIPE if prompt_stdin is not None else subprocess.DEVNULL,
+                env=env,
+            )
+
+        tree = _start_owned_with_spawn_retry(
+            launch_owned,
             cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="surrogateescape",
-            cwd=run_dir,
-            stdin=subprocess.PIPE if prompt_stdin is not None else subprocess.DEVNULL,
-            env=env,
+            cancel_check=lambda: db.is_cancel_requested(task.id),
         )
+    except _SpawnCancelled:
+        _mark_cancelled(task, "Отменена пользователем до повторного запуска CLI")
+        return
     except FileNotFoundError:
         _mark_failed(task, f"CLI '{provider}' not found. Is it installed and in PATH?", exit_code=-1)
         return
@@ -2028,12 +2135,18 @@ def _execute_task_body(task, admission_complete=None):
                     commit_timeout,
                 )
                 return
+            if workorder_check is not None:
+                remaining = (effective_timeout - (time.monotonic() - started)
+                             if effective_timeout else 8)
+                workorder_check(task, timeout=min(8, max(0.1, remaining)))
 
     # A successful wrapper may exit while a child still owns the pipes. Close
     # the task boundary before joining readers so such a child cannot survive
     # (or hold this worker forever).
     tree.close()
     _forget_provider_tree(task.id, tree)
+    if workorder_check is not None:
+        workorder_check(task, force=True)
     stdout_thread.join(timeout=10)
     stderr_thread.join(timeout=10)
     if stdin_thread is not None:
@@ -2094,6 +2207,7 @@ def _execute_task_body(task, admission_complete=None):
         return
 
     # Parse output
+    reported_usage = None
     model_used = None
     session_id = None
     if is_stream_json(result.stdout):
@@ -2107,6 +2221,7 @@ def _execute_task_body(task, admission_complete=None):
             parsed["meta"]["unrecognized_model"] = unrecognized
         output = format_result(parsed)
         verdict_source = parsed["text"]
+        reported_usage = parsed["meta"]
         model_used = parsed["meta"].get("model")
         session_id = parsed["meta"].get("session_id")
         # Check for rate limit in stream events — only if no text was returned
@@ -2117,6 +2232,20 @@ def _execute_task_body(task, admission_complete=None):
                 lambda: _requeue_provider_limit(
                     task, RETRY_RATE_LIMIT, output, provider_cfg))
             return
+        meta = parsed.get("meta", {})
+        if meta.get("is_error") or str(meta.get("subtype") or "").startswith("error"):
+            # Wrapper exit zero is not execution success when its structured
+            # result explicitly reports failure. Never ask a second turn to
+            # turn that error into a success declaration.
+            _commit_terminal_or_defer(
+                task,
+                "headless structured execution failure",
+                lambda: _mark_failed(
+                    task, "Provider stream reported an execution error\n" + output[-4000:],
+                    exit_code=1,
+                ),
+            )
+            return
     else:
         # Plain text output (non-Claude CLIs)
         output = result.stdout
@@ -2126,16 +2255,16 @@ def _execute_task_body(task, admission_complete=None):
         from .herdr_exec import _closing_workflow_verdict
         verdict = _closing_workflow_verdict(
             verdict_source, allow_targeted_stale=allow_targeted_stale)
-        if not verdict and VERDICT_REPAIR and not machine:
+        if not verdict and VERDICT_REPAIR and not machine and workorder_check is None:
             # Issue #82: one micro-request beats failing the whole pipeline
             # round (and paying for a full re-run) over a dropped last line.
             repaired = _repair_verdict(task, provider, provider_cfg,
                                        verdict_source or output, run_dir)
             if repaired:
-                verdict = _closing_workflow_verdict(
-                    repaired, allow_targeted_stale=allow_targeted_stale)
-                if verdict:
-                    print(f"  -> Verdict repaired via micro-request: {verdict}")
+                # _repair_verdict already parsed the explicit final line. It
+                # returns the normalized value, not another full declaration.
+                verdict = repaired
+                print(f"  -> Verdict repaired via micro-request: {verdict}")
         if not verdict:
             changed = _commit_terminal_or_defer(
                 task,
@@ -2151,9 +2280,9 @@ def _execute_task_body(task, admission_complete=None):
                 print("  -> Failed (pipeline result has no closing verdict)")
             return
     else:
-        verdict = parse_verdict(output)
+        verdict = parse_verdict(verdict_source)
         if (not verdict and VERDICT_REQUIRED and VERDICT_REPAIR
-                and not machine):
+                and not machine and workorder_check is None):
             repaired = _repair_verdict(task, provider, provider_cfg,
                                        verdict_source or output, run_dir)
             if repaired:
@@ -2171,7 +2300,8 @@ def _execute_task_body(task, admission_complete=None):
         "headless successful outcome",
         lambda: _mark_completed(
             task, output, exit_code=0, model_used=model_used,
-            session_id=session_id, verdict=verdict or None,
+            session_id=session_id, verdict=verdict or None, usage=reported_usage,
+            report_text=verdict_source,
         ),
     )
     if changed:
@@ -2186,9 +2316,11 @@ def _execute_task_body(task, admission_complete=None):
             print(f"  -> Removed empty worktree {wt['path']}")
 
 
-def _execute_task_inner(task, admission_complete=None):
+def _execute_task_inner(task, admission_complete=None, workorder_check=None):
     """Run one task and always release its exact GitHub budget reservation."""
     try:
+        if workorder_check is not None:
+            return _execute_task_body(task, admission_complete, workorder_check=workorder_check)
         if admission_complete is None:
             return _execute_task_body(task)
         return _execute_task_body(task, admission_complete)
@@ -2222,9 +2354,29 @@ def execute_task(task, admission_complete=None):
         except workflow_candidates.CandidateError as exc:
             _mark_failed(task, str(exc))
             return
-        if admission_complete is None:
-            return _execute_task_inner(task)
-        return _execute_task_inner(task, admission_complete)
+        from .workorder_guard import WorkorderAuthorizationError, watch_task
+
+        with watch_task(task.id, _close_registered_provider_tree) as workorder_check:
+            if workorder_check is not None:
+                return _execute_task_inner(task, admission_complete, workorder_check=workorder_check)
+            if admission_complete is None:
+                return _execute_task_inner(task)
+            return _execute_task_inner(task, admission_complete)
+    except WorkorderAuthorizationError as exc:
+        message = f"Workorder guard refused execution: {exc}"
+        commit_refusal = lambda: _mark_failed(task, message, exit_code=-1)
+        try:
+            stopped = _close_registered_provider_tree(task.id)
+        except Exception:
+            stopped = False
+        if not stopped:
+            raise ProviderOwnershipError(
+                "Workorder refusal is waiting for owned process cleanup",
+                lambda: "" if _close_registered_provider_tree(task.id) else "Workorder process cleanup is unconfirmed",
+                on_cleaned=commit_refusal,
+            ) from exc
+        _commit_terminal_or_defer(task, "workorder refusal", commit_refusal)
+        return
     finally:
         # Project-pipeline election reserves an exact target before any
         # provider can start. Every attempt exit (success, failure, defer,
@@ -2501,6 +2653,102 @@ def _active_worker_task_ids(in_flight: dict, recoveries: dict) -> set[int]:
 def _occupied_worker_slots(in_flight: dict, recoveries: dict) -> int:
     """A quarantined provider keeps its slot until ownership is resolved."""
     return len(in_flight) + len(recoveries)
+
+
+def admission_snapshot():
+    """Честная диагностика очереди — read-only повтор правил допуска воркера.
+
+    Повторяет фильтры get_next_runnable (pending/rate_limited,
+    scheduled_at/next_run_at наступили, серия не на паузе и не завершена).
+    При CONCURRENCY > 1 учитывает занятость lock_key RUNNING-задачами и
+    более ранними готовыми кандидатами; последовательный воркер не
+    исключает повторяющиеся каталоги. Никаких мутаций: claim не меняется.
+    Проекция для /api/tasks и панели. Позиция — ранг среди ГОТОВЫХ;
+    не-готовые получают wait_reason. Относительно опциональной lane-политики
+    проекта позиция базовая: lanes могут как менять порядок, так и запрещать
+    допуск. Lane-политика, бюджетная fairness, свободные слоты и глобальная
+    пауза не моделируются. ready означает только базовый допуск по указанным
+    фильтрам. Возвращает {task_id: dict(queue_position, wait_reason, ready)}.
+
+    Не более двух SELECT (running + кандидаты) независимо от длины очереди:
+    колонки lock_key приезжают в тех же строках. Прежняя версия звала
+    get_task на каждую строку — N+1, измерение на очереди в 500 задач
+    давало ~600 запросов и ~1.2 с на каждый GET /api/tasks.
+    """
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from . import db as _db
+
+    def _lock_view(row):
+        # Только поля lock_key: работаем со строкой, без get_task на задачу
+        return SimpleNamespace(
+            id=row["id"],
+            machine=row["machine"],
+            herdr_target=row["herdr_target"],
+            worktree=row["worktree"],
+            working_dir=row["working_dir"],
+        )
+
+    parallel = CONCURRENCY > 1
+    keys = {}
+
+    def _key(row):
+        identity = (row["machine"], row["herdr_target"],
+                    row["worktree"], row["working_dir"])
+        if identity not in keys:
+            keys[identity] = lock_key(_lock_view(row))
+        return keys[identity]
+
+    now = datetime.now(timezone.utc).isoformat()
+    snapshot = {}
+    with _db._connect() as conn:
+        running_keys = {
+            _key(row)
+            for row in conn.execute(
+                """SELECT id, machine, herdr_target, worktree, working_dir
+                   FROM tasks WHERE status = 'running'""")
+        } if parallel else set()
+        rows = conn.execute(
+            """SELECT t.id, t.machine, t.herdr_target, t.worktree,
+                      t.working_dir,
+                      (t.scheduled_at IS NULL OR t.scheduled_at <= ?) AS sched_ok,
+                      (t.next_run_at IS NULL OR t.next_run_at <= ?) AS next_ok,
+                      (t.series_id IS NULL OR EXISTS (
+                         SELECT 1 FROM task_series s WHERE s.id = t.series_id
+                           AND s.paused = 0 AND s.ended_at IS NULL)) AS series_ok
+               FROM tasks t
+               WHERE t.status IN ('pending', 'rate_limited')
+               ORDER BY t.priority ASC, t.created_at ASC, t.id ASC""",
+            (now, now)).fetchall()
+    taken = set(running_keys)
+    position = 0
+    for row in rows:
+        task = _lock_view(row)
+        if not row["series_ok"]:
+            snapshot[task.id] = {"queue_position": None,
+                                 "wait_reason": "paused_series", "ready": False}
+            continue
+        if not row["sched_ok"] or not row["next_ok"]:
+            snapshot[task.id] = {"queue_position": None,
+                                 "wait_reason": "scheduled_future",
+                                 "ready": False}
+            continue
+        key = _key(row) if parallel else ""
+        if key and key in taken:
+            snapshot[task.id] = {
+                "queue_position": None,
+                "wait_reason": ("busy_session" if task.herdr_target
+                                else "busy_working_dir"),
+                "ready": False,
+            }
+            continue
+        position += 1
+        snapshot[task.id] = {"queue_position": position,
+                             "wait_reason": None, "ready": True}
+        if key:
+            taken.add(key)
+    return snapshot
 
 
 def lock_key(task) -> str:

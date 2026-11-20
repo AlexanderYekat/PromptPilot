@@ -9,6 +9,7 @@ const calls = [];
 const messages = [];
 const stage = {code:'S1', title:'Manual edit', objective:'Goal', stage_type:'integration'};
 const context = vm.createContext({
+  window:{},
   selectedWorkflowId:'wf-test', selectedWorkflowData:{state_version:11}, API:'/api',
   sessionStorage:{getItem:k=>storage.get(k), setItem:(k,v)=>storage.set(k,v), removeItem:k=>storage.delete(k)},
   document:{getElementById:id=>elements[id]},

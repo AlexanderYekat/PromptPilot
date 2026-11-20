@@ -2,6 +2,7 @@
 
 Queue tasks are completed by hand in an isolated database: no provider runs.
 """
+from html import escape
 import json
 import subprocess
 
@@ -75,6 +76,10 @@ Deterministic gate:
 AUDIT_FINDINGS_JSON: []
 AUDIT_VERDICT: PASS
 
+Весь текст отчёта и объяснения размещай перед этими строками. Выводи их
+обычным текстом, вне цитат и блоков кода. После AUDIT_VERDICT допустима
+только завершающая строка ИТОГ установленного workflow-формата.
+
 Для замечаний верни JSON-массив объектов с полями fingerprint, severity
 (blocker/high/medium/low/info), category, title, status (open/resolved/reopened/
 accepted_risk), payload. Поле payload — JSON-объект, не строка; например:
@@ -98,7 +103,6 @@ RESOLVED = (
     '"category":"test","title":"Нужно исправление","status":"resolved"}]\n'
     "AUDIT_VERDICT: PASS\nИТОГ: ГОТОВО — этап принят"
 )
-PASS = "AUDIT_FINDINGS_JSON: []\nAUDIT_VERDICT: PASS\nИТОГ: ГОТОВО — этап принят"
 
 
 def stage(**fields):
@@ -118,9 +122,13 @@ def planned(db, stages, repository=None, branch="feature/prompts", edited=None, 
         "automation": {"enabled": True},
         "roles": {"planner": {"provider": None}, "executor": {"provider": None},
                   "reviewer": {"provider": None}},
-        "gate": {"commands": []},
+        # These cases test prompt composition without deterministic commands;
+        # opt out explicitly. Cases supplying GATE still exercise a real gate.
+        "gate": {"enabled": False, "commands": []},
         "limits": {"max_rounds": 10},
     }
+    if any(stage.get("acceptance_gates") for stage in stages):
+        cfg["gate"]["enabled"] = True
     cfg.update(config)
     workflow = db.create_workflow(WorkflowCreate(
         slug="prompts", objective="Сделать функцию", candidate_branch=branch,
@@ -209,12 +217,13 @@ def test_stage_texts_keep_role_context_answer_format_and_revision_context(isolat
     assert "automation.paused" not in events
 
 
-def test_sections_already_placed_by_the_stage_text_are_not_repeated(isolated_db):
+@pytest.mark.parametrize("review_placeholder", ["stage_review", "previous_review"])
+def test_sections_already_placed_by_the_stage_text_are_not_repeated(isolated_db, review_placeholder):
     reviewer_text = ("Проверь {{stage_goal}}.\nОтчёт: {{executor_report}}\nGate: {{gate_evidence}}\n"
                      "Замечания: {{open_findings}}\nПути: {{allowed_paths}}\n"
                      "Результаты: {{deliverables}}\n{{audit_contract}}\n{{audit_contract}}")
     executor_text = ("Делай: {{stage_goal}}.\nПути: {{allowed_paths}}\nРезультаты: {{deliverables}}\n"
-                     "Замечания: {{stage_review}}\nGate: {{gate_evidence}}\n{{audit_contract}}")
+                     "Замечания: {{" + review_placeholder + "}}\nGate: {{gate_evidence}}\n{{audit_contract}}")
     planned(isolated_db, [stage(executor_prompt=executor_text, reviewer_prompt=reviewer_text)])
 
     executor = finish_task(isolated_db, "EXEC-REPORT")
@@ -273,15 +282,21 @@ def test_stage_without_own_prompts_keeps_the_builtin_text(isolated_db):
                   candidate_branch="feature/prompts", round_no="1")
 
     executor = finish_task(isolated_db, "EXEC-REPORT")
-    assert executor.prompt == render(
+    expected_executor = render(
         LEGACY_EXECUTOR, **common, allowed_paths="src/feature.py",
         deliverables="отчёт о проверке", previous_review="(нет: это первый раунд)",
         gate_evidence="(gate ещё не выполнялся)")
+    assert executor.prompt.startswith(expected_executor.removesuffix(workflows.WORKFLOW_VERDICT_INSTRUCTION)
+                                      + '\n\n<promptpilot-rights')
+    assert executor.prompt.endswith(workflows.WORKFLOW_VERDICT_INSTRUCTION)
 
     reviewer = pending(isolated_db)
-    assert reviewer.prompt == render(
+    expected_reviewer = render(
         LEGACY_REVIEWER, reviewer=True, **common, executor_report="EXEC-REPORT",
-        gate_evidence="Настроенных deterministic-команд нет", open_findings="[]")
+        gate_evidence="Gate отключён настройками", open_findings="[]")
+    assert reviewer.prompt.startswith(expected_reviewer.removesuffix(workflows.WORKFLOW_REVIEWER_VERDICT_INSTRUCTION)
+                                      + '\n\n<promptpilot-rights')
+    assert reviewer.prompt.endswith(workflows.WORKFLOW_REVIEWER_VERDICT_INSTRUCTION)
     assert isolated_db.get_workflow(workflow.id).status.value == "reviewing"
 
 
@@ -307,8 +322,10 @@ def test_custom_role_template_without_format_gets_it(isolated_db):
 def submit(workflow_id, text):
     workflow = workflows.db.get_workflow(workflow_id)
     assert workflow.status.value == "awaiting_external"
+    assignment = workflows.external_assignment(workflow_id)
     workflows.submit_external_result(workflow_id, WorkflowExternalResult(
-        expected_version=workflow.state_version, result=text, performer="Мария"))
+        expected_version=workflow.state_version, run_id=assignment.run_id,
+        input_sha256=assignment.input_sha256, result=text, performer="Мария"))
     return workflows.advance_workflow(workflow_id)
 
 
@@ -325,7 +342,7 @@ def test_external_stage_with_own_assignment_keeps_its_context(isolated_db):
     first = workflows.external_assignment(workflow.id).assignment
     assert first.startswith("Сравните библиотеки вручную.")
     for part in ("Этап: S1 Исследование\nПроверяемая цель этапа:\nСравнить библиотеки",
-                 "docs/research.md", "таблица сравнения", "Проверки приёмки:", GATE,
+                 "docs/research.md", "таблица сравнения", "Проверки приёмки:", escape(GATE, quote=False),
                  "(нет: это первая попытка этапа)", "(gate ещё не выполнялся)"):
         assert part in first
     assert "ИТОГ:" not in first and CONTRACT not in first
@@ -402,3 +419,14 @@ def test_candidate_flow_with_stage_texts_accepts_the_auditor_pass(isolated_db, r
     assert current.status.value == "completed"
     events = [e.event_type for e in isolated_db.list_workflow_events(workflow.id, limit=1000)]
     assert "automation.paused" not in events and "candidate.blocked" not in events
+
+
+def test_report_quoting_a_placeholder_is_left_as_written(isolated_db):
+    # Placeholders are filled in one pass: a report that quotes one placed
+    # after it ({{open_findings}}) used to be rewritten by that later value.
+    planned(isolated_db, [stage(executor_prompt="Сделай работу этапа.")])
+
+    finish_task(isolated_db, "Отчёт цитирует {{open_findings}} как есть")
+    reviewer = pending(isolated_db)
+
+    assert "Отчёт цитирует {{open_findings}} как есть" in reviewer.prompt

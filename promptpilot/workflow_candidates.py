@@ -222,12 +222,12 @@ def unignored_output_directories(workflow):
 
 def readiness(workflow, stages=(), check_output_paths=False):
     cfg = config(workflow)
-    commands = list(cfg.gate.commands)
+    commands = cfg.gate.model_dump(mode='json')['commands']
     commands.extend(cfg.stage.get('acceptance_gates', []))
     specs = []
     for stage in stages:
         if hasattr(stage, 'acceptance_gates'):
-            spec = stage.model_dump()
+            spec = stage.model_dump(mode='json')
         else:
             # A stage row keeps its code in a column, not in spec_json.
             spec = {**db._json_load(stage['spec_json']), 'code': stage['code']}
@@ -243,7 +243,7 @@ def readiness(workflow, stages=(), check_output_paths=False):
         if role.worktree or role.machine or existing_session(role.provider, role.herdr_target):
             raise CandidateError('repository_mismatch', 'Фиксация версии поддерживает локальные роли в единой рабочей папке; worktree, remote и herdr-session требуют отдельной поддержки')
     for command in commands:
-        if '\\"$env:PROMPTPILOT_CANDIDATE_' in command:
+        if isinstance(command, str) and '\\"$env:PROMPTPILOT_CANDIDATE_' in command:
             raise CandidateError('invalid_candidate_command', 'В PowerShell используйте "$env:PROMPTPILOT_CANDIDATE_SHA" без обратных слешей')
     # Checked when a plan is approved or a planless workflow starts. Committing
     # into an output directory would otherwise surface only at handoff.
@@ -469,12 +469,15 @@ def preflight_task(task):
                 raise CandidateError('baseline_changed', 'Рабочая папка изменилась после постановки исполнителя в очередь')
 
 
-def run_gates(workflow, windows_runner):
+def run_gates(workflow, scope, *, owned_snapshot):
     """Claim once before executing. An interrupted claim requires operator action."""
     from .models import WorkflowGateDecision
+    from . import gate_execution
+    from .process_tree import run_owned
+
     cfg = config(workflow)
     stage = db.get_workflow_stage(workflow.current_stage_id) if workflow.current_stage_id else None
-    commands = list(dict.fromkeys(cfg.gate.commands + (stage.acceptance_gates if stage else cfg.stage.get('acceptance_gates', []))))
+    commands = scope['commands']
     with db._connect(immediate=True) as conn:
         row = conn.execute('SELECT * FROM workflows WHERE id=?', (workflow.id,)).fetchone()
         if row['state_version'] != workflow.state_version or row['status'] != 'gating':
@@ -497,7 +500,15 @@ def run_gates(workflow, windows_runner):
         readiness(workflow, [stage] if stage else [])
         observed_revision = identity(candidate['repository_path'])['revision']
         validate(candidate)
-        for command in commands:
+        if scope.get('validation_errors'):
+            raise CandidateError('invalid_gate_inputs', '; '.join(scope['validation_errors']))
+        for index, (command, argv) in enumerate(zip(commands, scope['argv'])):
+            if owned_snapshot and (index > 0 or 'inputs' in scope):
+                with db._connect() as conn:
+                    active = db.get_workflow(workflow.id, conn=conn)
+                    if (active.state_version != workflow.state_version
+                            or gate_execution.snapshot(conn, active) != scope):
+                        raise CandidateError('gate_scope_changed', 'Gate context changed; remaining commands stopped')
             record = {'candidate_id': candidate['candidate_id'], 'expected_revision': candidate['candidate_revision'],
                       'repository_path': candidate['repository_path'], 'command': command, 'exit_code': None,
                       'before_ok': False, 'after_ok': False}
@@ -505,18 +516,16 @@ def run_gates(workflow, windows_runner):
             record['observed_before'] = identity(candidate['repository_path'])['revision']
             validate(candidate)
             record['before_ok'] = True
-            argv = (['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', command]
-                    if os.name == 'nt' else ['/bin/sh', '-lc', command])
-            try:
-                result = (windows_runner(argv, candidate['repository_path'], cfg.gate.timeout_seconds, env=env)
-                          if os.name == 'nt' else subprocess.run(argv, cwd=candidate['repository_path'], env=env,
-                              capture_output=True, text=True, errors='replace', timeout=cfg.gate.timeout_seconds))
-                record['exit_code'] = result.returncode
-                record['output'] = ((result.stdout or '') + (result.stderr or ''))[-4000:]
-            finally:
-                record['observed_after'] = identity(candidate['repository_path'])['revision']
-                validate(candidate)
-                record['after_ok'] = True
+            result = run_owned(
+                argv, cwd=candidate['repository_path'], env=env,
+                **({'creationflags': subprocess.CREATE_NO_WINDOW} if os.name == 'nt' else {}),
+                capture_output=True, text=True, errors='replace', timeout=cfg.gate.timeout_seconds,
+            )
+            record['exit_code'] = result.returncode
+            record['output'] = ((result.stdout or '') + (result.stderr or ''))[-4000:]
+            record['observed_after'] = identity(candidate['repository_path'])['revision']
+            validate(candidate)
+            record['after_ok'] = True
             evidence.append(f"exit={result.returncode}: {command}\n{record['output']}")
             if result.returncode:
                 verdict, summary = 'FAIL', f'Команда gate завершилась с кодом {result.returncode}'
@@ -527,8 +536,6 @@ def run_gates(workflow, windows_runner):
         verdict, summary = 'HUMAN_REQUIRED', str(exc)
     except subprocess.TimeoutExpired:
         verdict, summary = 'HUMAN_REQUIRED', 'Gate превысил timeout; незавершённый процесс и протокол требуют проверки оператора'
-    except OSError as exc:
-        verdict, summary = 'HUMAN_REQUIRED', f'Не удалось запустить gate: {exc}'
     payload = {'candidate_id': candidate['candidate_id'], 'state_version': workflow.state_version,
                'observed_revision': observed_revision,
                'expected_revision': candidate['candidate_revision'], 'repository_path': candidate['repository_path'],

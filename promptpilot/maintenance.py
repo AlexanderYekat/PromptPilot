@@ -21,6 +21,11 @@ def _status(conn):
     drain = conn.execute('SELECT value FROM settings WHERE key=?', (DRAIN_KEY,)).fetchone()
     gates = [db._json_load(r[0]) for r in conn.execute(
         "SELECT value FROM settings WHERE key LIKE 'deployment_gate:%'")]
+    registered = {gate['workflow_id'] for gate in gates}
+    gates.extend(dict(row) for row in conn.execute(
+        "SELECT workflow_id, execution_id, state, created_at AS started_at "
+        "FROM workflow_gate_executions WHERE state IN ('STARTED', 'SETTLED', 'UNKNOWN')"
+    ) if row['workflow_id'] not in registered)
     tasks = [r[0] for r in conn.execute("SELECT id FROM tasks WHERE status='running'")]
     return {'drain': db._json_load(drain[0]) if drain else None,
             'running_tasks': tasks, 'active_gates': gates,

@@ -11,7 +11,7 @@ import threading
 import time
 import unicodedata
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -76,12 +76,40 @@ CREATE TABLE IF NOT EXISTS tasks (
     worktree_branch TEXT,
     note TEXT,
     budget_wait_scope TEXT,
+    merge_checkpoint_gate TEXT,
     budget_wait_started_at TEXT,
     pipeline_priority_restore INTEGER,
     verdict TEXT
     ,series_id INTEGER REFERENCES task_series(id)
     ,rights TEXT
 );
+
+CREATE TABLE IF NOT EXISTS task_token_usage (
+    task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    input_tokens INTEGER NOT NULL CHECK(input_tokens >= 0),
+    output_tokens INTEGER NOT NULL CHECK(output_tokens >= 0),
+    cached_input_tokens INTEGER NOT NULL CHECK(cached_input_tokens >= 0),
+    model TEXT,
+    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0 CHECK(cache_creation_input_tokens >= 0),
+    cost_attributable INTEGER NOT NULL DEFAULT 1
+);
+
+-- Original provider text for workflow decisions; display metadata stays in tasks.result.
+CREATE TABLE IF NOT EXISTS task_reports (
+    task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+    task_started_at TEXT,
+    result_sha256 TEXT NOT NULL,
+    report_text TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS task_reports_invalidate
+AFTER UPDATE OF status, started_at, result ON tasks
+WHEN NEW.status != 'completed'
+  OR NEW.started_at IS NOT OLD.started_at
+  OR NEW.result IS NOT OLD.result
+BEGIN
+    DELETE FROM task_reports WHERE task_id = NEW.id;
+END;
 
 CREATE TABLE IF NOT EXISTS task_series (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,7 +151,8 @@ CREATE TABLE IF NOT EXISTS notifications (
     sent_at TEXT,
     pane_id TEXT,
     machine TEXT,
-    flow_ref TEXT
+    flow_ref TEXT,
+    kind TEXT
 );
 
 CREATE TABLE IF NOT EXISTS prompt_log (
@@ -146,6 +175,37 @@ CREATE TABLE IF NOT EXISTS pipeline_snapshots (
     payload_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS tail_discovery (
+    repository TEXT PRIMARY KEY,
+    revision INTEGER NOT NULL,
+    checkpoint_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS tail_candidates (
+    repository TEXT NOT NULL REFERENCES tail_discovery(repository) ON DELETE RESTRICT,
+    pr_number INTEGER NOT NULL CHECK(pr_number > 0),
+    merged_at TEXT NOT NULL,
+    head TEXT NOT NULL,
+    base TEXT NOT NULL,
+    last_observed_at TEXT NOT NULL,
+    pass_token TEXT NOT NULL,
+    revision INTEGER NOT NULL DEFAULT 1,
+    classified_revision INTEGER,
+    state TEXT NOT NULL DEFAULT 'pending-proof',
+    review_id TEXT,
+    review_updated_at TEXT,
+    review_body_digest TEXT,
+    epoch_digest TEXT,
+    completion_kind TEXT,
+    completion_digest TEXT,
+    next_check_at TEXT,
+    last_reason TEXT,
+    PRIMARY KEY (repository, pr_number)
+);
+CREATE INDEX IF NOT EXISTS idx_tail_candidates_pass
+    ON tail_candidates(repository, pass_token, pr_number);
+
 CREATE TABLE IF NOT EXISTS pipeline_target_reservations (
     repository TEXT NOT NULL,
     stage TEXT NOT NULL,
@@ -161,6 +221,7 @@ CREATE TABLE IF NOT EXISTS pipeline_target_reservations (
     token TEXT NOT NULL,
     reserved_at TEXT NOT NULL,
     expires_at TEXT NOT NULL,
+    strict_lifetime INTEGER NOT NULL DEFAULT 0 CHECK(strict_lifetime IN (0, 1)),
     PRIMARY KEY (repository, stage, number, head)
 );
 
@@ -207,6 +268,42 @@ CREATE TABLE IF NOT EXISTS workflow_plans (
     updated_at TEXT NOT NULL,
     approved_at TEXT
 );
+
+CREATE TABLE IF NOT EXISTS workflow_gate_executions (
+    execution_id TEXT PRIMARY KEY,
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE RESTRICT,
+    token TEXT NOT NULL UNIQUE,
+    observed_version INTEGER NOT NULL CHECK(observed_version >= 0),
+    admitted_version INTEGER NOT NULL CHECK(admitted_version >= observed_version),
+    round_id TEXT NOT NULL REFERENCES workflow_rounds(id) ON DELETE RESTRICT,
+    stage_id TEXT,
+    scope_sha256 TEXT NOT NULL,
+    scope_json TEXT NOT NULL,
+    state TEXT NOT NULL CHECK(state IN
+        ('STARTED', 'SETTLED', 'APPLIED', 'NOT_STARTED', 'UNKNOWN', 'RESOLVED')),
+    decision_json TEXT,
+    decision_sha256 TEXT,
+    cleanup_json TEXT,
+    created_at TEXT NOT NULL,
+    settled_at TEXT,
+    projected_version INTEGER,
+    recovery_nonce TEXT UNIQUE,
+    resolution_json TEXT,
+    CHECK(state NOT IN ('SETTLED', 'APPLIED') OR
+        (decision_json IS NOT NULL AND decision_sha256 IS NOT NULL
+         AND cleanup_json IS NOT NULL AND settled_at IS NOT NULL)),
+    CHECK(state != 'APPLIED' OR projected_version IS NOT NULL),
+    CHECK(state NOT IN ('UNKNOWN', 'RESOLVED') OR recovery_nonce IS NOT NULL),
+    CHECK(state != 'RESOLVED' OR resolution_json IS NOT NULL)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gate_execution_active
+    ON workflow_gate_executions(workflow_id)
+    WHERE state IN ('STARTED', 'SETTLED', 'UNKNOWN');
+CREATE TRIGGER IF NOT EXISTS gate_executions_no_delete
+BEFORE DELETE ON workflow_gate_executions
+BEGIN
+    SELECT RAISE(ABORT, 'gate execution history is retained');
+END;
 
 CREATE TABLE IF NOT EXISTS workflow_stages (
     id TEXT PRIMARY KEY,
@@ -297,6 +394,15 @@ CREATE TABLE IF NOT EXISTS workflow_events (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS workflow_memory (
+    workflow_id TEXT NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    content TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    updated_by_task INTEGER,
+    PRIMARY KEY (workflow_id, name)
+);
+
 CREATE TRIGGER IF NOT EXISTS workflow_events_no_update
 BEFORE UPDATE ON workflow_events
 BEGIN
@@ -358,12 +464,16 @@ CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflows(status, updated_at)
 CREATE INDEX IF NOT EXISTS idx_workflow_stages_workflow ON workflow_stages(workflow_id, position);
 CREATE INDEX IF NOT EXISTS idx_workflow_rounds_workflow ON workflow_rounds(workflow_id, round_no);
 CREATE INDEX IF NOT EXISTS idx_workflow_runs_round ON workflow_runs(round_id, role, attempt_no);
+CREATE INDEX IF NOT EXISTS idx_workflow_runs_task ON workflow_runs(task_id);
+CREATE INDEX IF NOT EXISTS idx_workflow_plans_task ON workflow_plans(planner_task_id);
 CREATE INDEX IF NOT EXISTS idx_workflow_findings_workflow ON workflow_findings(workflow_id, status, severity);
 CREATE INDEX IF NOT EXISTS idx_workflow_artifacts_round ON workflow_artifacts(round_id, kind);
 CREATE INDEX IF NOT EXISTS idx_workflow_events_workflow ON workflow_events(workflow_id, seq);
 """
 
 MIGRATIONS = [
+    "ALTER TABLE task_token_usage ADD COLUMN cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE task_token_usage ADD COLUMN cost_attributable INTEGER NOT NULL DEFAULT 1",
     "ALTER TABLE tasks ADD COLUMN provider TEXT",
     "ALTER TABLE tasks ADD COLUMN model_used TEXT",
     "ALTER TABLE tasks ADD COLUMN skip_permissions INTEGER DEFAULT 0",
@@ -396,9 +506,11 @@ MIGRATIONS = [
     "ALTER TABLE tasks ADD COLUMN effort TEXT",
     "ALTER TABLE notifications ADD COLUMN pane_id TEXT",
     "ALTER TABLE notifications ADD COLUMN machine TEXT",
+    "ALTER TABLE notifications ADD COLUMN kind TEXT",
     "ALTER TABLE workflows ADD COLUMN current_stage_id TEXT",
     "ALTER TABLE workflows ADD COLUMN pause_after_stage_id TEXT",
     "ALTER TABLE workflows ADD COLUMN pause_version INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE workflow_memory ADD COLUMN scope_stage TEXT",
     """CREATE TABLE IF NOT EXISTS workflow_plans (
         workflow_id TEXT PRIMARY KEY REFERENCES workflows(id) ON DELETE RESTRICT,
         status TEXT NOT NULL DEFAULT 'draft', planner_task_id INTEGER,
@@ -426,7 +538,15 @@ MIGRATIONS = [
         task_timeout INTEGER, paused INTEGER NOT NULL DEFAULT 0, ended_at TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL
     )""",
-    "CREATE INDEX IF NOT EXISTS idx_tasks_series ON tasks(series_id, id)",
+    # Schedule refreshes scan narrow health columns for every occurrence. A
+    # covering index avoids visiting task rows containing large result payloads.
+    "CREATE INDEX IF NOT EXISTS idx_tasks_series_summary ON tasks(series_id, id, status, started_at, completed_at, verdict)",
+    # The covering index also supports every lookup using the older
+    # idx_tasks_series(series_id, id) prefix. Keeping both can make SQLite
+    # prefer the narrow, table-reading scan, so the old one is only dropped:
+    # migrations replay on every start, and creating it here first would
+    # rebuild it over the whole task table each time just to drop it again.
+    "DROP INDEX IF EXISTS idx_tasks_series",
     """CREATE TABLE IF NOT EXISTS pipeline_snapshots (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         profile_id TEXT NOT NULL, repository TEXT NOT NULL,
@@ -449,9 +569,18 @@ MIGRATIONS = [
     "ALTER TABLE pipeline_target_reservations ADD COLUMN herdr_pane_id TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE pipeline_target_reservations ADD COLUMN herdr_tab_id TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE pipeline_target_reservations ADD COLUMN herdr_workspace_id TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE pipeline_target_reservations ADD COLUMN strict_lifetime INTEGER NOT NULL DEFAULT 0 CHECK(strict_lifetime IN (0, 1))",
     "ALTER TABLE tasks ADD COLUMN budget_wait_scope TEXT",
+    "ALTER TABLE tasks ADD COLUMN merge_checkpoint_gate TEXT",
     "CREATE INDEX IF NOT EXISTS idx_tasks_budget_wait ON tasks(budget_wait_scope, status, priority)",
     "ALTER TABLE tasks ADD COLUMN pipeline_priority_restore INTEGER",
+    "ALTER TABLE tail_candidates ADD COLUMN classified_revision INTEGER",
+    """CREATE INDEX IF NOT EXISTS idx_tail_candidates_age
+       ON tail_candidates(repository, base, merged_at, pr_number)
+       WHERE classified_revision IS NOT revision OR state IN ('ready', 'pending-proof')""",
+    """CREATE INDEX IF NOT EXISTS idx_tail_candidates_due
+       ON tail_candidates(repository, base, next_check_at, pr_number)
+       WHERE classified_revision = revision AND state != 'ready' AND next_check_at IS NOT NULL""",
     "ALTER TABLE tasks ADD COLUMN budget_wait_started_at TEXT",
     "CREATE INDEX IF NOT EXISTS idx_tasks_budget_wait_fairness ON tasks(budget_wait_scope, status, budget_wait_started_at, priority, id)",
     # 1С-доработка (epf_tools): связь PP-задачи с проектом обработки
@@ -470,21 +599,24 @@ MIGRATIONS = [
         updated_at TEXT NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS idx_epf_jobs_task ON epf_jobs(task_id)",
+    # the assignment of a stage done outside PromptPilot (issue #122)
+    "ALTER TABLE workflow_runs ADD COLUMN input_json TEXT",
     # what the agent run may do (models.TaskRights); NULL = skip_permissions decides
     "ALTER TABLE tasks ADD COLUMN rights TEXT",
     # flow notifications carry "<item>:<step>" (approval) or "<item>:" (stuck item)
     # so the bot adds the matching buttons
     "ALTER TABLE notifications ADD COLUMN flow_ref TEXT",
-    # the assignment of a stage done outside PromptPilot (issue #122)
-    "ALTER TABLE workflow_runs ADD COLUMN input_json TEXT",
 ]
 
 WORKFLOW_SCHEMA_VERSION = "workflow_orchestrator_w0_v1"
 WORKFLOW_STAGE_SCHEMA_VERSION = "workflow_stage_planner_w3_v1"
+WORKFLOW_GATE_SERIAL_SCHEMA_VERSION = "workflow_gate_serial_v1"
 PIPELINE_TARGET_RESERVATION_SCHEMA_VERSION = "pipeline_target_reservations_v1"
 PIPELINE_TARGET_ATTEMPT_SCHEMA_VERSION = "pipeline_target_reservations_attempt_v2"
 PIPELINE_TARGET_OWNERSHIP_SCHEMA_VERSION = "pipeline_target_reservations_ownership_v3"
 PIPELINE_TARGET_HERDR_SCHEMA_VERSION = "pipeline_target_reservations_herdr_v4"
+TAIL_DISCOVERY_SCHEMA_VERSION = "tail_discovery_v1"
+TAIL_CLASSIFICATION_SCHEMA_VERSION = "tail_classification_v1"
 PIPELINE_BUDGET_WAITER_FAIRNESS_SCHEMA_VERSION = \
     "pipeline_github_budget_waiter_fairness_v1"
 
@@ -639,6 +771,11 @@ def _init_db_once():
         conn.execute(
             """INSERT OR IGNORE INTO schema_migrations (version, applied_at)
                VALUES (?, ?)""",
+            (WORKFLOW_GATE_SERIAL_SCHEMA_VERSION, _now()),
+        )
+        conn.execute(
+            """INSERT OR IGNORE INTO schema_migrations (version, applied_at)
+               VALUES (?, ?)""",
             (PIPELINE_TARGET_RESERVATION_SCHEMA_VERSION, _now()),
         )
         conn.execute(
@@ -655,6 +792,14 @@ def _init_db_once():
             """INSERT OR IGNORE INTO schema_migrations (version, applied_at)
                VALUES (?, ?)""",
             (PIPELINE_TARGET_HERDR_SCHEMA_VERSION, _now()),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            (TAIL_DISCOVERY_SCHEMA_VERSION, _now()),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)",
+            (TAIL_CLASSIFICATION_SCHEMA_VERSION, _now()),
         )
         fairness_migrated = conn.execute(
             "SELECT 1 FROM schema_migrations WHERE version = ?",
@@ -740,6 +885,7 @@ def reserve_pipeline_target(repository: str, stage: str, number: int,
                             head: str, task_id: int, ttl_seconds: int,
                             *, task_started_at: str | None = None,
                             ownership_kind: str | None = None,
+                            strict_lifetime: bool = False,
                             now: Optional[datetime] = None) -> Optional[dict]:
     """Atomically reserve one exact project-pipeline target for a task.
 
@@ -750,14 +896,19 @@ def reserve_pipeline_target(repository: str, stage: str, number: int,
     repository, stage, number, head, task_id = _pipeline_target_identity(
         repository, stage, number, head, task_id)
     ttl_seconds = _pipeline_reservation_ttl(ttl_seconds)
-    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    now_value = current.isoformat()
-    expires_at = (current + timedelta(seconds=ttl_seconds)).isoformat()
+    if type(strict_lifetime) is not bool:
+        raise ValueError('strict pipeline lifetime must be boolean')
     ownership_kind = str(ownership_kind or "").strip().lower()
     if ownership_kind not in {"", "headless", "herdr"}:
         raise ValueError("invalid pipeline provider ownership kind")
     with _connect(immediate=True) as conn:
+        # A writer wait consumes lease lifetime. Read time only after it.
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        now_value = current.isoformat()
+        expires_at = (current + timedelta(seconds=ttl_seconds)).isoformat()
         attempt = ""
+        if strict_lifetime and task_started_at is None:
+            return None
         if task_started_at is not None:
             attempt = str(task_started_at).strip()
             try:
@@ -772,6 +923,9 @@ def reserve_pipeline_target(repository: str, stage: str, number: int,
             ).fetchone()
             if (task_row is None or task_row["status"] != "running"
                     or task_row["started_at"] != attempt):
+                return None
+            if strict_lifetime and conn.execute(
+                    "SELECT 1 FROM settings WHERE key=? AND value='1'",('cancel_task:'+str(task_id),)).fetchone():
                 return None
         conn.execute(
             """DELETE FROM pipeline_target_reservations
@@ -799,11 +953,14 @@ def reserve_pipeline_target(repository: str, stage: str, number: int,
                     or (attempt and existing["task_started_at"] != attempt)
                     or (ownership_kind and existing["ownership_kind"] != ownership_kind)):
                 return None
+            strict_lifetime = strict_lifetime or bool(existing['strict_lifetime'])
+            if strict_lifetime and not _strict_pipeline_target_live(conn,existing,current):
+                return None
             conn.execute(
-                """UPDATE pipeline_target_reservations SET expires_at = ?
+                """UPDATE pipeline_target_reservations SET expires_at = ?, strict_lifetime = ?
                    WHERE repository = ? AND stage = ? AND number = ? AND head = ?
                      AND task_id = ? AND token = ?""",
-                (expires_at, repository, stage, number, head, task_id,
+                (expires_at, int(strict_lifetime), repository, stage, number, head, task_id,
                  existing["token"]),
             )
             existing = conn.execute(
@@ -827,11 +984,11 @@ def reserve_pipeline_target(repository: str, stage: str, number: int,
         conn.execute(
             """INSERT INTO pipeline_target_reservations
                (repository, stage, number, head, task_id, task_started_at,
-                ownership_kind, herdr_session_state, token, reserved_at, expires_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ownership_kind, herdr_session_state, token, reserved_at, expires_at, strict_lifetime)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (repository, stage, number, head, task_id, attempt, ownership_kind,
              "reserved" if ownership_kind == "herdr" else "", token,
-             now_value, expires_at),
+             now_value, expires_at, int(strict_lifetime)),
         )
         row = conn.execute(
             """SELECT * FROM pipeline_target_reservations
@@ -954,6 +1111,22 @@ def bind_pipeline_target_herdr_session(
         return _reservation_dict(row) if row is not None else None
 
 
+def _strict_pipeline_target_live(conn,row,current):
+    """Persistent typed policy also fences callers using legacy helpers.
+
+    The marker is local storage metadata, never an extra signed wire field.
+    Expired running attempts remain ownership barriers until real cleanup.
+    """
+    try:expiry=datetime.fromisoformat(row['expires_at'])
+    except (TypeError,ValueError):return False
+    if expiry.tzinfo is None or expiry.utcoffset() is None or expiry<=current:
+        return False
+    return conn.execute("""SELECT 1 FROM tasks WHERE id=? AND status='running'
+        AND started_at=? AND started_at!=''
+        AND NOT EXISTS (SELECT 1 FROM settings WHERE key=? AND value='1')""",
+        (row['task_id'],row['task_started_at'],'cancel_task:'+str(row['task_id']))).fetchone() is not None
+
+
 def renew_pipeline_target_reservation(reservation: dict, ttl_seconds: int,
                                       *, now: Optional[datetime] = None) -> Optional[dict]:
     """Renew only the still-live exact lease represented by ``reservation``."""
@@ -972,10 +1145,14 @@ def renew_pipeline_target_reservation(reservation: dict, ttl_seconds: int,
     if not re.fullmatch(r"[0-9a-f]{32}", token):
         raise ValueError("invalid pipeline target reservation token")
     ttl_seconds = _pipeline_reservation_ttl(ttl_seconds)
-    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    now_value = current.isoformat()
-    expires_at = (current + timedelta(seconds=ttl_seconds)).isoformat()
     with _connect(immediate=True) as conn:
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        now_value = current.isoformat()
+        expires_at = (current + timedelta(seconds=ttl_seconds)).isoformat()
+        stored=conn.execute('SELECT * FROM pipeline_target_reservations WHERE repository=? AND number=?',
+                            (repository,number)).fetchone()
+        if stored is not None and stored['strict_lifetime'] and not _strict_pipeline_target_live(conn,stored,current):
+            return None
         updated = conn.execute(
             """UPDATE pipeline_target_reservations
                SET expires_at = CASE WHEN expires_at < ? THEN ? ELSE expires_at END
@@ -1025,17 +1202,21 @@ def renew_task_pipeline_target_reservations(
         *, now: Optional[datetime] = None) -> int:
     """Heartbeat every still-live target owned by one running task.
 
-    Expired rows are never resurrected, and a shorter heartbeat never reduces
-    an operator-configured longer TTL. This keeps a live/uncertain provider's
-    target fenced while preserving TTL recovery after a hard process crash.
+    Legacy running attempts retain their historical renewal behavior. Strict
+    typed rows cannot renew after expiry/cancellation, including through this
+    old bulk helper, and remain barriers while their owner is still running.
+    A shorter heartbeat never reduces an operator-configured longer TTL.
     """
     if isinstance(task_id, bool) or not isinstance(task_id, int) or task_id <= 0:
         return 0
     ttl_seconds = _pipeline_reservation_ttl(ttl_seconds)
-    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    now_value = current.isoformat()
-    heartbeat_expiry = (current + timedelta(seconds=ttl_seconds)).isoformat()
     with _connect(immediate=True) as conn:
+        current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        now_value = current.isoformat()
+        heartbeat_expiry = (current + timedelta(seconds=ttl_seconds)).isoformat()
+        stored=conn.execute('SELECT * FROM pipeline_target_reservations WHERE task_id=?',(task_id,)).fetchone()
+        if stored is not None and stored['strict_lifetime'] and not _strict_pipeline_target_live(conn,stored,current):
+            return 0
         updated = conn.execute(
             """UPDATE pipeline_target_reservations
                SET expires_at = CASE WHEN expires_at < ? THEN ? ELSE expires_at END
@@ -1128,6 +1309,62 @@ def _create_series(conn: sqlite3.Connection, task: TaskCreate) -> int:
     return cur.lastrowid
 
 
+def workorder_origins(conn: sqlite3.Connection, *, task_id=None, series_id=None) -> tuple[set[int], set[int]]:
+    """Immutable guarded roots, including unsupported legacy series aliases."""
+    query = (
+        "SELECT r.task_id, t.series_id, e.payload_json, w.config_json "
+        "FROM workflow_runs r LEFT JOIN tasks t ON t.id=r.task_id "
+        "JOIN workflows w ON w.id=r.workflow_id LEFT JOIN workflow_events e "
+        "ON e.idempotency_key='workflow.created:' || w.id"
+    )
+    params = ()
+    if task_id is not None:
+        query += " WHERE r.task_id=?"
+        params = (task_id,)
+    elif series_id is not None:
+        query += " WHERE r.task_id IN (SELECT id FROM tasks WHERE series_id=?)"
+        params = (series_id,)
+    rows = conn.execute(query, params).fetchall()
+    tasks, series = set(), set()
+    fences = ()
+    if series_id is not None:
+        fences = conn.execute("SELECT value FROM settings WHERE key=?",
+                              (f"workorder_no_recurrence:v1:{series_id}",))
+    elif task_id is None:
+        fences = conn.execute("SELECT value FROM settings WHERE key GLOB 'workorder_no_recurrence:v1:*'")
+    for row in fences:
+        series.add(int(row["value"]))
+    for row in rows:
+        try:
+            original = _json_load(row["payload_json"]) if row["payload_json"] else {}
+            current = _json_load(row["config_json"])
+            guarded = ((original.get("config") or {}).get("workorder_guard") is not None
+                       or current.get("workorder_guard") is not None)
+        except (ValueError, TypeError, AttributeError):
+            guarded = True
+        if guarded:
+            tasks.add(row["task_id"])
+            if row["series_id"] is not None:
+                series.add(row["series_id"])
+    return tasks, series
+
+
+def _retain_workorder_series_fences(conn):
+    """Keep unsupported legacy lineage refused after root task retention cleanup."""
+    _, series = workorder_origins(conn)
+    conn.executemany("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+                     [(f"workorder_no_recurrence:v1:{value}", str(value)) for value in series])
+
+
+def workorder_recurrence_forbidden(task_id: int, *, conn=None) -> bool:
+    with (nullcontext(conn) if conn is not None else _connect()) as connection:
+        if task_id in workorder_origins(connection, task_id=task_id)[0]:
+            return True
+        row = connection.execute("SELECT series_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return bool(row and row["series_id"] is not None
+                    and row["series_id"] in workorder_origins(connection, series_id=row["series_id"])[1])
+
+
 def _backfill_task_series(conn: sqlite3.Connection):
     """Give legacy recurrence chains a stable identity without changing runs."""
     rows = conn.execute(
@@ -1135,8 +1372,13 @@ def _backfill_task_series(conn: sqlite3.Connection):
            WHERE recurrence IS NOT NULL AND recurrence != '' AND series_id IS NULL
            ORDER BY id"""
     ).fetchall()
+    if not rows:
+        return
+    guarded_tasks, _ = workorder_origins(conn)
     groups = {}
     for row in rows:
+        if row["id"] in guarded_tasks:
+            continue
         groups.setdefault((row["prompt"], row["working_dir"] or ""), []).append(row)
     for chain in groups.values():
         head = next((r for r in reversed(chain)
@@ -1205,6 +1447,8 @@ def create_series_occurrence_if_idle(task: TaskCreate) -> Optional[TaskInDB]:
     if not task.series_id:
         raise ValueError("series occurrence requires series_id")
     with _connect(immediate=True) as conn:
+        if task.series_id in workorder_origins(conn, series_id=task.series_id)[1]:
+            return None
         series = conn.execute(
             "SELECT ended_at FROM task_series WHERE id = ?",
             (task.series_id,),
@@ -1291,6 +1535,8 @@ def get_next_runnable(
 
     The whole select-then-claim runs under the write lock, so several workers
     (threads of one worker, or separate processes) never claim the same row.
+    Global pause is checked under this same lock: a worker that passed an
+    earlier pause precheck cannot claim after the pause was acknowledged.
 
     busy_keys/key_fn — when the caller already runs tasks, candidates whose
     key_fn(task) is in busy_keys are passed over: that is how two agents are
@@ -1305,6 +1551,11 @@ def get_next_runnable(
     with _connect(immediate=True) as conn:
         # Atomic with maintenance admission: a drain cannot miss a new claim.
         if conn.execute("SELECT 1 FROM settings WHERE key='deployment_drain'").fetchone():
+            return None
+        paused = conn.execute(
+            "SELECT value FROM settings WHERE key = 'worker_paused'"
+        ).fetchone()
+        if paused and paused["value"] == "1":
             return None
         # The admission baton must reach a worker slot too. Otherwise an
         # endless stream of higher-priority runnable tasks can repeatedly be
@@ -1467,8 +1718,11 @@ def _release_task_pipeline_targets(conn, task_id: int, started_at=None):
 
 def mark_completed(task_id: int, result: str, exit_code: int = 0,
                    model_used: str = None, session_id: str = None,
-                   verdict: str = None, *, expected_started_at=None) -> bool:
+                   verdict: str = None, *, expected_started_at=None, usage=None,
+                   report_text: str = None) -> bool:
     """Finalize a task, optionally committing its verdict atomically."""
+    if report_text is not None and not isinstance(report_text, str):
+        raise ValueError('report_text must be a string or None')
     with _connect() as conn:
         attempt = _attempt_iso(expected_started_at)
         where = "id = ?"
@@ -1488,6 +1742,42 @@ def mark_completed(task_id: int, result: str, exit_code: int = 0,
         if cur.rowcount:
             _drop_cancel_flag(conn, task_id)
             _release_task_pipeline_targets(conn, task_id, attempt)
+            # The raw/model boundary is recorded by the producer, never inferred
+            # by stripping renderer-looking text supplied by the model. Keep it
+            # out of ordinary task list projections and bind it to this result.
+            conn.execute("DELETE FROM task_reports WHERE task_id = ?", (task_id,))
+            if report_text is not None:
+                linked = conn.execute(
+                    "SELECT started_at FROM tasks WHERE id=? AND EXISTS "
+                    "(SELECT 1 FROM workflow_runs WHERE task_id=tasks.id)", (task_id,),
+                ).fetchone()
+                if linked:
+                    conn.execute(
+                        "INSERT INTO task_reports (task_id,task_started_at,result_sha256,report_text) "
+                        "VALUES (?, ?, ?, ?)",
+                        (task_id, linked['started_at'], hashlib.sha256(result.encode('utf-8')).hexdigest(),
+                         report_text),
+                    )
+            # Usage belongs to this successful attempt, never to assistant text.
+            conn.execute("DELETE FROM task_token_usage WHERE task_id = ?", (task_id,))
+            if isinstance(usage, dict):
+                counts = [usage.get("input_tokens"), usage.get("output_tokens"),
+                          usage.get("cached_input_tokens", 0),
+                          usage.get("cache_creation_input_tokens", 0)]
+                if counts[2] is None:
+                    counts[2] = 0
+                if (all(type(n) is int and 0 <= n <= 2**63 - 1 for n in counts)
+                        and counts[2] + counts[3] <= counts[0]):
+                    model = usage.get("model") or model_used
+                    if not isinstance(model, str):
+                        model = None
+                    conn.execute(
+                        """INSERT INTO task_token_usage
+                           (task_id,input_tokens,output_tokens,cached_input_tokens,
+                            cache_creation_input_tokens,model,cost_attributable)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (task_id, *counts, model, int(usage.get("cost_attributable", True) is True)),
+                    )
         return cur.rowcount > 0
 
 
@@ -1843,10 +2133,28 @@ def _effective_series_recurrence(row: dict, now: Optional[datetime] = None) -> s
 
 def list_series() -> list:
     """Durable recurring series with current occurrence and health counters."""
+    return _list_series()
+
+
+def _list_series(series_id: int | None = None) -> list:
+    # The dashboard needs every series, while a control acknowledgement needs
+    # only its target. Apply the same bound ID to every snapshot projection.
+    series_filter = " WHERE s.id = ?" if series_id is not None else ""
+    history_filter = " WHERE t.series_id = ?" if series_id is not None else ""
+    picked_filter = " AND series_id = ?" if series_id is not None else ""
+    bound = (series_id,) if series_id is not None else ()
     with _connect() as conn:
         # The summary and its sparse occurrence details must describe the same
         # queue snapshot even if a worker completes a run between SELECTs.
         conn.execute("BEGIN")
+        # An older auxiliary process can recreate idx_tasks_series after our
+        # startup migration. SQLite may then choose it and visit every task
+        # payload page despite this narrow projection. Prefer the covering
+        # index explicitly while preserving reads of a pre-migration database
+        # where that index does not exist yet. Metadata is read once per call.
+        summary_hint = (" INDEXED BY idx_tasks_series_summary" if any(
+            row[1] == "idx_tasks_series_summary"
+            for row in conn.execute("PRAGMA index_list(tasks)")) else "")
         series_rows = [dict(r) for r in conn.execute(
             """SELECT s.id, s.title, s.prompt, s.working_dir,
                       s.base_recurrence, s.temporary_recurrence,
@@ -1857,8 +2165,8 @@ def list_series() -> list:
                FROM task_series AS s
                LEFT JOIN settings AS auto_pause
                  ON auto_pause.key = ? || CAST(s.id AS TEXT)
-               ORDER BY s.id DESC""",
-            (_PIPELINE_REPEAT_BLOCKER_PAUSE_PREFIX,))]
+            """ + series_filter + " ORDER BY s.id DESC",
+            (_PIPELINE_REPEAT_BLOCKER_PAUSE_PREFIX,) + bound)]
         # Keep this read deliberately narrow.  Task result/prompt/note payloads
         # can be very large and none of them contributes to series health.
         # Fetching all series histories in one pass also avoids the old N+1
@@ -1867,9 +2175,9 @@ def list_series() -> list:
         for row in conn.execute(
                 """SELECT t.id, t.series_id, t.status, t.started_at,
                           t.completed_at, t.verdict
-                   FROM tasks AS t
+                   FROM tasks AS t""" + summary_hint + """
                    INNER JOIN task_series AS s ON s.id = t.series_id
-                   ORDER BY t.series_id DESC, t.id DESC"""):
+                """ + history_filter + " ORDER BY t.series_id DESC, t.id DESC", bound):
             task_rows_by_series.setdefault(row["series_id"], []).append(dict(row))
 
         # Only the current active occurrence exposes its error/schedule, and
@@ -1886,24 +2194,24 @@ def list_series() -> list:
                               MAX(CASE WHEN status IN
                                   ('completed', 'failed', 'cancelled')
                                   THEN id END) AS last_id
-                       FROM tasks
-                       WHERE series_id IS NOT NULL
+                       FROM tasks""" + summary_hint + """
+                       WHERE series_id IS NOT NULL""" + picked_filter + """
                        GROUP BY series_id
                    )
                    SELECT 'active' AS kind, t.series_id, t.id, t.machine,
-                          t.scheduled_at, t.error, t.worktree, t.detached,
+                          t.scheduled_at, t.next_run_at, t.error, t.worktree, t.detached,
                           t.herdr_target
                    FROM tasks AS t
                    INNER JOIN picked ON picked.active_id = t.id
                    INNER JOIN task_series AS s ON s.id = t.series_id
                    UNION ALL
                    SELECT 'last' AS kind, t.series_id, t.id, t.machine,
-                          NULL AS scheduled_at, NULL AS error,
+                          NULL AS scheduled_at, NULL AS next_run_at, NULL AS error,
                           NULL AS worktree, NULL AS detached,
                           NULL AS herdr_target
                    FROM tasks AS t
                    INNER JOIN picked ON picked.last_id = t.id
-                   INNER JOIN task_series AS s ON s.id = t.series_id"""):
+                   INNER JOIN task_series AS s ON s.id = t.series_id""", bound):
             task_details[(row["kind"], row["series_id"])] = dict(row)
 
         out = []
@@ -1952,7 +2260,12 @@ def list_series() -> list:
                 "auto_pause_reason": auto_pause_reason if s["paused"] else None,
                 "next_task_id": active["id"] if active else None,
                 "next_status": active["status"] if active else None,
-                "next_run_at": active_detail["scheduled_at"] if active_detail else None,
+                # The worker requires both the schedule and retry deadline.
+                # Showing only scheduled_at hides a rate-limited retry entirely.
+                "next_run_at": max(
+                    (value for value in (active_detail["scheduled_at"],
+                                         active_detail["next_run_at"]) if value),
+                    key=_parse_dt, default=None) if active_detail else None,
                 "next_error": active_detail["error"] if active_detail else None,
                 "next_started_at": active["started_at"] if active else None,
                 "last_task_id": last["id"] if last else None,
@@ -1969,7 +2282,7 @@ def list_series() -> list:
 
 
 def get_series(series_id: int) -> Optional[dict]:
-    return next((s for s in list_series() if s["id"] == series_id), None)
+    return next(iter(_list_series(series_id)), None)
 
 
 SERIES_EDITABLE_FIELDS = ("title", "base_recurrence", "temporary_recurrence",
@@ -2453,6 +2766,8 @@ def pause_pipeline_series_on_repeated_blocker(
 
 def _recreate_series_occurrence(conn, series_id: int, series,
                                 scheduled_at: datetime) -> bool:
+    if series_id in workorder_origins(conn, series_id=series_id)[1]:
+        return False
     latest_row = conn.execute(
         "SELECT * FROM tasks WHERE series_id = ? ORDER BY id DESC LIMIT 1",
         (series_id,),
@@ -2577,8 +2892,11 @@ def repair_active_series_occurrences(
             """SELECT * FROM task_series
                WHERE paused = 0 AND ended_at IS NULL ORDER BY id"""
         ).fetchall()
+        _, forbidden_series = workorder_origins(conn)
         for series in series_rows:
             series_id = int(series["id"])
+            if series_id in forbidden_series:
+                continue
             if conn.execute(
                     """SELECT 1 FROM tasks WHERE series_id = ?
                        AND status IN ('pending', 'running', 'rate_limited')
@@ -2657,8 +2975,218 @@ def clear_pipeline_series_wake(series_id: int) -> bool:
         return deleted.rowcount > 0
 
 
-def series_action(series_id: int, action: str) -> bool:
+class ItemHoldResolutionConflict(ValueError):
+    """The operator's exact hold snapshot or nonce no longer matches."""
+
+
+def _item_hold_digest(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _item_hold_json(raw: str):
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON key")
+            value[key] = item
+        return value
+
+    def no_constant(value):
+        raise ValueError("non-finite JSON value")
+
+    def finite_float(value):
+        result = float(value)
+        if not math.isfinite(result):
+            raise ValueError("non-finite JSON number")
+        return result
+
+    try:
+        return json.loads(raw, object_pairs_hook=unique_object,
+                          parse_constant=no_constant, parse_float=finite_float)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ItemHoldResolutionConflict("Malformed hold metadata") from exc
+
+
+def _item_hold_records(raw: str | None) -> dict:
+    value = {} if raw is None else _item_hold_json(raw)
+    if (not isinstance(value, dict)
+            or any(not isinstance(key, str)
+                   or not re.fullmatch(r"[1-9][0-9]*", key)
+                   or not isinstance(record, dict)
+                   for key, record in value.items())):
+        raise ItemHoldResolutionConflict("Malformed hold ledger")
+    return value
+
+
+def _item_hold_record_digest(record: dict) -> str:
+    return _item_hold_digest(json.dumps(
+        record, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False))
+
+
+def _item_resolution_nonce_key(nonce: str) -> str:
+    if (not isinstance(nonce, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}", nonce)):
+        raise ValueError("request_nonce must contain 1..128 ASCII nonce characters")
+    return "pipeline_item_hold_resolution:v1:" + _item_hold_digest(nonce)
+
+
+def _item_resolution_receipt(raw: str) -> dict:
+    value = _item_hold_json(raw)
+    fields = {"schema", "receipt_id", "resolved_at", "request", "resolved_record",
+              "resolved_record_sha256", "before_raw_holds_sha256", "after_raw_holds_sha256",
+              "operator_resolution_only", "product_mutation_authorized",
+              "canonical_progress_claimed", "wake_requested"}
+    if (not isinstance(value, dict) or set(value) != fields
+            or value.get("schema") != "pipeline-item-hold-resolution-v1"
+            or not isinstance(value.get("request"), dict)
+            or not isinstance(value.get("resolved_record"), dict)
+            or not isinstance(value.get("receipt_id"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", value["receipt_id"])):
+        raise ItemHoldResolutionConflict("Malformed resolution receipt")
+    request = value["request"]
+    request_fields = {"series_id", "number", "expected_head", "expected_task_id",
+                      "expected_raw_holds_sha256", "request_nonce"}
+    try:
+        if set(request) != request_fields:
+            raise ValueError("unknown receipt request")
+        for name in ("series_id", "number", "expected_task_id"):
+            if type(request[name]) is not int or not 0 < request[name] <= 2**63 - 1:
+                raise ValueError("invalid receipt request identity")
+        _item_resolution_nonce_key(request["request_nonce"])
+        for name in ("before_raw_holds_sha256", "after_raw_holds_sha256",
+                     "resolved_record_sha256"):
+            if not isinstance(value[name], str) or not re.fullmatch(r"[0-9a-f]{64}", value[name]):
+                raise ValueError("invalid receipt digest")
+        stamp = datetime.fromisoformat(value["resolved_at"])
+        if stamp.tzinfo is None:
+            raise ValueError("missing receipt timezone")
+        record = value["resolved_record"]
+        if (not isinstance(request["expected_head"], str)
+                or not re.fullmatch(r"[0-9a-f]{40}", request["expected_head"])
+                or record.get("head") != request["expected_head"]
+                or type(record.get("task_id")) is not int
+                or record["task_id"] != request["expected_task_id"]
+                or value["before_raw_holds_sha256"] != request["expected_raw_holds_sha256"]
+                or value["resolved_record_sha256"] != _item_hold_record_digest(record)
+                or value["operator_resolution_only"] is not True
+                or any(value[name] is not False for name in (
+                    "product_mutation_authorized", "canonical_progress_claimed", "wake_requested"))):
+            raise ValueError("receipt contradicts resolution")
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ItemHoldResolutionConflict("Malformed resolution receipt") from exc
+    return value
+
+
+def list_pipeline_item_holds(series_id: int) -> dict:
+    """Read exact hold bytes and canonical record digests without changing state."""
+    if type(series_id) is not int or not 0 < series_id <= 2**63 - 1:
+        raise ValueError("Invalid series ID")
     with _connect() as conn:
+        conn.execute("BEGIN")
+        if conn.execute("SELECT 1 FROM task_series WHERE id=?", (series_id,)).fetchone() is None:
+            raise KeyError("Series not found")
+        row = conn.execute("SELECT value FROM settings WHERE key=?",
+                           (f"pipeline_item_holds:v1:{series_id}",)).fetchone()
+        raw = None if row is None else row["value"]
+        records = _item_hold_records(raw)
+        mode = conn.execute("SELECT value FROM settings WHERE key=?",
+                            (f"pipeline_item_hold_mode:v1:{series_id}",)).fetchone()
+        return {
+            "series_id": series_id, "raw_holds": raw,
+            "raw_holds_sha256": None if raw is None else _item_hold_digest(raw),
+            "hold_mode": None if mode is None else mode["value"],
+            "holds": [{"number": int(key), "record": record,
+                       "record_sha256": _item_hold_record_digest(record)}
+                      for key, record in sorted(records.items(), key=lambda pair: int(pair[0]))],
+        }
+
+
+def get_pipeline_item_hold_resolution(series_id: int, request_nonce: str) -> dict | None:
+    """Reconcile a lost response; this read never repeats the resolution."""
+    if type(series_id) is not int or not 0 < series_id <= 2**63 - 1:
+        raise ValueError("Invalid series ID")
+    key = _item_resolution_nonce_key(request_nonce)
+    with _connect() as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        if row is None:
+            return None
+        receipt = _item_resolution_receipt(row["value"])
+        if (receipt["request"].get("series_id") != series_id
+                or receipt["request"].get("request_nonce") != request_nonce):
+            raise ItemHoldResolutionConflict("Nonce belongs to another resolution")
+        return receipt
+
+
+def resolve_pipeline_item_hold(series_id: int, number: int, *, expected_head: str,
+                               expected_task_id: int, expected_raw_holds_sha256: str,
+                               request_nonce: str) -> dict:
+    """Explicit operator decision for ONE exact HEAD-bound hold, never admission.
+
+    The caller owns authorization and remediation assessment. No reason string,
+    quota reset, current review or machine progress is inferred here. Resolving
+    a hold does not wake work, alter an existing attempt or grant product rights.
+    The hold CAS and immutable nonce receipt commit together.
+    """
+    for value in (series_id, number, expected_task_id):
+        if type(value) is not int or not 0 < value <= 2**63 - 1:
+            raise ValueError("IDs must be positive SQLite integers")
+    if not isinstance(expected_head, str) or not re.fullmatch(r"[0-9a-f]{40}", expected_head):
+        raise ValueError("Expected HEAD must be a lowercase commit SHA")
+    if (not isinstance(expected_raw_holds_sha256, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_raw_holds_sha256)):
+        raise ValueError("Expected raw hold SHA256 is required")
+    key = _item_resolution_nonce_key(request_nonce)
+    request = {"series_id": series_id, "number": number, "expected_head": expected_head,
+               "expected_task_id": expected_task_id,
+               "expected_raw_holds_sha256": expected_raw_holds_sha256,
+               "request_nonce": request_nonce}
+    with _connect(immediate=True) as conn:
+        prior = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        if prior is not None:
+            receipt = _item_resolution_receipt(prior["value"])
+            if receipt["request"] != request:
+                raise ItemHoldResolutionConflict("Nonce already used for a different request")
+            return receipt
+        if conn.execute("SELECT 1 FROM task_series WHERE id=?", (series_id,)).fetchone() is None:
+            raise KeyError("Series not found")
+        if conn.execute("SELECT 1 FROM tasks WHERE series_id=? AND status='running' LIMIT 1",
+                        (series_id,)).fetchone() is not None:
+            raise ItemHoldResolutionConflict("Series has a running attempt; wait for it to finish")
+        hold_key = f"pipeline_item_holds:v1:{series_id}"
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (hold_key,)).fetchone()
+        if row is None or _item_hold_digest(row["value"]) != expected_raw_holds_sha256:
+            raise ItemHoldResolutionConflict("Hold ledger changed; read it again")
+        raw = row["value"]
+        records = _item_hold_records(raw)
+        target = records.get(str(number))
+        if (target is None or target.get("head") != expected_head
+                or type(target.get("task_id")) is not int
+                or target["task_id"] != expected_task_id):
+            raise ItemHoldResolutionConflict("Exact HEAD/task hold is absent or changed")
+        remaining = {name: record for name, record in records.items() if name != str(number)}
+        after = json.dumps(remaining, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        receipt = {
+            "schema": "pipeline-item-hold-resolution-v1", "receipt_id": uuid.uuid4().hex,
+            "resolved_at": _now(), "request": request, "resolved_record": target,
+            "resolved_record_sha256": _item_hold_record_digest(target),
+            "before_raw_holds_sha256": expected_raw_holds_sha256,
+            "after_raw_holds_sha256": _item_hold_digest(after),
+            "operator_resolution_only": True, "product_mutation_authorized": False,
+            "canonical_progress_claimed": False, "wake_requested": False,
+        }
+        changed = conn.execute("UPDATE settings SET value=? WHERE key=? AND value=?",
+                               (after, hold_key, raw))
+        if changed.rowcount != 1:
+            raise ItemHoldResolutionConflict("Hold ledger CAS failed")
+        conn.execute("INSERT INTO settings(key,value) VALUES(?,?)",
+                     (key, json.dumps(receipt, ensure_ascii=False, sort_keys=True,
+                                      separators=(",", ":"), allow_nan=False)))
+        return receipt
+
+def series_action(series_id: int, action: str, *, retry_blocked: bool = False) -> bool:
+    with _connect(immediate=True) as conn:
         row = conn.execute("SELECT * FROM task_series WHERE id = ?", (series_id,)).fetchone()
         if not row:
             return False
@@ -2683,14 +3211,14 @@ def series_action(series_id: int, action: str) -> bool:
                 (_pipeline_series_wake_intent_key(series_id),),
             )
         elif action == "resume":
-            conn.execute("DELETE FROM settings WHERE key = ?",
-                         (f"pipeline_item_holds:v1:{series_id}",))
             resumed = conn.execute(
                 """UPDATE task_series SET paused = 0, updated_at = ?
                    WHERE id = ? AND paused = 1 AND ended_at IS NULL""",
                 (now, series_id),
             ).rowcount > 0
             if resumed:
+                conn.execute("DELETE FROM settings WHERE key = ?",
+                             (f"pipeline_item_holds:v1:{series_id}",))
                 conn.execute(
                     "DELETE FROM settings WHERE key = ?",
                     (_pipeline_repeat_blocker_pause_key(series_id),),
@@ -2710,8 +3238,6 @@ def series_action(series_id: int, action: str) -> bool:
             # the run started; Resume is the only way out of this state.
             if row["paused"] or row["ended_at"]:
                 return False
-            conn.execute("DELETE FROM settings WHERE key = ?",
-                         (f"pipeline_item_holds:v1:{series_id}",))
             cur = conn.execute(
                 """UPDATE tasks
                    SET scheduled_at = ?, next_run_at = NULL,
@@ -2721,6 +3247,9 @@ def series_action(series_id: int, action: str) -> bool:
                 (now, series_id),
             )
             if cur.rowcount > 0:
+                if retry_blocked:
+                    conn.execute("DELETE FROM settings WHERE key = ?",
+                                 (f"pipeline_item_holds:v1:{series_id}",))
                 conn.execute(
                     "DELETE FROM settings WHERE key = ?",
                     (_pipeline_series_wake_intent_key(series_id),),
@@ -2741,6 +3270,9 @@ def series_action(series_id: int, action: str) -> bool:
             recreated = _recreate_series_occurrence(
                 conn, series_id, row, datetime.now(timezone.utc))
             if recreated:
+                if retry_blocked:
+                    conn.execute("DELETE FROM settings WHERE key = ?",
+                                 (f"pipeline_item_holds:v1:{series_id}",))
                 conn.execute(
                     "DELETE FROM settings WHERE key = ?",
                     (_pipeline_series_wake_intent_key(series_id),),
@@ -3105,6 +3637,8 @@ def update_task_fields(task_id: int, fields: dict) -> bool:
             "WHEN budget_wait_scope IS NOT NULL THEN ? ELSE NULL END")
         values.append(_now())
     with _connect() as conn:
+        if fields.get("recurrence") and workorder_recurrence_forbidden(task_id, conn=conn):
+            return False
         cur = conn.execute(
             f"UPDATE tasks SET {', '.join(sets)} "
             "WHERE id = ? AND status IN ('pending', 'rate_limited')",
@@ -3115,6 +3649,7 @@ def update_task_fields(task_id: int, fields: dict) -> bool:
 
 def delete_task(task_id: int) -> bool:
     with _connect() as conn:
+        _retain_workorder_series_fences(conn)
         # A running provider may still own a checkout and an exact pipeline
         # target. Deletion must follow cancel + confirmed terminal cleanup;
         # otherwise removing the row would also free the reservation while the
@@ -3266,6 +3801,50 @@ def prune_pipeline_snapshots(before: datetime) -> int:
         return cur.rowcount
 
 
+def pipeline_operational_errors(series_ids: list[int], since: datetime) -> dict:
+    """Actual failed executions, separate from a model's human/unable verdict.
+
+    A later completed execution in the same series resolves an older process
+    failure. Pauses, missing PIDs and cancelled tasks are not stop evidence.
+    """
+    ids = sorted({int(value) for value in series_ids if value is not None})
+    if not ids:
+        return {"complete": True, "items": []}
+    marks = ",".join("?" for _ in ids)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""SELECT t.id, t.series_id, t.completed_at,
+                       substr(CAST(t.error AS BLOB), 1, 4097) AS error_prefix,
+                       length(CAST(t.error AS BLOB)) AS error_bytes
+                FROM tasks AS t
+                WHERE t.series_id IN ({marks}) AND t.completed_at >= ?
+                  AND t.status = 'failed'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM tasks AS newer
+                    WHERE newer.series_id = t.series_id AND newer.id > t.id
+                      AND newer.status = 'completed'
+                      AND newer.completed_at > t.completed_at)
+                ORDER BY t.id DESC LIMIT 51""",
+            (*ids, _to_utc_iso(since)),
+        ).fetchall()
+    items = []
+    for row in rows[:50]:
+        original_bytes = row["error_bytes"] or 0
+        truncated = original_bytes > 4096
+        suffix = f"… [сокращено; подробности в задаче #{row['id']}]" if truncated else ""
+        prefix = (row["error_prefix"] or b"")[:4096 - len(suffix.encode("utf-8"))]
+        summary = prefix.decode("utf-8", errors="ignore") + suffix
+        items.append({"task_id": row["id"], "series_id": row["series_id"],
+         "category": "tool_error", "source": "task.status=failed",
+         "recipient": "engineering", "transition_at": row["completed_at"],
+         "summary": summary or "Ошибка выполнения; подробности в задаче",
+         "summary_truncated": truncated, "summary_bytes": original_bytes,
+         "summary_limit_bytes": 4096})
+    return {"complete": len(rows) <= 50,
+            "truncated": len(rows) > 50 or any(item["summary_truncated"] for item in items),
+            "items": items}
+
+
 def pipeline_run_metrics(series_ids: list[int], since: datetime) -> dict:
     """Semantic outcomes of scheduled runs belonging to one pipeline profile."""
     ids = sorted({int(value) for value in series_ids if value is not None})
@@ -3359,11 +3938,17 @@ def pipeline_series_activity(series_ids: list[int]) -> dict[int, dict]:
     marks = ",".join("?" for _ in ids)
     with _connect() as conn:
         rows = conn.execute(
-            f"""SELECT id, series_id, status, verdict, started_at, completed_at,
-                       result
-                FROM tasks WHERE series_id IN ({marks})
-                  AND status IN ('completed', 'failed', 'cancelled')
-                ORDER BY id DESC""",
+            f"""WITH latest AS (
+                    SELECT series_id, MAX(id) AS id
+                    FROM tasks WHERE series_id IN ({marks})
+                      AND status IN ('completed', 'failed', 'cancelled')
+                    GROUP BY series_id
+                )
+                SELECT t.id, t.series_id, t.status, t.verdict,
+                       t.started_at, t.completed_at, t.result
+                FROM tasks AS t
+                INNER JOIN latest ON latest.id = t.id
+                ORDER BY t.id DESC""",
             ids,
         ).fetchall()
     activity = {}
@@ -3426,6 +4011,74 @@ def has_setting_prefix(prefix: str) -> bool:
     return row is not None
 
 
+def settings_with_prefix(prefix: str, limit: int = 200) -> dict[str, str]:
+    with _connect() as conn:
+        return dict(conn.execute(
+            "SELECT key,value FROM settings WHERE substr(key,1,?)=? ORDER BY key LIMIT ?",
+            (len(prefix), prefix, limit)).fetchall())
+
+
+def claim_codex_answer(identity: str) -> bool:
+    """One explicit answer attempt across duplicate cards and bot restarts."""
+    with _connect(immediate=True) as conn:
+        return bool(conn.execute(
+            "INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+            ("codex-app-server.answer." + identity, _now())).rowcount)
+
+
+def queue_codex_question(key: str, record: dict) -> bool:
+    with _connect(immediate=True) as conn:
+        if not conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)",
+                            (key, _json_dump(record))).rowcount:
+            previous = _json_load(conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()["value"], {})
+            if previous.get("used") or previous.get("question") != record.get("question"):
+                return False
+            expired = previous.get("expires_at", 0) < datetime.now(timezone.utc).timestamp()
+            previous["expires_at"] = record.get("expires_at", previous.get("expires_at", 0))
+            conn.execute("UPDATE settings SET value=? WHERE key=?", (_json_dump(previous), key))
+            if not expired or conn.execute(
+                    "SELECT 1 FROM notifications WHERE kind='codex.question' AND message=? "
+                    "AND sent_at IS NULL LIMIT 1", (key.rsplit(".", 1)[-1],)).fetchone():
+                return False
+        conn.execute(
+            "INSERT INTO notifications(tg_chat_id,message,created_at,machine,pane_id,kind) "
+            "VALUES(?,?,?,?,?,?)",
+            (record["chat_id"], key.rsplit(".", 1)[-1], _now(), record["machine"],
+             record["pane"], "codex.question"))
+    return True
+
+
+def finish_codex_tracking(key: str, turn_id: str, result: str, status: str,
+                          notifications: list[dict]) -> bool:
+    """Commit completion and its delivery outbox in the same transaction."""
+    with _connect(immediate=True) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        record = _json_load(row["value"], {}) if row else {}
+        if record.get("done") or record.get("turn_id") != turn_id:
+            return False
+        record.update(done=True, result=result, status=status)
+        conn.execute("UPDATE settings SET value=? WHERE key=?", (_json_dump(record), key))
+        for note in notifications:
+            conn.execute(
+                "INSERT INTO notifications(tg_chat_id,message,created_at,machine,pane_id,kind) "
+                "VALUES(?,?,?,?,?,?)",
+                (record["chat_id"], note["message"], _now(), record["machine"],
+                 record["pane"], note["kind"]))
+    return True
+
+
+def save_codex_tracking(key: str, record: dict, legacy_source: str):
+    """Switch file observation to the exact turn without retaining an old manifest."""
+    slot = hashlib.sha256(_json_dump([record["pane"], record["chat_id"]]).encode()).hexdigest()
+    retired = {"pane": record["pane"], "tg_chat_id": record["chat_id"], "queued": True,
+               "expires_at": record["expires_at"]}
+    with _connect(immediate=True) as conn:
+        conn.executemany("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", [
+            (key, _json_dump(record)),
+            ("result-files.native." + legacy_source + "." + slot, _json_dump(retired)),
+        ])
+
+
 def increment_int_setting(key: str, default: int = 0) -> int:
     """Atomically increment an integer setting shared by all PP processes."""
     with _connect(immediate=True) as conn:
@@ -3451,10 +4104,15 @@ def set_setting_if_newer_revision(
         lease_guard: Optional[dict] = None,
         publication_revision_key: Optional[str] = None,
         companion_key: Optional[str] = None,
-        companion_value: Optional[str] = None) -> bool:
+        companion_value: Optional[str] = None,
+        pipeline_snapshot: Optional[dict] = None) -> bool:
     """Atomically publish a newer revision while a durable guard matches."""
     if (companion_key is None) != (companion_value is None):
         raise ValueError("companion_key and companion_value must be set together")
+    if pipeline_snapshot is not None:
+        continuation = (lease_guard or {}).get("continuation") or {}
+        if not continuation or pipeline_snapshot.get("profile_id") != continuation.get("profile_id"):
+            raise ValueError("atomic source snapshot requires its Native continuation fence")
     with _connect(immediate=True) as conn:
         if (lease_guard is not None
                 and not _pipeline_scan_lease_guard_matches(conn, lease_guard)):
@@ -3502,6 +4160,14 @@ def set_setting_if_newer_revision(
             conn.execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                 (publication_revision_key, str(int(revision))),
+            )
+        if pipeline_snapshot is not None:
+            conn.execute(
+                "INSERT INTO pipeline_snapshots(profile_id,repository,captured_at,payload_json) "
+                "VALUES(?,?,?,?)",
+                (pipeline_snapshot["profile_id"], pipeline_snapshot["repository"],
+                 pipeline_snapshot["captured_at"], json.dumps(pipeline_snapshot["payload"],
+                     ensure_ascii=False, separators=(",", ":"))),
             )
     return True
 
@@ -3600,6 +4266,15 @@ def _pipeline_budget_vector(value, name: str) -> dict:
     return result
 
 
+def _pipeline_final_source_cost(value, queue_id, route, combined_cost):
+    credit = _pipeline_budget_vector(value, "final Source cost")
+    if (queue_id != "merge" or route not in ("skill", "fallback_targeted", "merge_confirmation")
+            or not any(credit.values())
+            or any(amount > combined_cost[resource] for resource, amount in credit.items())):
+        raise ValueError("invalid final Source credit for execution reservation")
+    return credit
+
+
 def _load_pipeline_budget_reservations(conn, key: str) -> list[dict]:
     row = conn.execute(
         "SELECT value FROM settings WHERE key = ?", (key,)
@@ -3640,13 +4315,17 @@ def _load_pipeline_budget_reservations(conn, key: str) -> list[dict]:
                 raise ValueError("duplicate reservation ledger item")
             seen_tokens.add(token)
             seen_attempts.add(attempt)
-            result.append({
+            reservation = {
                 "token": token, "task_id": task_id,
                 "task_started_at": started_at,
                 "profile_id": item["profile_id"],
                 "queue_id": item["queue_id"], "route": item["route"],
                 "cost": cost, "created_at": float(item["created_at"]),
-            })
+            }
+            if "final_source_cost" in item:
+                reservation["final_source_cost"] = _pipeline_final_source_cost(
+                    item["final_source_cost"], item["queue_id"], item["route"], cost)
+            result.append(reservation)
         return result
     except (KeyError, OverflowError, TypeError, ValueError,
             json.JSONDecodeError) as exc:
@@ -3684,6 +4363,120 @@ def _active_pipeline_budget_reservations(conn, values: list[dict]) -> tuple[list
                 and row["started_at"] == item["task_started_at"]):
             active.append(item)
     return active, len(active) != len(values)
+
+
+def _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, route_costs,
+                                   starvation_timeout_seconds=0, *, bounded_route=None):
+    """Read an admitted running attempt without pruning any foreign ledger."""
+    from .config import TASK_TIMEOUT
+    from .task_identity import task_execution_fingerprint
+
+    if type(task_id) is not int or task_id <= 0:
+        raise ValueError("source refresh requires a worker task identity")
+    row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    session = row["session_id"] or row["herdr_pane"] if row is not None else None
+    if (row is None or row["status"] != "running" or not row["series_id"]
+            or bounded_route is None and (not isinstance(session, str) or not session)
+            or row["machine"] or row["detached"]):
+        raise ValueError("source refresh requires a live local Native session")
+    series = conn.execute("SELECT paused,ended_at FROM task_series WHERE id=?",
+                          (row["series_id"],)).fetchone()
+    controls = {r["key"]: r["value"] for r in conn.execute(
+        "SELECT key,value FROM settings WHERE key IN ('worker_paused',?)",
+        (f"cancel_task:{task_id}",))}
+    if (series is None or series["paused"] or series["ended_at"]
+            or controls.get("worker_paused", "0") != "0"
+            or controls.get(f"cancel_task:{task_id}") == "1"):
+        raise ValueError("source refresh attempt is paused, cancelled or ended")
+    started = datetime.fromisoformat(row["started_at"])
+    now = time.time()
+    timeout = row["task_timeout"] if row["task_timeout"] is not None else TASK_TIMEOUT
+    if (started.tzinfo is None or started.timestamp() > now
+            or timeout and now >= started.timestamp() + timeout):
+        raise ValueError("source refresh attempt lifetime is invalid")
+    if bounded_route not in (None, "merge_confirmation", "merge_receipt"):
+        raise ValueError("unsupported Native-only continuation route")
+    routes = (bounded_route,) if bounded_route else ("skill", "fallback_targeted")
+    costs = {route: _pipeline_budget_vector(route_costs[route], f"continuation {route} cost")
+             for route in routes}
+    key = _pipeline_github_budget_reservation_key(scope)
+    values = _load_pipeline_budget_reservations(
+        conn, key)
+    # One task attempt cannot borrow admission from a second account scope.
+    for other in conn.execute("SELECT key FROM settings WHERE substr(key,1,?)=? AND key<>?",
+            (len(_PIPELINE_GITHUB_BUDGET_RESERVATION_PREFIX),
+             _PIPELINE_GITHUB_BUDGET_RESERVATION_PREFIX, key)):
+        if any(v["task_id"] == task_id for v in _load_pipeline_budget_reservations(conn, other["key"])):
+            raise ValueError("source refresh attempt owns ambiguous admission scopes")
+    own = [r for r in values if r["task_id"] == task_id]
+    if (len(own) != 1 or own[0]["task_started_at"] != row["started_at"]
+            or own[0]["profile_id"] != profile_id or own[0]["queue_id"] != queue_id
+            or own[0]["route"] not in costs):
+        raise ValueError("source refresh requires its exact existing execution reservation")
+    credit = own[0].get("final_source_cost")
+    base_cost = costs[own[0]["route"]]
+    if any(own[0]["cost"][r] != base_cost[r] + (credit[r] if credit else 0)
+           for r in base_cost):
+        raise ValueError("source refresh requires its exact existing execution reservation")
+    active, _changed = _active_pipeline_budget_reservations(conn, values)
+    guard = {"scope": scope, "task_id": task_id, "started_at": row["started_at"],
+             "session_id": row["session_id"], "herdr_pane": row["herdr_pane"],
+             "series_id": row["series_id"],
+             "priority": row["priority"], "profile_id": profile_id, "queue_id": queue_id,
+             "execution_sha256": task_execution_fingerprint(row),
+             "route": own[0]["route"], "cost": dict(base_cost),
+             "route_costs": costs, "token": own[0]["token"]}
+    waiting = _pipeline_github_budget_waiter_summary(conn, scope,
+        starvation_timeout_seconds=starvation_timeout_seconds, now=now)
+    return {"guard": guard, "totals": {r: sum(v["cost"][r] for v in active)
+                                        for r in _PIPELINE_GITHUB_BUDGET_RESOURCES},
+            "count": len(active), "items": active, "final_source_cost": credit,
+            "revision": _pipeline_github_budget_revision(conn, scope),
+            "woken_waiters": {"count": 0, "min_priority": None}, "waiting_waiters": waiting}
+
+
+def pipeline_source_refresh_state(scope, task_id, profile_id, queue_id, route_costs,
+                                  *, starvation_timeout_seconds=0):
+    """Observe existing Native admission; never reserve, release or clean it."""
+    with _connect() as conn:
+        conn.execute("BEGIN")
+        return _pipeline_source_refresh_state(conn, scope, task_id, profile_id, queue_id, route_costs,
+                                              starvation_timeout_seconds)
+
+
+def _pipeline_source_refresh_guard_matches(conn, guard):
+    try:
+        observed = _pipeline_source_refresh_state(conn, guard["scope"], guard["task_id"],
+            guard["profile_id"], guard["queue_id"], guard["route_costs"],
+            bounded_route=(guard["route"] if guard["route"] in ("merge_confirmation", "merge_receipt") else None))
+        return observed["guard"] == guard
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+
+
+def spend_pipeline_final_source_credit(guard, scan_lease_guard, expected_revision, expected_cost) -> bool:
+    """Spend one MERGE Source credit while the bound scan holds the account lease."""
+    if (not isinstance(guard, dict) or not isinstance(scan_lease_guard, dict)
+            or not guard.get("scope") or scan_lease_guard.get("continuation") != guard
+            or scan_lease_guard.get("scope") != guard["scope"]
+            or type(expected_revision) is not int or expected_revision < 0):
+        return False
+    credit = _pipeline_budget_vector(expected_cost, "expected final Source cost")
+    scope = guard["scope"]
+    with _connect(immediate=True) as conn:
+        if (not _pipeline_scan_lease_guard_matches(conn, scan_lease_guard)
+                or _pipeline_github_budget_revision(conn, scope) != expected_revision):
+            return False
+        key = _pipeline_github_budget_reservation_key(scope)
+        values = _load_pipeline_budget_reservations(conn, key)
+        for item in values:
+            if item["token"] == guard["token"] and item.get("final_source_cost") == credit:
+                item["cost"] = dict(guard["cost"])
+                del item["final_source_cost"]
+                _write_pipeline_budget_reservations(conn, key, values)
+                _advance_pipeline_github_budget_revision(conn, scope)
+                return True
+        return False
 
 
 def _write_pipeline_budget_reservations(conn, key: str, values: list[dict]) -> None:
@@ -4002,7 +4795,8 @@ def reserve_pipeline_github_budget(
         starvation_timeout_seconds: int = 0,
         now: Optional[float] = None,
         scan_lease_guard: Optional[dict] = None,
-        expected_revision: Optional[int] = None) -> dict:
+        expected_revision: Optional[int] = None,
+        final_source_cost: Optional[dict] = None) -> dict:
     """Atomically reserve quota for one exact running task attempt."""
     key = _pipeline_github_budget_reservation_key(scope)
     if not _valid_pipeline_scan_token(token):
@@ -4022,6 +4816,8 @@ def reserve_pipeline_github_budget(
         raise ValueError(
             "expected pipeline budget revision must be a non-negative integer")
     requested = _pipeline_budget_vector(cost, "cost")
+    if final_source_cost is not None:
+        final_source_cost = _pipeline_final_source_cost(final_source_cost, queue_id, route, requested)
     floor = _pipeline_budget_vector(minimum_remaining, "minimum_remaining")
     starvation_timeout_seconds = _pipeline_budget_starvation_timeout(
         starvation_timeout_seconds)
@@ -4088,7 +4884,9 @@ def reserve_pipeline_github_budget(
             item = own[0]
             if (item["task_id"] != task_id
                     or item["task_started_at"] != task_started_at
-                    or item["cost"] != requested or item["route"] != route):
+                    or item["cost"] != requested or item["route"] != route
+                    or item["queue_id"] != queue_id or item["profile_id"] != profile_id
+                    or item.get("final_source_cost") != final_source_cost):
                 raise ValueError("pipeline budget token was reused inconsistently")
             conn.execute(
                 """UPDATE tasks
@@ -4224,12 +5022,15 @@ def reserve_pipeline_github_budget(
                     "effective_after": after, "active_reservations": len(active),
                     "revision": revision}
 
-        active.append({
+        reservation = {
             "token": token, "task_id": task_id,
             "task_started_at": task_started_at, "profile_id": profile_id,
             "queue_id": queue_id, "route": route, "cost": requested,
             "created_at": created_at,
-        })
+        }
+        if final_source_cost is not None:
+            reservation["final_source_cost"] = final_source_cost
+        active.append(reservation)
         _write_pipeline_budget_reservations(conn, key, active)
         revision = _advance_pipeline_github_budget_revision(conn, scope)
         conn.execute(
@@ -4330,16 +5131,18 @@ def _next_pipeline_refresh_revision(conn) -> int:
 
 def _write_pipeline_refresh_status(
         conn, key: str, repository: str, status: Optional[dict],
-        revision: int) -> bool:
+        revision: int, *, checker_failure_profile_hash: Optional[str] = None) -> bool:
     """Publish one already-allocated event if it is newer for this profile."""
     row = conn.execute(
         "SELECT value FROM settings WHERE key = ?", (key,)
     ).fetchone()
     existing_revision = 0
+    checker_failures = None
     if row is not None:
         try:
             existing = json.loads(row["value"])
             existing_revision = existing["revision"]
+            checker_failures = existing.get("source_checker_failure_revisions")
             if (not isinstance(existing, dict)
                     or existing.get("version") != 1
                     or isinstance(existing_revision, bool)
@@ -4350,14 +5153,19 @@ def _write_pipeline_refresh_status(
             existing_revision = 0
     if existing_revision >= revision:
         return False
+    if checker_failure_profile_hash is not None:
+        if checker_failures is not None and not isinstance(checker_failures,dict):
+            raise ValueError("invalid causal Source checker failure watermarks")
+        checker_failures = dict(checker_failures or {})
+        checker_failures[checker_failure_profile_hash] = revision
+    payload = {"version": 1, "repository": str(repository), "revision": revision, "status": status}
+    if checker_failures is not None:
+        # A later availability event or successful skill admission cannot erase
+        # this causal watermark. Only a fresh complete Source can acknowledge it.
+        payload["source_checker_failure_revisions"] = checker_failures
     conn.execute(
         "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
-        (key, json.dumps({
-            "version": 1,
-            "repository": str(repository),
-            "revision": revision,
-            "status": status,
-        }, ensure_ascii=False, separators=(",", ":"))),
+        (key, json.dumps(payload, ensure_ascii=False, separators=(",", ":"))),
     )
     return True
 
@@ -4383,7 +5191,7 @@ def _pipeline_scan_lease_guard_matches(conn, guard: dict) -> bool:
         expires_at = float(payload["expires_at"])
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return False
-    return (
+    owned = (
         isinstance(payload, dict)
         and payload.get("version") == 1
         and _valid_pipeline_scan_token(payload.get("token"))
@@ -4391,6 +5199,9 @@ def _pipeline_scan_lease_guard_matches(conn, guard: dict) -> bool:
         and math.isfinite(expires_at)
         and expires_at > time.time()
     )
+    if owned and guard.get("continuation") is not None:
+        return _pipeline_source_refresh_guard_matches(conn, guard["continuation"])
+    return owned
 
 
 def acquire_pipeline_scan_lease(
@@ -4503,7 +5314,8 @@ def renew_pipeline_scan_lease(
 
 def release_pipeline_scan_lease(
         scope: str, token: str, *,
-        refresh_status: Optional[dict] = None) -> bool:
+        refresh_status: Optional[dict] = None,
+        checker_failure_guard: Optional[dict] = None) -> bool:
     """Release a lease and optionally publish final refresh status atomically."""
     key = _pipeline_scan_lease_key(scope)
     owner = token
@@ -4546,8 +5358,20 @@ def release_pipeline_scan_lease(
             # completed while this owner held the lease; a successor can only
             # allocate a later revision after this transaction commits.
             revision = _next_pipeline_refresh_revision(conn)
+            failure_hash = ((final_status or {}).get("github_budget") or {}).get("source_checker_failure_profile_hash")
+            if failure_hash is not None:
+                if (not isinstance(failure_hash, str) or re.fullmatch(r"[0-9a-f]{64}", failure_hash) is None
+                        or (final_status or {}).get("refresh_blocked") != "checker_failed"
+                        or not isinstance(checker_failure_guard, dict)
+                        or checker_failure_guard.get("scope") != scope
+                        or checker_failure_guard.get("token") != owner
+                        or (isinstance(checker_failure_guard.get("continuation"),dict)
+                            and checker_failure_guard["continuation"].get("profile_id") != refresh_status["profile_id"])
+                        or not _pipeline_scan_lease_guard_matches(conn, checker_failure_guard)):
+                    failure_hash = None
             _write_pipeline_refresh_status(
-                conn, status_key, status_repository, final_status, revision)
+                conn, status_key, status_repository, final_status, revision,
+                checker_failure_profile_hash=failure_hash)
         conn.execute("DELETE FROM settings WHERE key = ?", (key,))
     return True
 
@@ -4586,7 +5410,7 @@ def publish_pipeline_refresh_status(
             conn, key, repository, status, event_revision)
 
 
-def get_pipeline_refresh_status(profile_id: str) -> Optional[dict]:
+def get_pipeline_refresh_status(profile_id: str, *, strict: bool = False) -> Optional[dict]:
     """Read one validated status event, including a clear tombstone."""
     raw = get_setting(_pipeline_refresh_status_key(profile_id))
     if raw is None:
@@ -4601,6 +5425,8 @@ def get_pipeline_refresh_status(profile_id: str) -> Optional[dict]:
                 or status is not None and not isinstance(status, dict)):
             raise ValueError("invalid refresh status payload")
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        if strict:
+            raise ValueError("invalid durable pipeline refresh status")
         return None
     return payload
 
@@ -4733,6 +5559,25 @@ def mark_notified(task_id: int):
         )
 
 
+def mark_notified_with_files(task, files: list) -> bool:
+    """Commit this exact completion and its file outbox entries together."""
+    with _connect() as conn:
+        changed = conn.execute(
+            "UPDATE tasks SET notified_at=? WHERE id=? AND notified_at IS NULL "
+            "AND status='completed' AND started_at IS ? AND tg_chat_id IS ? AND result IS ?",
+            (_now(), task.id, _to_utc_iso(task.started_at), task.tg_chat_id, task.result),
+        ).rowcount
+        if not changed:
+            return False
+        for file in files:
+            conn.execute(
+                "INSERT INTO notifications(task_id,tg_chat_id,message,created_at,machine,kind) "
+                "VALUES(?,?,?,?,?,?)",
+                (task.id, task.tg_chat_id, file["message"], _now(), task.machine, file["kind"]),
+            )
+    return True
+
+
 # ── 1С-доработка (epf_tools): связь задачи с проектом обработки ─────────
 
 def create_epf_job(task_id: int, project_dir: str, original_name: str,
@@ -4780,6 +5625,112 @@ def update_epf_job(job_id: int, fields: dict):
             f"UPDATE epf_jobs SET {cols} WHERE id = ?",
             (*sets.values(), job_id),
         )
+
+
+def save_native_file_context(source_key: str, context: dict):
+    slot = hashlib.sha256(_json_dump([context['pane'], context['tg_chat_id']]).encode()).hexdigest()
+    set_setting('result-files.native.' + source_key + '.' + slot, _json_dump(context))
+
+
+def queue_native_file_manifests(source_key: str, agents: list[dict]) -> int:
+    """Observe only completions after the reply, on the same agent instance."""
+    prefix = 'result-files.native.' + source_key + '.'
+    current = {a.get('pane_id'): a for a in agents if isinstance(a, dict)}
+    count = 0
+    with _connect(immediate=True) as conn:
+        rows = conn.execute('SELECT key,value FROM settings WHERE substr(key,1,?)=?',
+                            (len(prefix), prefix)).fetchall()
+        for row in rows:
+            context = _json_load(row['value'], {})
+            if context.get('expires_at', 0) < time.time():
+                conn.execute('DELETE FROM settings WHERE key=?', (row['key'],))
+                continue
+            if context.get('queued'):
+                continue
+            agent = current.get(context['pane'])
+            if not agent or agent.get('agent_status') != 'done':
+                continue
+            if any(context.get(field) and agent.get(field) != context[field]
+                   for field in ('terminal_id', 'agent_session')):
+                continue
+            sequence = agent.get('completion_seq')
+            if sequence is None:
+                sequence = agent.get('state_change_seq')
+            if type(sequence) is not int or sequence <= context['baseline_seq']:
+                continue
+            conn.execute(
+                'INSERT INTO notifications(tg_chat_id,message,created_at,machine,kind) VALUES(?,?,?,?,?)',
+                (context['tg_chat_id'], _json_dump(context), _now(), context['machine'], 'result.manifest'),
+            )
+            context['queued'] = True
+            conn.execute('UPDATE settings SET value=? WHERE key=?', (_json_dump(context), row['key']))
+            count += 1
+    return count
+
+
+def expand_file_manifest(notification_id: int, files: list[dict]) -> bool:
+    """Persist fetched manifest children and acknowledge the parent atomically."""
+    with _connect(immediate=True) as conn:
+        row = conn.execute("SELECT * FROM notifications WHERE id=? AND sent_at IS NULL AND kind='result.manifest'",
+                           (notification_id,)).fetchone()
+        if not row:
+            return False
+        for payload in files:
+            conn.execute(
+                'INSERT INTO notifications(tg_chat_id,message,created_at,machine,kind) VALUES(?,?,?,?,?)',
+                (row['tg_chat_id'], _json_dump(payload), _now(), row['machine'], 'result.file'),
+            )
+        conn.execute('UPDATE notifications SET sent_at=? WHERE id=?', (_now(), notification_id))
+    return True
+
+
+def queue_herdr_completions(source_key: str, completions: list[dict], chat_ids: list[int], *, machine: str = "",
+                            present_panes: Optional[list[str]] = None) -> int:
+    """Atomically observe completion identities and enqueue durable delivery.
+
+    First successful observation baselines old sessions. Later observations,
+    including the first after a restart, enqueue every visible new identity.
+    Delivery uses the existing persistent notification outbox.
+    """
+    key = "herdr_watch_completion_v2:" + source_key
+    queued = 0
+    with _connect(immediate=True) as conn:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        state = _json_load(row["value"], {}) if row else {}
+        initialized = state.get("initialized", False)
+        observed = state.setdefault("observed", {})
+        if present_panes is not None:
+            present = set(present_panes)
+            # Without an instance identity, observed absence is the only proof
+            # that reusing a pane starts a new lifetime. Stable terminal/session
+            # cursors survive layout moves and temporary absence.
+            observed = {slot: value for slot, value in observed.items()
+                        if not slot.startswith("legacy:") or slot[7:] in present}
+            state["observed"] = observed
+        for completion in completions:
+            pane = completion["pane"]
+            terminal = completion.get("terminal_id")
+            session = completion.get("agent_session")
+            if isinstance(terminal, str) and terminal:
+                slot = "terminal:" + terminal
+            elif isinstance(session, dict) and session.get("value"):
+                slot = "session:" + _json_dump({field: session.get(field) for field in ("agent", "kind", "value")})
+            else:
+                slot = "legacy:" + pane
+            identity = {"sequence": completion["sequence"]}
+            if observed.get(slot) == identity:
+                continue
+            if initialized:
+                for chat_id in chat_ids:
+                    conn.execute(
+                        "INSERT INTO notifications(tg_chat_id,message,created_at,pane_id,machine,kind) VALUES(?,?,?,?,?,?)",
+                        (int(chat_id), completion["message"], _now(), pane, machine, "herdr.done"),
+                    )
+                    queued += 1
+            observed[slot] = identity
+        state["initialized"] = True
+        conn.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, _json_dump(state)))
+    return queued
 
 
 def add_notification(tg_chat_id: int, message: str, task_id: int = None,
@@ -4935,6 +5886,7 @@ def task_has_live_pipeline_target_reservation(task_id: int) -> bool:
 
 def purge_old(before_days: int = 7) -> int:
     with _connect() as conn:
+        _retain_workorder_series_fences(conn)
         cutoff = datetime.now(timezone.utc)
         from datetime import timedelta
         cutoff = (cutoff - timedelta(days=before_days)).isoformat()
@@ -5099,10 +6051,10 @@ def append_workflow_event(event: WorkflowEventCreate) -> WorkflowEventInDB:
         return _append_workflow_event(conn, event)
 
 
-def create_workflow(data: WorkflowCreate, workflow_id: str = None) -> WorkflowInDB:
+def create_workflow(data: WorkflowCreate, workflow_id: str = None, *, conn=None) -> WorkflowInDB:
     workflow_id = workflow_id or _new_id("wf")
     now = _now()
-    with _connect(immediate=True) as conn:
+    with (nullcontext(conn) if conn is not None else _connect(immediate=True)) as conn:
         try:
             conn.execute(
                 """INSERT INTO workflows
@@ -5133,6 +6085,38 @@ def create_workflow(data: WorkflowCreate, workflow_id: str = None) -> WorkflowIn
             "SELECT * FROM workflows WHERE id = ?", (workflow_id,)
         ).fetchone()
         return _row_to_workflow(row)
+
+
+def abort_draft_workflow(workflow_id: str) -> bool:
+    """Компенсация неатомарного создания миссии с готовым планом.
+
+    Отменяет ТОЛЬКО draft-миссию: терминальный cancelled + slug вида
+    «aborted-<slug>-<id>», освобождая исходный slug для повторного запроса.
+    Физическое удаление строки невозможно по схеме: workflow_events держит
+    FK ON DELETE RESTRICT (при foreign_keys=ON), а события append-only —
+    журнал целостности важнее. Планы/этапы/раунды draft-а удаляются.
+    """
+    with _connect(immediate=True) as conn:
+        row = conn.execute(
+            "SELECT status, slug FROM workflows WHERE id = ?", (workflow_id,)
+        ).fetchone()
+        if not row or row["status"] != "draft":
+            return False
+        require_gate_idle(conn, workflow_id)
+        conn.execute(
+            "DELETE FROM workflow_stages WHERE workflow_id = ?", (workflow_id,))
+        conn.execute(
+            "DELETE FROM workflow_plans WHERE workflow_id = ?", (workflow_id,))
+        conn.execute(
+            "DELETE FROM workflow_rounds WHERE workflow_id = ?", (workflow_id,))
+        cur = conn.execute(
+            """UPDATE workflows
+               SET status = 'cancelled',
+                   slug = 'aborted-' || substr(slug, 1, 40) || '-' || substr(id, 4, 8),
+                   updated_at = ?
+               WHERE id = ? AND status = 'draft'""",
+            (_now(), workflow_id))
+        return cur.rowcount > 0
 
 
 def get_workflow(workflow_id: str, *, conn=None) -> Optional[WorkflowInDB]:
@@ -5244,8 +6228,24 @@ def _replace_workflow_stages(conn: sqlite3.Connection, workflow_id: str,
     return [_row_to_workflow_stage(row) for row in rows]
 
 
+def active_gate_execution(conn, workflow_id: str):
+    return conn.execute(
+        "SELECT * FROM workflow_gate_executions WHERE workflow_id=? "
+        "AND state IN ('STARTED','SETTLED','UNKNOWN')", (workflow_id,),
+    ).fetchone()
+
+
+def require_gate_idle(conn, workflow_id: str):
+    execution = active_gate_execution(conn, workflow_id)
+    if execution:
+        raise WorkflowConflictError(
+            f"unresolved gate execution {execution['execution_id']} "
+            f"({execution['state']}); explicit engineering recovery may be required")
+
+
 def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:
-    changes = update.model_dump(exclude={"expected_version"}, exclude_none=True)
+    changes = update.model_dump(
+        exclude={"expected_version", "allow_terminal_config"}, exclude_none=True)
     if not changes:
         raise ValueError("workflow update contains no changed fields")
     if "config" in changes:
@@ -5261,15 +6261,21 @@ def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:
         ).fetchone()
         if not current:
             raise WorkflowNotFoundError(workflow_id)
+        require_gate_idle(conn, workflow_id)
         metadata_changes = set(changes) - {"config_json"}
         if current["status"] != "draft" and metadata_changes:
             raise WorkflowConflictError(
                 "workflow metadata except config can only be edited while status is draft"
             )
         if current["status"] in {"completed", "failed", "cancelled"}:
-            raise WorkflowConflictError(
-                "terminal workflow configuration cannot be edited"
-            )
+            # allow_terminal_config: явная семантика правки конфига
+            # терминальной миссии (только config; на выполнение не влияет)
+            if not (getattr(update, "allow_terminal_config", False)
+                    and set(changes) <= {"config_json"}):
+                raise WorkflowConflictError(
+                    "terminal workflow configuration cannot be edited "
+                    "(allow_terminal_config=true разрешает правку только config)"
+                )
         if current["state_version"] != update.expected_version:
             raise WorkflowConflictError(
                 f"workflow version is {current['state_version']}, "
@@ -5285,6 +6291,22 @@ def update_workflow(workflow_id: str, update: WorkflowUpdate) -> WorkflowInDB:
             if old_config.candidate.enabled and (old_config.gate != new_config.gate
                                                 or old_config.stage != new_config.stage):
                 raise WorkflowConflictError('candidate gate and stage contract cannot change after execution starts')
+
+        if "config_json" in changes or "repository_path" in changes:
+            origin = conn.execute(
+                "SELECT payload_json FROM workflow_events WHERE idempotency_key=?",
+                ("workflow.created:" + workflow_id,),
+            ).fetchone()
+            original = _json_load(origin["payload_json"]) if origin else {}
+            original_guard = (original.get("config") or {}).get("workorder_guard")
+            next_config = _json_load(changes.get("config_json", current["config_json"]))
+            if original_guard != next_config.get("workorder_guard"):
+                raise WorkflowConflictError("workorder guard must match its immutable creation origin")
+            if original_guard is not None and "repository_path" in changes:
+                import os
+                if os.path.realpath(changes["repository_path"]) != original.get("repository_path"):
+                    raise WorkflowConflictError("workorder repository is immutable")
+                changes["repository_path"] = original["repository_path"]
 
         new_version = current["state_version"] + 1
         assignments = [f"{field} = ?" for field in changes]
@@ -5318,6 +6340,7 @@ def create_workflow_round(data: WorkflowRoundCreate,
                           round_id: str = None) -> WorkflowRoundInDB:
     round_id = round_id or _new_id("round")
     with _connect(immediate=True) as conn:
+        require_gate_idle(conn, data.workflow_id)
         workflow = conn.execute(
             "SELECT * FROM workflows WHERE id = ?", (data.workflow_id,)
         ).fetchone()
@@ -5376,6 +6399,7 @@ def create_workflow_run(data: WorkflowRunCreate,
                         run_id: str = None) -> WorkflowRunInDB:
     run_id = run_id or _new_id("run")
     with _connect(immediate=True) as conn:
+        require_gate_idle(conn, data.workflow_id)
         round_row = conn.execute(
             """SELECT workflow_id FROM workflow_rounds
                WHERE id = ?""",
@@ -5533,6 +6557,66 @@ def list_workflow_findings(workflow_id: str,
         return [_row_to_workflow_finding(row) for row in rows]
 
 
+MEMORY_MAX_BYTES = 16 * 1024
+
+
+def list_memory(workflow_id: str) -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM workflow_memory WHERE workflow_id = ? ORDER BY name",
+            (workflow_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def save_memory(workflow_id: str, name: str, content: str,
+                updated_by_task: int = None,
+                scope_stage: str = None) -> tuple[bool, str]:
+    """Сохранить заметку миссии (замена целиком). Лимит 16КБ — ОТКАЗ, не
+    обрезка: агент должен знать, что не влезло, и разбить сам.
+    scope_stage привязывает заметку к этапу — конвейер удалит её при
+    закрытии этапа (уборка — работа пайплайна)."""
+    name = name or "memory.md"
+    if not name.strip():
+        return False, "пустое имя заметки"
+    if len(name) > 64:
+        return False, "имя заметки длиннее 64 символов"
+    if len(content.encode("utf-8")) > MEMORY_MAX_BYTES:
+        return False, (f"заметка {name} больше {MEMORY_MAX_BYTES} байт — "
+                       f"сократи или раздели на несколько заметок")
+    with _connect(immediate=True) as conn:
+        if scope_stage:
+            rows = conn.execute(
+                """SELECT id FROM workflow_stages WHERE workflow_id=?
+                   AND (id=? OR code=?) AND status NOT IN ('completed','skipped')""",
+                (workflow_id, scope_stage, scope_stage),
+            ).fetchall()
+            if len(rows) != 1:
+                return False, "scope_stage должен указывать на открытый этап этой миссии"
+            scope_stage = rows[0]["id"]
+        conn.execute(
+            """INSERT INTO workflow_memory (workflow_id, name, content, updated_at, updated_by_task, scope_stage)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(workflow_id, name) DO UPDATE SET
+                   content = excluded.content,
+                   updated_at = excluded.updated_at,
+                   updated_by_task = excluded.updated_by_task,
+                   scope_stage = excluded.scope_stage""",
+            (workflow_id, name, content, _now(), updated_by_task,
+             (scope_stage or None)),
+        )
+    return True, "сохранено"
+
+
+def delete_memory(workflow_id: str, name: str) -> bool:
+    with _connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM workflow_memory WHERE workflow_id = ? AND name = ?",
+            (workflow_id, name),
+        )
+        return cur.rowcount > 0
+
+
 def create_workflow_artifact(data: WorkflowArtifactCreate,
                              artifact_id: str = None) -> WorkflowArtifactInDB:
     artifact_id = artifact_id or _new_id("artifact")
@@ -5620,15 +6704,35 @@ def list_workflow_artifacts(workflow_id: str,
         return [_row_to_workflow_artifact(row) for row in rows]
 
 
-def list_workflow_events(workflow_id: str, after_seq: int = 0,
-                         limit: int = 200) -> list[WorkflowEventInDB]:
+def list_workflow_notification_events(after_seq: int = 0, limit: int = 500,
+                                      *, tail: bool = False):
+    """One global event snapshot, including workflows beyond UI list limits."""
     with _connect() as conn:
         rows = conn.execute(
-            """SELECT * FROM workflow_events
+            "SELECT e.*, w.slug AS workflow_slug FROM workflow_events e "
+            "JOIN workflows w ON w.id=e.workflow_id WHERE e.seq>? ORDER BY e.seq "
+            + ("DESC" if tail else "ASC") + " LIMIT ?", (after_seq, limit),
+        ).fetchall()
+    if tail:
+        rows.reverse()
+    return [(row["workflow_slug"], _row_to_workflow_event(row)) for row in rows]
+
+
+def list_workflow_events(workflow_id: str, after_seq: int = 0,
+                         limit: int = 200,
+                         tail: bool = False) -> list[WorkflowEventInDB]:
+    """tail=True — последние `limit` событий в хронологическом порядке:
+    дешевле страницы «всё и отрезать» для длинных миссий."""
+    with _connect() as conn:
+        order = "DESC" if tail else "ASC"
+        rows = conn.execute(
+            f"""SELECT * FROM workflow_events
                WHERE workflow_id = ? AND seq > ?
-               ORDER BY seq LIMIT ?""",
+               ORDER BY seq {order} LIMIT ?""",
             (workflow_id, after_seq, limit),
         ).fetchall()
+        if tail:
+            rows = list(reversed(rows))
         return [_row_to_workflow_event(row) for row in rows]
 
 

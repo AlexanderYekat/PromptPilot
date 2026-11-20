@@ -14,6 +14,7 @@ import pytest
 
 from promptpilot import fallback_handoff as handoff
 from promptpilot import pipeline_insights, project_pipeline as pp
+from promptpilot.models import TaskCreate
 
 
 HEAD = "a" * 40
@@ -59,6 +60,41 @@ def health(target_stage="integration-review"):
             "merge_executable": [] if reviewing else [target]}
 
 
+@pytest.mark.parametrize("change", [
+    {"number": 99}, {"head": "b" * 40}, {"review_depth": 2},
+    {"stage": "integration-review"},
+])
+def test_parallel_review_allowlist_cannot_expand_content_authority(change):
+    value = health()
+    content = {"number": 43, "head": "c" * 40,
+               "stage": "review", "review_depth": 0}
+    value["content_review_candidates"] = [content]
+    value["parallel_review_candidates"] = [dict(content, **change)]
+    with pytest.raises(pp.PipelineError, match="parallel REVIEW"):
+        handoff.validate_health(value)
+
+
+def test_parallel_review_allowlist_requires_integration_review_owner():
+    value = health("integration-merge-ready")
+    content = {"number": 43, "head": "c" * 40,
+               "stage": "review", "review_depth": 0}
+    value["content_review_candidates"] = [content]
+    value["review_candidates"] = [content]
+    value["parallel_review_candidates"] = [content]
+    with pytest.raises(pp.PipelineError, match="no integration-review owner"):
+        handoff.validate_health(value)
+
+
+def test_parallel_review_cannot_duplicate_integration_owner():
+    value = health()
+    duplicate = {"number": 42, "head": HEAD,
+                 "stage": "review", "review_depth": 0}
+    value["content_review_candidates"] = [duplicate]
+    value["parallel_review_candidates"] = [duplicate]
+    with pytest.raises(pp.PipelineError, match="includes its integration owner"):
+        handoff.validate_health(value)
+
+
 def invoke(argv):
     output = io.StringIO()
     with redirect_stdout(output):
@@ -67,6 +103,16 @@ def invoke(argv):
 
 
 class ReadOnlyGitHub:
+    def graphql_page(self, owner, name, number, cursor):
+        # Legacy OFF admission now checks that the selected PR has no trusted
+        # v1 history before handing it to a full skill. This peer has none.
+        assert (owner, name, number, cursor) == ('ivanarama', 'onebase', 42, None)
+        return {'data': {'repository': {'pullRequest': {
+            'headRefOid': HEAD, 'baseRefOid': 'c'*40, 'baseRefName': 'main', 'state': 'OPEN', 'isDraft': False,
+            'labels': {'nodes': [], 'pageInfo': {'hasNextPage': False}},
+            'timelineItems': {'edges': [], 'pageInfo': {'hasNextPage': False}},
+        }}}}
+
     def json(self, *args, **kwargs):
         assert args == ("api", "user"), f"unexpected GitHub operation: {args}"
         assert not kwargs, "no GitHub write input is permitted"
@@ -88,7 +134,23 @@ def test_cli_dispatch_handoff_runs_exactly_election_and_fresh_gate(config, monke
 
     monkeypatch.setattr(pp, "load_config", lambda _: dict(config))
     monkeypatch.setattr(pp, "run_health", run_health)
-    monkeypatch.setattr(pp, "GitHub", ReadOnlyGitHub)
+    class ReviewHistoryGitHub(ReadOnlyGitHub):
+        def graphql_page(self, owner, name, number, cursor):
+            result = super().graphql_page(owner, name, number, cursor)
+            if target_stage == "review":
+                # Ordinary third-round fallback still applies, but the reader
+                # now first proves whether a real later explicit request exists.
+                from tests.test_explicit_full_current_review import history
+                value = history()
+                value["edges"].pop()  # No new owner request: keep ordinary fallback.
+                for item in value["edges"]:
+                    node = item["node"]
+                    if node.get("author"):
+                        node["author"]["login"] = "ivanarama"
+                result["data"]["repository"]["pullRequest"]["timelineItems"]["edges"] = value["edges"]
+            return result
+
+    monkeypatch.setattr(pp, "GitHub", ReviewHistoryGitHub)
     cleanup_reads = []
     monkeypatch.setattr(pp, "pending_merge_intents", lambda *_: cleanup_reads.append(True) or [])
     monkeypatch.setattr(pp, "list_ship", lambda *_: pytest.fail("owner election must not rescan ship"))
@@ -402,9 +464,10 @@ def test_next_review_forces_targeted_full_skill_for_pre_review(config, monkeypat
     source = health(handoff.PRE_REVIEW_VALIDATION_STAGE)
     monkeypatch.setattr(pp, "run_health", lambda *_, **__: source)
     monkeypatch.setattr(
-        pp, "stable_timeline",
+        pp, "content_review_target_gate",
         lambda *_: pytest.fail("pre-review validation must not enter fast audit"),
     )
+    monkeypatch.setattr(pp, 'stable_timeline', lambda *_: {'edges': []})
 
     result = pp.next_review(object(), config)
 
@@ -414,15 +477,17 @@ def test_next_review_forces_targeted_full_skill_for_pre_review(config, monkeypat
 
 
 def test_next_review_pre_review_fails_closed_without_target_protocol(monkeypatch):
+    monkeypatch.setattr(pp, 'stable_timeline', lambda *_: {'edges': []})
     source = health(handoff.PRE_REVIEW_VALIDATION_STAGE)
     monkeypatch.setattr(pp, "run_health", lambda *_, **__: source)
     with pytest.raises(pp.PipelineError, match="exact-target"):
-        pp.next_review(object(), {})
+        pp.next_review(object(), {'repository':'ivanarama/onebase','trusted_account':'ivanarama'})
 
 
 def test_legacy_config_does_not_silently_opt_in(monkeypatch):
+    monkeypatch.setattr(pp, 'stable_timeline', lambda *_: {'edges': []})
     monkeypatch.setattr(pp, "run_health", lambda *_, **__: health())
-    assert pp.next_review(object(), {}) == {
+    assert pp.next_review(object(), {'repository':'ivanarama/onebase','trusted_account':'ivanarama'}) == {
         "action": "fallback", "reason": "integration/base-sync state requires the full skill",
     }
 
@@ -649,3 +714,58 @@ def test_module_cli_helper_errors_are_json_and_visible_without_tracebacks(config
     assert payload["error"]
     assert result.stderr.strip() == f"pipelinectl gate-fallback: {payload['error']}"
     assert "Traceback" not in result.stderr
+
+
+def test_validated_merge_fallback_parks_exact_target_with_stale_dashboard(
+        config, isolated_db, monkeypatch):
+    source = health("merge")
+    target = source["merge_executable"][0]
+    preflight = handoff.create(config, source, "merge", target, "full skill required")
+    queue = {"id": "merge", "item_blockers": True,
+             "execution": {"mode": "auto", "command": ["pp", "next", "merge"]}}
+    monkeypatch.setattr(pipeline_insights, "_matching_queue", lambda _: ("p", {}, queue))
+    monkeypatch.setattr(pipeline_insights, "_tool_available", lambda *_: (True, ""))
+    monkeypatch.setattr(pipeline_insights, "_tool_preflight", lambda *_: preflight)
+    monkeypatch.setattr(pipeline_insights, "read_cached", lambda *_: {"cache": {"stale": True}})
+    task = isolated_db.create_task(TaskCreate(prompt="merge", recurrence="15m"))
+    route = pipeline_insights.execution_route(task, "canonical skill")
+    assert route["action"] == "prompt"
+    isolated_db.mark_completed(
+        task.id, f'ИТОГ: НУЖЕН ЧЕЛОВЕК (#{target["number"]} — conflict requires owner)',
+        verdict="НУЖЕН ЧЕЛОВЕК")
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        task.series_id, task.id)["suppress_recurrence"]
+    from promptpilot.pipeline_item_holds import prepare
+    fresh = {"cache": {"complete": True}, "diagnostics": source}
+    successor = SimpleNamespace(id=task.id + 1, series_id=task.series_id)
+    assert prepare(successor, queue, fresh) == [target["number"]]
+
+
+@pytest.mark.parametrize("verdict", ["НЕ СМОГ", "НУЖЕН ЧЕЛОВЕК"])
+def test_repeated_merge_target_with_stale_snapshot_keeps_series_guard(
+        config, isolated_db, monkeypatch, verdict):
+    source = health("merge")
+    target = source["merge_executable"][0]
+    preflight = handoff.create(config, source, "merge", target, "full skill required")
+    queue = {"id": "merge", "item_blockers": True,
+             "execution": {"mode": "auto", "command": ["pp", "next", "merge"]}}
+    monkeypatch.setattr(pipeline_insights, "_matching_queue", lambda _: ("p", {}, queue))
+    monkeypatch.setattr(pipeline_insights, "_tool_available", lambda *_: (True, ""))
+    monkeypatch.setattr(pipeline_insights, "_tool_preflight", lambda *_a, **_k: preflight)
+    monkeypatch.setattr(pipeline_insights, "read_cached", lambda *_: {"cache": {"stale": True}})
+    result = f'ИТОГ: {verdict} (#{target["number"]} — conflict requires owner)'
+    first = isolated_db.create_task(TaskCreate(prompt="merge", recurrence="15m"))
+    assert pipeline_insights.execution_route(first, "canonical skill")["action"] == "prompt"
+    isolated_db.mark_completed(first.id, result, verdict=verdict)
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        first.series_id, first.id)["suppress_recurrence"]
+    # Repairing the same occurrence remains idempotent.
+    assert not isolated_db.pause_pipeline_series_on_repeated_blocker(
+        first.series_id, first.id)["suppress_recurrence"]
+    second = isolated_db.create_task(TaskCreate(
+        prompt="merge", recurrence="15m", series_id=first.series_id))
+    assert pipeline_insights.execution_route(second, "canonical skill")["action"] == "prompt"
+    isolated_db.mark_completed(second.id, result, verdict=verdict)
+    guard = isolated_db.pause_pipeline_series_on_repeated_blocker(second.series_id, second.id)
+    assert guard["suppress_recurrence"] and guard["previous_task_id"] == first.id
+    assert isolated_db.list_series()[0]["paused"]

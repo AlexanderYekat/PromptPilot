@@ -1,10 +1,10 @@
 import os
 import sqlite3
-from contextlib import closing
 import subprocess
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
@@ -406,7 +406,7 @@ def test_quarantine_heartbeat_does_not_wait_for_cleanup_backoff(
 
 
 def test_reservation_schema_has_versioned_migration(isolated_db):
-    with closing(sqlite3.connect(isolated_db.DB_PATH)) as conn, conn:
+    with closing(sqlite3.connect(isolated_db.DB_PATH)) as conn:
         table = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name='pipeline_target_reservations'"
@@ -475,6 +475,44 @@ def test_review_election_reserves_then_selects_next_candidate(
     assert repeated_reservation["token"] == second_reservation["token"]
     assert replacement_first["number"] == 10
     assert exhausted is None
+
+
+def test_integration_owner_and_content_review_use_distinct_replica_reservations(
+        isolated_db, monkeypatch):
+    config = {
+        "repository": "owner/repo", "review_completion_gate": "target-v1",
+        "fallback_handoff": "target-v1", "parallel_content_review": True,
+        "review_lease_seconds": 300, "target_reservation_ttl_seconds": 300,
+    }
+    owner = {"number": 10, "head": HEAD_A, "stage": "integration-review"}
+    content = _candidate(11, HEAD_B)
+    health = {
+        "state": "yellow",
+        "findings": [{"code": "single_flight_barrier", "severity": "yellow", "pr": 10}],
+        "integration_owner": owner, "review_candidates": [owner],
+        "content_review_candidates": [content],
+        "parallel_review_candidates": [content], "merge_executable": [],
+    }
+    fallback_handoff.validate_health(health)
+    monkeypatch.setenv("PP_PIPELINE_REPLICAS", "2")
+    attempts = []
+    for index in range(2):
+        isolated_db.create_task(TaskCreate(prompt=f"parallel replica {index}"))
+        attempts.append(isolated_db.get_next_runnable())
+
+    candidates = health["review_candidates"] + pipelinectl.parallel_content_candidates(
+        config, health)
+    _set_replica_attempt_env(monkeypatch, attempts[0])
+    first, first_reservation, _ = pipelinectl._elect_review_candidate(
+        config, health, candidates)
+    _set_replica_attempt_env(monkeypatch, attempts[1])
+    second, second_reservation, _ = pipelinectl._elect_review_candidate(
+        config, health, candidates)
+
+    assert (first["number"], second["number"]) == (10, 11)
+    assert first_reservation["task_id"] == attempts[0].id
+    assert second_reservation["task_id"] == attempts[1].id
+    assert health["merge_executable"] == []
 
 
 def test_expired_owned_reservation_fails_without_retargeting(
@@ -577,14 +615,27 @@ def test_fallback_gate_requires_live_exact_task_reservation(
     monkeypatch.setattr(pipelinectl, "run_health", lambda *_args, **_kwargs: health)
     monkeypatch.setattr(pipelinectl, "ensure_identity", lambda *_args: None)
 
+    reads=[]
+    def ordinary_history(repo_owner,repo_name,number,cursor):
+        assert (repo_owner,repo_name,number,cursor)==('owner','repo',10,None)
+        reads.append(number)
+        return {'data':{'repository':{'pullRequest':{
+            'headRefOid':HEAD_A,'baseRefOid':'c'*40,'baseRefName':'main',
+            'state':'OPEN','isDraft':False,
+            'labels':{'nodes':[],'pageInfo':{'hasNextPage':False}},
+            'timelineItems':{'edges':[],'pageInfo':{'hasNextPage':False}},
+        }}}}
+    peer=SimpleNamespace(graphql_page=ordinary_history)
     validated = fallback_handoff.gate(
-        object(), config, "review", envelope["handoff"]["lease"])
+        peer, config, "review", envelope["handoff"]["lease"])
     assert validated["action"] == "validated"
+    assert reads==[10,10]
 
     isolated_db.release_pipeline_target_reservations(owner.id)
     with pytest.raises(pipelinectl.PipelineError, match="expired or was released"):
         fallback_handoff.gate(
-            object(), config, "review", envelope["handoff"]["lease"])
+            peer, config, "review", envelope["handoff"]["lease"])
+    assert reads==[10,10]
 
 
 def test_replica_working_dirs_are_required_existing_and_distinct(tmp_path):
@@ -1020,6 +1071,79 @@ def test_execution_route_passes_replica_identity_to_preflight(
         "PP_PIPELINE_LEASE_KEY_FILE": str(
             (isolated_db.DB_PATH.resolve().parent / "pipeline-lease.key").resolve()),
     }
+
+
+@pytest.mark.parametrize("fault", [None, "unsigned", "wrong-kind", "unavailable", "skill"])
+def test_two_fix_routes_have_distinct_signed_targets_and_no_unqualified_fallback(
+        isolated_db, monkeypatch, tmp_path, fault):
+    monkeypatch.setattr(pipelinectl, 'stable_timeline', lambda *_args: {'edges': []})
+    from promptpilot import fix_handoff
+
+    directories = [tmp_path / f"fix-{index}" for index in (1, 2)]
+    for directory in directories:
+        consumer = directory / ".claude/skills/fix-approved/SKILL.md"
+        consumer.parent.mkdir(parents=True)
+        consumer.write_text(fix_handoff.CONSUMER_MARKER + "\n", encoding="utf-8")
+        isolated_db.create_task(TaskCreate(
+            prompt=f"Project - FIX {directory.name}", working_dir=str(directory),
+            recurrence="15m"))
+    monkeypatch.setenv("PP_DATA_DIR", str(isolated_db.DB_PATH.parent))
+    queue = {
+        "id": "fix", "series_contains": "Project - FIX", "replicas": 2,
+        "execution": {"mode": "skill" if fault == "skill" else "auto",
+                      "command": ["pipelinectl", "next", "fix"]},
+    }
+    config = {"repository": "owner/repo", "trusted_account": "owner", "parallel_fix_enabled": True}
+    monkeypatch.setattr(pipeline_insights, "_matching_queue", lambda _t: (
+        "p", {"repository": "owner/repo"}, queue))
+    monkeypatch.setattr(pipeline_insights, "_tool_available", lambda *_a: (
+        fault != "unavailable", "tool missing"))
+    monkeypatch.setattr(pipeline_insights, "load_providers", lambda: {})
+    monkeypatch.setattr(pipelinectl, "run_health", lambda *_a, **_k: {
+        "state": "green", "findings": [], "fix_candidates": [
+            {"stage": "review", "number": 10, "head": HEAD_A},
+            {"stage": "fix-issue", "number": 11, "eligibility_digest": HEAD_B},
+        ]})
+    calls = []
+
+    def preflight(_execution, command, working_dir, *, env_extra=None):
+        calls.append((command, working_dir))
+        with monkeypatch.context() as child:
+            for name, value in env_extra.items():
+                child.setenv(name, value)
+            child.chdir(working_dir)
+            value = pipelinectl.next_fix(None, config)
+            if fault == "unsigned":
+                del value["handoff"]
+            elif fault == "wrong-kind":
+                lease = pipelinectl.decode_signed_lease(value["handoff"]["lease"])
+                lease["target"]["stage"] = "review"
+                value["handoff"]["lease"] = pipelinectl.encode_signed_lease(lease)
+            return value
+
+    monkeypatch.setattr(pipeline_insights, "_tool_preflight", preflight)
+    routes = []
+    for directory in directories:
+        task = isolated_db.get_next_runnable()
+        assert task.working_dir == str(directory)
+        route = pipeline_insights.execution_route(task, "canonical FIX", str(directory))
+        routes.append(route)
+        if fault:
+            assert route["action"] == "block"
+            assert "prompt" not in route
+        else:
+            assert route["action"] == "prompt"
+            assert route["next_already_run"] is True
+            assert route["pipeline_replicas"] == 2
+            assert "gate-fix-owner" in route["prompt"]
+            assert "перед КАЖДОЙ".lower() in route["prompt"].lower()
+            assert route["pipeline_target_reservation"]["task_id"] == task.id
+    if not fault:
+        assert [route["target"]["number"] for route in routes] == [10, 11]
+        assert [route["target"]["stage"] for route in routes] == ["fix-pr", "fix-issue"]
+        assert len({route["gate_command"][-1] for route in routes}) == 2
+    if fault in {"unavailable", "skill"}:
+        assert calls == []
 
 
 def test_signed_integration_review_inherits_merge_budget_priority(

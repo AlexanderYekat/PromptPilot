@@ -27,6 +27,7 @@ def test_external_revision_keeps_rights_notes_and_previous_result(isolated_db, m
 
     waiting = isolated_db.get_workflow(wf.id)
     submission = WorkflowExternalResult(expected_version=waiting.state_version,
+                                       run_id=assignment.run_id, input_sha256=assignment.input_sha256,
                                        result="Original external report", performer="Researcher")
     workflows.submit_external_result(wf.id, submission)
     with pytest.raises(db.WorkflowConflictError):
@@ -53,20 +54,19 @@ def test_external_revision_keeps_rights_notes_and_previous_result(isolated_db, m
 def test_all_fork_columns_migrate_together(tmp_path, monkeypatch):
     path = tmp_path / "old.db"
     legacy = db.SCHEMA.replace("    ,rights TEXT\n", "").replace(
-        "    flow_ref TEXT\n", "").replace("    machine TEXT,\n);", "    machine TEXT\n);")
-    # Match the actual source schema instead of silently testing a modern DB.
-    legacy = legacy.replace("    input_json TEXT,\n", "")
-    assert "input_json" not in legacy and "flow_ref" not in legacy and ",rights" not in legacy
+        "    flow_ref TEXT,\n", "").replace("    input_json TEXT,\n", "")
+    fields = [("tasks", "rights"), ("notifications", "flow_ref"), ("workflow_runs", "input_json")]
     with closing(sqlite3.connect(path)) as conn, conn:
         conn.executescript(legacy)
+        for table, field in fields:
+            assert field not in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         conn.execute("INSERT INTO tasks(prompt,created_at) VALUES('retained','2026-01-01')")
     monkeypatch.setattr(db, "DB_DIR", tmp_path)
     monkeypatch.setattr(db, "DB_PATH", path)
     db.init_db()
     db.init_db()
     with db._connect() as conn:
-        for table, field in [("tasks", "rights"), ("notifications", "flow_ref"),
-                             ("workflow_runs", "input_json")]:
+        for table, field in fields:
             assert field in {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         assert conn.execute("SELECT prompt FROM tasks").fetchone()[0] == "retained"
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"

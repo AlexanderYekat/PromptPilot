@@ -2,6 +2,7 @@
 
 import copy
 import hashlib
+import html
 import json
 import math
 import os
@@ -21,6 +22,8 @@ from urllib.parse import quote
 from . import db
 from .config import (CONCURRENCY, DB_DIR, DEFAULT_CLI, POLL_INTERVAL,
                      TASK_TIMEOUT, load_providers)
+from .wip_diagnostics import (backpressure_details, explain_backpressure,
+                              refresh_budget_diagnostic)
 
 
 DEFAULT_PROFILES: dict = {}
@@ -90,6 +93,258 @@ class _GitHubRateLimitUnavailable(RuntimeError):
     """The authenticated GitHub budget cannot be proved from valid responses."""
 
 
+class _GitHubSearchBudgetDenied(RuntimeError):
+    def __init__(self, decision):
+        super().__init__(decision["reason"])
+        self.decision = decision
+
+
+class _LegacyGraphQLSearchBudget:
+    """Recheck the existing complete scan estimate before every GraphQL page."""
+    def __init__(self, policy, admission):
+        self.policy, self.admission = policy, admission
+        self.last_limits = copy.deepcopy(admission["github_rate_limit"])
+        # The initial canonical rateLimit observation has already executed.
+        self.observed_spend, self.pending_cost = 1, 0
+        self.used = False
+
+    def _allowance_denied(self, reason):
+        return _budget_denied(self.policy, state="budget_in_flight", reason=reason,
+            now=time.time(), limits=self.last_limits,
+            status_revision=_current_github_scan_status_revision())
+
+    def before_request(self, query_cost):
+        self.used = True
+        _ensure_github_scan_lease(renew=True)
+        ceiling = self.policy["requested_cost"]["graphql"]
+        if query_cost > ceiling:
+            decision = _budget_denied(self.policy, state="invalid_config",
+                reason="GraphQL search query cost exceeds configured insights estimate",
+                now=time.time(), status_revision=_current_github_scan_status_revision())
+            decision["graphql_query_cost"] = query_cost
+            decision["configured_graphql_cost"] = ceiling
+        elif self.observed_spend + self.pending_cost + 1 + query_cost > ceiling:
+            decision = self._allowance_denied(
+                "Whole Source GraphQL estimate cannot cover another rate observation and query")
+        else:
+            # Same canonical metadata producer as initial scan admission, with
+            # its existing lease and Native-attempt publication fence. Never
+            # relabel earlier Core/Search counters with a new timestamp.
+            limits = _github_rate_limits()
+            reservations = _budget_reservation_ledger(self.policy)
+            before, current = self.last_limits["graphql"], limits["graphql"]
+            if current["reset"] != before["reset"] or current["remaining"] > before["remaining"]:
+                decision = self._allowance_denied(
+                    "Source GraphQL observation window changed; cumulative scan cost is unproved")
+            else:
+                # One allowance belongs to the entire leased Source operation,
+                # including its health checker, every queue/page, previews and
+                # rate observations. External consumption counts conservatively.
+                # The known previous request and this metadata query cost at
+                # least their reserved amount even if counters lag a response.
+                self.observed_spend += max(before["remaining"] - current["remaining"],
+                                           self.pending_cost + 1)
+                self.pending_cost = 0
+                self.last_limits = copy.deepcopy(limits)
+                if self.observed_spend + query_cost > ceiling:
+                    decision = self._allowance_denied(
+                        "Whole Source GraphQL observation allowance is exhausted")
+                else:
+                    decision = _evaluate_github_budget(self.policy, limits, now=time.time(),
+                        status_revision=_current_github_scan_status_revision(),
+                        reserved_other=reservations["totals"], active_reservations=reservations["count"])
+        if not decision["allowed"]:
+            lease = self.admission.get("_lease")
+            self.admission.clear()
+            self.admission.update(decision)
+            self.admission["_lease"] = lease
+            raise _GitHubSearchBudgetDenied(decision)
+        self.pending_cost = query_cost
+
+    def before_preview(self):
+        self.before_request(1)
+
+    def after_preview(self, cost):
+        pass
+
+    def before_data(self, quote):
+        self.before_request(quote)
+
+    def after_data(self, actual):
+        if actual > self.pending_cost:
+            raise ValueError("GraphQL search cost changed after preview")
+
+    def metadata(self):
+        self.before_request(0)
+
+    def failed_request(self):
+        pass
+
+
+class _GraphQLSearchBudget:
+    """Successful own-cost proof and a separate conservative account view."""
+    def __init__(self, policy, admission):
+        from .github_observation_budget import AvailabilityEnvelope, ObservationCost
+        self.policy, self.admission = policy, admission
+        self.last_limits = copy.deepcopy(admission["github_rate_limit"])
+        self.cost = ObservationCost(policy["requested_cost"]["graphql"])
+        self.envelope = AvailabilityEnvelope(self.last_limits)
+        lease = admission.get("_lease")
+        self.initial_metadata_cost = getattr(lease, "last_graphql_metadata_cost", None)
+        self.used = False
+        self.health_context = None
+        self.health_provenance = None
+
+    @property
+    def observed_spend(self):
+        return self.cost.charged
+
+    @property
+    def pending_cost(self):
+        return self.cost.escrow
+
+    def _record_denial(self, reason, state):
+        decision = _budget_denied(self.policy, state=state, reason=reason,
+            now=time.time(), limits=self.last_limits,
+            status_revision=_current_github_scan_status_revision())
+        decision["source_cost_uncertain"] = self.cost.uncertain
+        decision["source_cost_charged"] = self.cost.charged
+        decision["source_cost_observed_actual"] = self.cost.observed_actual
+        lease = self.admission.get("_lease")
+        self.admission.clear(); self.admission.update(decision); self.admission["_lease"] = lease
+        return decision
+
+    def _deny(self, reason, state="budget_in_flight"):
+        raise _GitHubSearchBudgetDenied(self._record_denial(reason, state))
+
+    def activate(self):
+        if not self.used:
+            self.used = True
+            try:
+                self.cost.bootstrap(self.initial_metadata_cost)
+            except ValueError as exc:
+                self._deny(str(exc), "unavailable")
+
+    def check_account(self):
+        reservations = _budget_reservation_ledger(self.policy)
+        projected = self.envelope.projected_limits(self.last_limits)
+        decision = _evaluate_github_budget(self.policy, projected, now=time.time(),
+            status_revision=_current_github_scan_status_revision(),
+            reserved_other=reservations["totals"], active_reservations=reservations["count"])
+        # Never store or label our conservative projection as a canonical rate.
+        decision["github_rate_limit"] = copy.deepcopy(self.last_limits)
+        decision["source_availability_envelope"] = {k:r["remaining"] for k,r in projected.items()}
+        if not decision["allowed"]:
+            lease = self.admission.get("_lease")
+            self.admission.clear(); self.admission.update(decision); self.admission["_lease"] = lease
+            raise _GitHubSearchBudgetDenied(decision)
+
+    def metadata(self):
+        self.activate(); _ensure_github_scan_lease(renew=True); self.check_account()
+        try:
+            self.cost.reserve()  # unknown pricing: one finite remaining escrow
+            limits = _github_rate_limits()
+            lease = self.admission.get("_lease")
+            actual = getattr(lease, "last_graphql_metadata_cost", None)
+            self.cost.settle(actual)
+        except _GitHubScanLeaseFailure:
+            self.cost.poison(); raise
+        except _GitHubRateLimitUnavailable:
+            self.cost.poison(); raise
+        except ValueError as exc:
+            self.cost.poison(); self._deny(str(exc), "unavailable")
+        self.envelope.charge_graphql(actual)
+        self.envelope.observe(limits)
+        self.last_limits = copy.deepcopy(limits)
+        self.check_account()
+
+    def before_preview(self):
+        self.metadata()
+        try:self.cost.reserve()
+        except ValueError as exc:self._deny(str(exc))
+
+    def after_preview(self, cost):
+        self._settle(cost)
+
+    def before_data(self, quote):
+        self.metadata()
+        try:self.cost.reserve(quote)
+        except ValueError as exc:self._deny(str(exc))
+
+    def after_data(self, actual):
+        self._settle(actual)
+
+    def _settle(self, actual):
+        try:self.cost.settle(actual)
+        except ValueError as exc:self._deny(str(exc), "unavailable")
+        self.envelope.charge_graphql(actual)
+
+    def failed_request(self):
+        self.cost.poison()
+
+    def prepare_health(self, profile):
+        from .source_graphql_cost import health_contract
+        self.activate(); self.check_account()
+        try:
+            expected = health_contract(profile)
+        except (OSError, ValueError) as exc:self._deny(str(exc), "invalid_config")
+        try:
+            self.cost.reserve()
+        except ValueError as exc:self._deny(str(exc))
+        self.health_context = dict(expected, nonce=uuid.uuid4().hex, allowance=self.cost.escrow)
+
+    def consume_health(self, diagnostics, profile):
+        from .source_graphql_cost import digest, health_contract, validate_receipt
+        try:
+            expected = health_contract(profile)  # artifact/contract must still be exact
+            receipt = (diagnostics or {}).get("source_graphql_usage")
+            context = self.health_context
+            if (diagnostics or {}).get("exit_code") not in (0,1) or type((diagnostics or {}).get("exit_code")) is not int:
+                raise ValueError("technical checker exit cannot prove successful Source cost")
+            actual = validate_receipt(receipt, expected, nonce=context["nonce"], allowance=context["allowance"])
+            self.cost.settle(actual, allow_zero=True)
+        except (OSError, TypeError, ValueError) as exc:
+            self.cost.poison()
+            raise ValueError("Source checker cost protocol failed: " + str(exc)) from exc
+        self.envelope.charge_graphql(actual)
+        proof = {"executable_sha256":expected["executable_sha256"], "receipt_sha256":digest(receipt)}
+        diagnostics["source_graphql_cost_proof"] = proof
+        self.health_provenance = dict(proof, reused=False, charged=actual)
+        self.health_context = None
+
+    def refuse_health(self, payload, profile):
+        from .source_graphql_cost import health_contract, validate_refusal
+        if not isinstance(payload,dict) or set(payload)!={"source_graphql_usage"}:
+            raise ValueError("invalid Source checker allowance refusal report")
+        expected = health_contract(profile)
+        context = self.health_context
+        actual = validate_refusal(payload["source_graphql_usage"], expected,
+            nonce=context["nonce"], allowance=context["allowance"])
+        self.cost.settle(actual, allow_zero=True)
+        self.envelope.charge_graphql(actual)
+        self.health_context = None
+        self._deny("Source checker clean allowance_exhausted refusal", "budget_in_flight")
+
+    def reuse_health(self, diagnostics, profile, age):
+        from .source_graphql_cost import digest, health_contract, validate_receipt
+        self.activate()
+        try:
+            ttl = max(0,int(profile["health_check"].get("cache_seconds",1800)))
+            if (not isinstance(age,(int,float)) or isinstance(age,bool)
+                    or not math.isfinite(age) or not 0<=age<ttl):
+                raise ValueError("cached health cost proof is outside its original TTL")
+            expected = health_contract(profile)
+            if type(diagnostics.get("exit_code"))is not int or diagnostics["exit_code"] not in (0,1):
+                raise ValueError("cached technical checker failure cannot prove Source cost")
+            receipt = (diagnostics or {}).get("source_graphql_usage")
+            validate_receipt(receipt, expected, nonce=receipt["nonce"], allowance=receipt["allowance"])
+            proof = diagnostics["source_graphql_cost_proof"]
+            if proof != {"executable_sha256":expected["executable_sha256"], "receipt_sha256":digest(receipt)}:
+                raise ValueError("cached health cost proof differs from current artifact/receipt")
+        except (OSError, KeyError, TypeError, ValueError) as exc:self._deny(str(exc), "unavailable")
+        self.health_provenance = dict(proof, reused=True, age_seconds=age, charged=0)
+
+
 class _GitHubScanLease:
     """Renew one SQLite-backed scan lease while external work is in flight."""
 
@@ -120,7 +375,11 @@ class _GitHubScanLease:
 
     @property
     def guard(self) -> dict:
-        return {"scope": self.scope, "token": self.token}
+        result = {"scope": self.scope, "token": self.token}
+        continuation = getattr(self, "continuation", None)
+        if continuation is not None:
+            result["continuation"] = continuation.guard
+        return result
 
     def _mark_lost(self) -> None:
         with self._state_lock:
@@ -240,8 +499,19 @@ class _GitHubScanLease:
             if self._thread is not None:
                 self._thread.join(timeout=2)
             try:
+                failure = ((refresh_status or {}).get("status") or {}).get("github_budget", {}).get(
+                    "source_checker_failure_profile_hash") is not None
+                failure_guard = None
+                if failure:
+                    try:
+                        if getattr(self,"continuation",None) is not None:
+                            self.continuation.check()
+                        failure_guard = self.guard
+                    except _GitHubScanLeaseFailure:
+                        pass  # still release our own token; no new failure proof
                 db.release_pipeline_scan_lease(
-                    self.scope, self.token, refresh_status=refresh_status)
+                    self.scope, self.token, refresh_status=refresh_status,
+                    **({"checker_failure_guard": failure_guard} if failure else {}))
             except Exception:
                 # A failed release stays fail-closed until the renewable lease
                 # expires; never let cleanup hide the scan's original outcome.
@@ -308,14 +578,23 @@ def _strict_budget_vector(raw: dict, path: str) -> dict:
 def _github_budget_policy(profile: dict) -> dict | None:
     """Normalize the opt-in admission policy without changing legacy profiles."""
     raw = profile.get("github_budget")
+    health = profile.get("health_check") or {}
+    declared_cost = isinstance(health,dict) and "source_graphql_cost" in health
     if raw is None or raw is False:
+        if declared_cost:raise ValueError("Source checker cost declaration requires github_budget.source_cost_protocol")
         return None
     if not isinstance(raw, dict):
         raise ValueError("github_budget должен быть JSON-объектом")
     enabled = raw.get("enabled", True)
+    source_cost_protocol = raw.get("source_cost_protocol")
+    if "source_cost_protocol" in raw and source_cost_protocol != "source-graphql-cost-v1":
+        raise ValueError("unsupported github_budget.source_cost_protocol")
+    if declared_cost and source_cost_protocol is None:
+        raise ValueError("Source checker cost declaration requires github_budget.source_cost_protocol")
     if not isinstance(enabled, bool):
         raise ValueError("github_budget.enabled должен быть true или false")
     if not enabled:
+        if source_cost_protocol is not None:raise ValueError("Source cost protocol requires enabled github_budget")
         return None
 
     minimum_remaining = _minimum_remaining(
@@ -357,8 +636,10 @@ def _github_budget_policy(profile: dict) -> dict | None:
         raise ValueError("github_budget.essential_snapshot_headroom must be a boolean")
     if essential_snapshot_headroom and costs is None:
         raise ValueError("github_budget.essential_snapshot_headroom requires costs")
+    if source_cost_protocol is not None and costs is None:
+        raise ValueError("Source cost protocol requires configured finite costs")
 
-    return {
+    policy = {
         "minimum_remaining": minimum_remaining,
         "priority_one_headroom": priority_one_headroom,
         "costs": costs,
@@ -381,12 +662,18 @@ def _github_budget_policy(profile: dict) -> dict | None:
         # profiles cannot accidentally opt out of each other's reservation.
         "lease_scope": _GITHUB_SCAN_LEASE_SCOPE,
     }
+    if source_cost_protocol is not None:
+        policy["source_cost_protocol"] = source_cost_protocol
+    return policy
 
 
 def _with_shared_budget_floor(policy: dict) -> dict:
     """Use the strongest hard reserve of every profile sharing this account."""
     floor = dict(policy["minimum_remaining"])
     priority_one_headroom = dict(policy["priority_one_headroom"])
+    snapshot_headroom = {resource: 0 for resource in floor}
+    if policy.get("essential_snapshot_headroom"):
+        snapshot_headroom.update(policy["costs"]["insights"])
     starvation_timeouts = []
     if policy.get("starvation_timeout_seconds", 0) > 0:
         starvation_timeouts.append(policy["starvation_timeout_seconds"])
@@ -399,12 +686,16 @@ def _with_shared_budget_floor(policy: dict) -> dict:
         for resource, value in candidate["priority_one_headroom"].items():
             priority_one_headroom[resource] = max(
                 priority_one_headroom[resource], value)
+        if candidate.get("essential_snapshot_headroom"):
+            for resource, value in candidate["costs"]["insights"].items():
+                snapshot_headroom[resource] = max(snapshot_headroom[resource], value)
         if candidate.get("starvation_timeout_seconds", 0) > 0:
             starvation_timeouts.append(
                 candidate["starvation_timeout_seconds"])
     selected = dict(policy)
     selected["minimum_remaining"] = floor
     selected["priority_one_headroom"] = priority_one_headroom
+    selected["snapshot_headroom"] = snapshot_headroom
     # The reservation ledger is account-wide. Every caller must therefore use
     # one deterministic deadline; the tightest explicit bound wins.
     selected["starvation_timeout_seconds"] = (
@@ -413,6 +704,32 @@ def _with_shared_budget_floor(policy: dict) -> dict:
         raise ValueError(
             "общий github_budget.priority_one_headroom требует "
             "github_budget.costs в каждом профиле с тем же GitHub token")
+    if any(snapshot_headroom.values()) and selected.get("costs") is None:
+        raise ValueError("общий essential snapshot headroom требует github_budget.costs")
+    return selected
+
+
+def _with_execution_snapshot_floor(policy: dict) -> dict:
+    """Keep one shared essential scan possible while provider work is running.
+
+    This is a hard admission gap, distinct from borrowable P1 headroom. Existing
+    soft headroom may already cover it: preserve their maximum, not their sum.
+    account-wide scan lease serializes scans, so protect the componentwise
+    largest scan once, rather than reserving one scan for every task. Scans
+    themselves pay their configured cost against the ordinary floor.
+    """
+    selected = dict(policy)
+    selected["snapshot_headroom_applied"] = False
+    headroom = policy.get("snapshot_headroom") or {}
+    if (policy.get("cost_accounting") and policy.get("budget_route")
+            not in (None, "insights") and any(headroom.values())):
+        soft = (policy.get("priority_one_headroom") or {}
+                if policy.get("priority_headroom_applied") else {})
+        selected["minimum_remaining"] = {
+            resource: minimum + max(0, headroom[resource] - soft.get(resource, 0))
+            for resource, minimum in policy["minimum_remaining"].items()
+        }
+        selected["snapshot_headroom_applied"] = True
     return selected
 
 
@@ -496,6 +813,13 @@ def _budget_policy_for_route(policy: dict, route: str | None) -> dict:
             resource: 0 for resource in policy["minimum_remaining"]}
         selected["cost_accounting"] = False
         return selected
+    if route == "merge_receipt":
+        from .merge_finish_transport import RECEIPT_COST
+        return dict(policy, budget_route=route, requested_cost=dict(RECEIPT_COST), cost_accounting=True)
+    if route == "merge_confirmation":
+        from .merge_finish_transport import reservation_cost
+        return dict(policy, budget_route=route, requested_cost=reservation_cost(policy),
+                    cost_accounting=True)
     if route not in _GITHUB_BUDGET_ROUTES:
         raise ValueError(f"неизвестный GitHub budget route: {route}")
     selected = dict(policy)
@@ -545,6 +869,9 @@ def _priority_budget_metadata(policy: dict) -> dict:
         "priority_headroom_applied": bool(
             policy.get("priority_headroom_applied")),
         "admission_priority": policy.get("admission_priority"),
+        "snapshot_headroom": dict(policy.get("snapshot_headroom") or {
+            resource: 0 for resource in resources}),
+        "snapshot_headroom_applied": bool(policy.get("snapshot_headroom_applied")),
     }
 
 
@@ -762,6 +1089,9 @@ def _evaluate_github_budget(policy: dict, limits: dict | None, *,
 
 def _budget_reservation_ledger(policy: dict, *, now: float | None = None) -> dict:
     """Read the shared ledger, adding fairness options only when enabled."""
+    continuation = getattr(_scan_lease_context, "continuation", None)
+    if continuation is not None:
+        return continuation.ledger(policy)
     timeout = int(policy.get("starvation_timeout_seconds") or 0)
     if not timeout:
         return db.pipeline_github_budget_reservations(policy["lease_scope"])
@@ -833,6 +1163,8 @@ def _priority_waiter_decision(
 
 def _arm_budget_waiter(task, decision: dict, *, starvation_timeout_seconds: int = 0) -> dict:
     """Persist a budget handoff before the serial admission lease is released."""
+    if getattr(_scan_lease_context, "continuation", None) is not None:
+        return decision  # This attempt already owns admission; no scheduler edits.
     state = decision.get("state")
     if state not in {
             "budget_in_flight", "ledger_changed", "priority_waiter",
@@ -872,10 +1204,38 @@ def _arm_budget_waiter(task, decision: dict, *, starvation_timeout_seconds: int 
     return decision
 
 
+def _admit_scan_budget(policy, limits, reservations, lease, priority, task_id, final_source):
+    credit = reservations.get("final_source_cost") if final_source and lease.continuation else None
+    totals = reservations["totals"]
+    if credit is None:
+        waiting = _priority_waiter_decision(policy, limits, reservations,
+            priority=priority, task_id=task_id, status_revision=lease.status_revision)
+        if waiting is not None:
+            return waiting
+    else:
+        if credit != policy["requested_cost"]:
+            raise ValueError("reserved final Source cost differs from the current scan cost")
+        # The requested scan is already counted in this attempt's promise.
+        totals = {resource: total - credit[resource] for resource, total in totals.items()}
+    decision = _evaluate_github_budget(policy, limits, now=time.time(),
+        status_revision=lease.status_revision, reserved_other=totals,
+        active_reservations=reservations["count"])
+    decision["_budget_reservation_revision"] = reservations["revision"]
+    if credit is not None and decision["allowed"]:
+        if not db.spend_pipeline_final_source_credit(lease.continuation.guard, lease.guard,
+                reservations["revision"], credit):
+            return _reservation_denied(policy, limits, {"state": "ledger_changed"},
+                                       status_revision=lease.status_revision)
+        lease.continuation.final_source_spend["final_source_credit_used"] = True
+        decision["final_source_credit_used"] = True
+    return decision
+
+
 @contextmanager
 def _github_scan_admission(profile: dict, purpose: str,
                            *, profile_id: str | None = None,
-                           budget_route: str | None = None, task=None):
+                           budget_route: str | None = None, task=None,
+                           publish_refresh_status: bool = True, final_source: bool = False):
     """Admit one expensive scan and hold its cross-process reservation."""
     now = time.time()
     admission_priority = getattr(
@@ -894,6 +1254,7 @@ def _github_scan_admission(profile: dict, purpose: str,
                 # Optional/fresh scans preserve urgent-task headroom. Essential
                 # snapshot recovery is checked again under the shared lease.
                 policy = _budget_policy_for_admission_priority(policy, 10)
+            policy = _with_execution_snapshot_floor(policy)
     except (TypeError, ValueError) as exc:
         fallback = {
             "minimum_remaining": dict(_DEFAULT_GITHUB_BUDGET_MINIMUM),
@@ -964,6 +1325,8 @@ def _github_scan_admission(profile: dict, purpose: str,
         policy["lease_scope"], token, policy["lease_seconds"],
         status_revision=(status_revision
                          if isinstance(status_revision, int) else None))
+    lease.continuation = getattr(_scan_lease_context, "continuation", None)
+    lease.source_cost_protocol = policy.get("source_cost_protocol")
     lease.expires_at = acquired.get("expires_at")
     previous = getattr(_scan_lease_context, "lease", None)
     _scan_lease_context.lease = lease
@@ -1008,19 +1371,8 @@ def _github_scan_admission(profile: dict, purpose: str,
                         now=time.time(), limits=limits,
                         status_revision=lease.status_revision)
                 else:
-                    decision = _priority_waiter_decision(
-                        policy, limits, reservations,
-                        priority=admission_priority,
-                        task_id=getattr(task, "id", None),
-                        status_revision=lease.status_revision)
-                    if decision is None:
-                        decision = _evaluate_github_budget(
-                            policy, limits, now=time.time(),
-                            status_revision=lease.status_revision,
-                            reserved_other=reservations["totals"],
-                            active_reservations=reservations["count"])
-                        decision["_budget_reservation_revision"] = \
-                            reservations["revision"]
+                    decision = _admit_scan_budget(policy, limits, reservations, lease,
+                        admission_priority, getattr(task, "id", None), final_source)
                     if task is not None:
                         decision = _arm_budget_waiter(task, decision, starvation_timeout_seconds=policy.get("starvation_timeout_seconds", 0))
         except _GitHubScanLeaseFailure as exc:
@@ -1036,6 +1388,10 @@ def _github_scan_admission(profile: dict, purpose: str,
                     "fairness_waiter", "scan_in_progress"}):
             _clear_budget_waiter_after_admission(task)
         decision["_lease"] = lease
+        if decision.get("allowed") and policy.get("cost_accounting"):
+            meter = (_GraphQLSearchBudget if policy.get("source_cost_protocol") == "source-graphql-cost-v1"
+                     else _LegacyGraphQLSearchBudget)
+            lease.search_budget = meter(policy, decision)
         yield decision
     finally:
         _scan_lease_context.lease = previous
@@ -1044,7 +1400,8 @@ def _github_scan_admission(profile: dict, purpose: str,
             "repository": profile.get("repository", ""),
             "status": (None if decision.get("allowed")
                        else _refresh_blocked_status(decision)),
-        } if profile_id is not None and not lease.lost else None)
+        } if (publish_refresh_status and profile_id is not None
+              and budget_route == "insights" and not lease.lost) else None)
         lease.release(refresh_status=refresh_status)
 
 
@@ -1052,6 +1409,9 @@ def _ensure_github_scan_lease(*, renew: bool = False) -> None:
     lease = getattr(_scan_lease_context, "lease", None)
     if lease is not None:
         lease.ensure_owned(renew=renew)
+    continuation = getattr(_scan_lease_context, "continuation", None)
+    if continuation is not None:
+        continuation.check()
 
 
 def _current_github_scan_status_revision() -> int | None:
@@ -1146,6 +1506,8 @@ def _reservation_denied(policy: dict, limits: dict | None, result: dict, *,
 
 def _clear_budget_waiter_after_admission(task) -> None:
     """Settle a durable handoff when no in-flight reservation will do it."""
+    if getattr(_scan_lease_context, "continuation", None) is not None:
+        return
     task_id = getattr(task, "id", None)
     started_at = getattr(task, "started_at", None)
     # Synthetic/read-only callers cannot own a durable marker. Real worker
@@ -1171,7 +1533,7 @@ def _clear_budget_waiter_after_denial(task) -> None:
 def _reserve_execution_admission(
         task, profile_id: str, profile: dict, queue: dict, admission: dict,
         budget_route: str, *, retain_budget: bool,
-        admission_priority: int | None = None) -> dict:
+        admission_priority: int | None = None, fallback_target: dict | None = None) -> dict:
     """Recheck the elected route and optionally reserve its in-flight cost."""
     lease = admission.get("_lease")
     expected_revision = admission.get("_budget_reservation_revision")
@@ -1181,6 +1543,10 @@ def _reserve_execution_admission(
     if type(expected_revision) is not int or expected_revision < 0:
         expected_revision = None
     try:
+        if queue.get("id") == "merge" and budget_route in {"skill", "fallback_targeted"}:
+            from .merge_checkpoint import blocks_fallback
+            if blocks_fallback(profile.get("repository"), fallback_target):
+                raise ValueError("prior MERGE confirmation send needs exact readback before general fallback")
         policy = _github_budget_policy(profile)
         if policy is None:
             _clear_budget_waiter_after_admission(task)
@@ -1189,11 +1555,19 @@ def _reserve_execution_admission(
         policy = _budget_policy_for_route(policy, budget_route)
         policy = _budget_policy_for_admission_priority(
             policy, effective_priority)
+        policy = _with_execution_snapshot_floor(policy)
         if not policy.get("cost_accounting"):
             # Profiles without route costs keep the original one-shot floor
             # admission; they neither re-read limits nor create reservations.
             _clear_budget_waiter_after_admission(task)
             return admission
+        final_source_cost = None
+        if queue.get("id") == "merge" and budget_route in ("skill", "fallback_targeted", "merge_confirmation"):
+            scan_cost = policy["costs"]["insights"]
+            if any(scan_cost.values()):
+                final_source_cost = scan_cost
+                policy["requested_cost"] = {resource: cost + scan_cost[resource]
+                                            for resource, cost in policy["requested_cost"].items()}
         if not isinstance(lease, _GitHubScanLease):
             raise _GitHubScanLeaseLost(
                 "GitHub execution admission lost its scan lease")
@@ -1244,7 +1618,7 @@ def _reserve_execution_admission(
                 starvation_timeout_seconds=policy.get(
                     "starvation_timeout_seconds", 0),
                 scan_lease_guard=lease.guard,
-                expected_revision=expected_revision)
+                expected_revision=expected_revision, final_source_cost=final_source_cost)
             if not reserved.get("allowed"):
                 decision = _reservation_denied(
                     policy, limits, reserved,
@@ -1414,7 +1788,9 @@ def _profile_fingerprint(profile: dict) -> str:
     # means. Keep last-good data readable when an operator enables/tunes the
     # budget while GitHub quota is already low.
     observed_profile = copy.deepcopy(profile)
-    observed_profile.pop("github_budget", None)
+    budget = observed_profile.pop("github_budget", None)
+    if isinstance(budget,dict) and budget.get("source_cost_protocol")=="source-graphql-cost-v1":
+        observed_profile = {"profile":observed_profile, "source_cost_protocol":"source-graphql-cost-v1"}
     encoded = json.dumps(
         observed_profile, ensure_ascii=False, sort_keys=True,
         separators=(",", ":"), default=str,
@@ -1505,7 +1881,7 @@ def _profile_lock(profile_id: str) -> threading.Lock:
 
 
 def _publish_cache(profile_id: str, profile: dict, generation: int, epoch: int,
-                   revision: int, result: dict) -> bool:
+                   revision: int, result: dict, *, pipeline_snapshot=None) -> bool:
     """Atomically publish a complete last-good response if still current."""
     with _cache_state_lock:
         if generation != _cache_generation:
@@ -1533,7 +1909,8 @@ def _publish_cache(profile_id: str, profile: dict, generation: int, epoch: int,
                 publication_revision_key=(
                     _published_profile_revision_key(profile_id)),
                 companion_key=_published_profile_key(profile_id),
-                companion_value=profile_hash):
+                companion_value=profile_hash,
+                **({"pipeline_snapshot": pipeline_snapshot} if pipeline_snapshot is not None else {})):
             if lease is not None:
                 # The CAS can also lose to an ordinary cache invalidation or a
                 # newer refresh. Distinguish that benign race from a rejected
@@ -1542,6 +1919,10 @@ def _publish_cache(profile_id: str, profile: dict, generation: int, epoch: int,
             return False
         _cache[profile_id] = (
             generated_at, result, epoch, profile_hash, revision)
+        continuation = getattr(_scan_lease_context, "continuation", None)
+        if continuation is not None:
+            continuation.published = {"profile_hash": profile_hash, "epoch": epoch,
+                                      "revision": revision, "generated_at": generated_at}
         return True
 
 
@@ -1578,55 +1959,17 @@ def _gh_executable() -> str:
 
 
 def _github_search(repository: str, query: str) -> dict:
-    """Return count plus public item metadata used for age and movement metrics."""
-    def fetch_page(page: int) -> dict:
-        _ensure_github_scan_lease(renew=True)
-        command = [
-            _gh_executable(), "api", "search/issues", "--method", "GET",
-            "--field", f"q=repo:{repository} {query}", "--field", "per_page=100",
-            "--field", f"page={page}",
-        ]
-        run = subprocess.run(command, capture_output=True, text=True, timeout=30,
-                             encoding="utf-8", errors="replace")
-        _ensure_github_scan_lease()
-        if run.returncode:
-            raise RuntimeError(
-                (run.stderr or run.stdout or "gh api завершился с ошибкой").strip())
-        return json.loads(run.stdout)
+    """Read exact queue membership without spending the REST Search window."""
+    from .github_search import search
 
-    if db.is_paused():
-        raise _GitHubScanPaused("pipeline scan interrupted by global pause")
-    payload = fetch_page(1)
-    total = int(payload.get("total_count", len(payload.get("items", []))))
-    raw_items = list(payload.get("items", []))
-    # GitHub Search exposes at most 1000 matches. Fetching all exposed pages keeps
-    # movement metrics exact for ordinary queues instead of silently sampling 100.
-    exposed_total = min(total, 1000)
-    for page in range(2, math.ceil(exposed_total / 100) + 1):
-        # Page 1 may have been in flight when pause was enabled. It is safe to
-        # finish that request, but never start another page from a partial scan.
+    def check():
         if db.is_paused():
             raise _GitHubScanPaused("pipeline scan interrupted by global pause")
-        page_items = fetch_page(page).get("items", [])
-        raw_items.extend(page_items)
-        if len(page_items) < 100:
-            break
+        _ensure_github_scan_lease(renew=True)
 
-    items = []
-    for item in raw_items:
-        kind = "pr" if item.get("pull_request") is not None else "issue"
-        number = int(item["number"])
-        items.append({
-            "key": f"{kind}:{number}", "kind": kind, "number": number,
-            "title": item.get("title") or f"#{number}",
-            "labels": sorted(label.get("name", "") for label in item.get("labels", [])
-                             if label.get("name")),
-            "created_at": item.get("created_at"), "updated_at": item.get("updated_at"),
-            "closed_at": item.get("closed_at"),
-            "merged_at": (item.get("pull_request") or {}).get("merged_at"),
-            "url": item.get("html_url"),
-        })
-    return {"count": total, "items": items, "membership_complete": total <= len(items)}
+    lease = getattr(_scan_lease_context, "lease", None)
+    return search(repository, query, _gh_api_json, check, getattr(lease, "search_budget", None),
+                  after_data_request=lambda: _ensure_github_scan_lease(renew=True))
 
 
 def _github_count(repository: str, query: str) -> int:
@@ -1702,13 +2045,19 @@ def _gh_api_json(args: list[str], input_value: dict | None = None):
     _ensure_github_scan_lease()
     if run.returncode:
         raise RuntimeError((run.stderr or run.stdout or "gh api failed").strip())
-    return json.loads(run.stdout) if run.stdout.strip() else None
+    if not run.stdout.strip():
+        return None
+    lease = getattr(_scan_lease_context, "lease", None)
+    if getattr(lease,"source_cost_protocol",None) == "source-graphql-cost-v1":
+        from .source_graphql_cost import unique_object
+        return json.loads(run.stdout, object_pairs_hook=unique_object)
+    return json.loads(run.stdout)
 
 
 _GITHUB_LOGIN = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?")
 _GITHUB_RATE_LIMIT_QUERY = """query PromptPilotRateLimit {
   viewer { login }
-  rateLimit { limit remaining resetAt used }
+  rateLimit { limit remaining resetAt used cost }
 }"""
 
 
@@ -1872,6 +2221,11 @@ def _github_rate_limits() -> dict:
     }
     lease = getattr(_scan_lease_context, "lease", None)
     if isinstance(lease, _GitHubScanLease):
+        rate = (graphql_payload.get("data") or {}).get("rateLimit") or {}
+        cost = rate.get("cost")
+        clean_errors = ("errors" not in graphql_payload or
+                        isinstance(graphql_payload["errors"], list) and not graphql_payload["errors"])
+        lease.last_graphql_metadata_cost = cost if clean_errors and type(cost) is int and cost >= 1 else None
         try:
             stored = db.record_pipeline_github_rate_snapshot(
                 lease.scope, result, observed_at=time.time(),
@@ -2236,7 +2590,7 @@ def _window_metrics(snapshots: list[dict], current: dict, series_ids: list[int],
     }
 
 
-def _backpressure_gate(config: dict, data: dict) -> dict | None:
+def _backpressure_gate(config: dict, data: dict, *, excluded_numbers=()) -> dict | None:
     """Profile-owned intake throttle, never an authorization to mutate GitHub.
 
     A complete cached snapshot is an admission hint, not a hard transactional
@@ -2265,6 +2619,8 @@ def _backpressure_gate(config: dict, data: dict) -> dict | None:
     for item in diagnostics[candidate_field]:
         if not isinstance(item, dict) or type(item.get("number")) is not int:
             continue
+        if item["number"] in excluded_numbers:
+            continue
         if any(isinstance(rule, dict) and rule.get("key") in item
                and item[rule["key"]] in rule.get("values", [])
                for rule in policy.get("allow_when_match", [])):
@@ -2287,6 +2643,66 @@ def _backpressure_gate(config: dict, data: dict) -> dict | None:
     }
 
 
+def _intake_snapshot_defer(config: dict, data: dict, profile_id: str,
+                           queue_id: str, *, refresh_failed=False) -> dict:
+    details = backpressure_details(config["backpressure"], data, refresh_failed=refresh_failed)
+    reason = ("WIP: обновление снимка не удалось; новые задачи отложены" if refresh_failed else
+              "WIP: свежий полный снимок недоступен; приём новых задач отложен")
+    return {"action": "defer", "defer_for": config.get("defer_for", "10m"),
+            "reason": reason + "; " + explain_backpressure(details),
+            "profile_id": profile_id, "queue_id": queue_id, "wip_diagnostics": details}
+
+
+def _required_snapshot_defer(profile_id: str, queue_id: str, state: str) -> dict:
+    # This is an observation prerequisite, never an empty-queue verdict or a
+    # replacement for execution/mutation admission. Refreshes use the same
+    # shared scan lease/budget as the sampler, before any provider is loaded.
+    return {"action": "defer",
+            "defer_until": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(),
+            "reason": "Required pipeline snapshot unavailable: " + state,
+            "profile_id": profile_id, "queue_id": queue_id,
+            "snapshot_admission": {"state": state}}
+
+
+def _snapshot_has_remaining_ttl(data, minimum_remaining_seconds):
+    if not minimum_remaining_seconds:
+        return True
+    cache = data.get("cache") or {}
+    age, ttl = cache.get("age_seconds"), cache.get("ttl_seconds")
+    return (type(age) in (float, int) and math.isfinite(age) and age >= 0
+            and type(ttl) in (float, int) and math.isfinite(ttl)
+            and ttl - age > minimum_remaining_seconds)
+
+
+def _required_snapshot_state(data, profile: dict, queue_id: str | None) -> str | None:
+    cache = data.get("cache") if isinstance(data, dict) else None
+    if not isinstance(cache, dict):
+        return "missing cache metadata"
+    if cache.get("refresh_blocked"):
+        return "refresh_blocked=" + str(cache["refresh_blocked"])
+    if cache.get("invalidated"):
+        return "invalidated"
+    if cache.get("stale") is not False:
+        return "stale"
+    if cache.get("available") is not True or cache.get("complete") is not True:
+        return "incomplete"
+    if cache.get("profile_hash") != _profile_fingerprint(profile):
+        return "profile changed"
+    # This queue's Source prerequisite must not turn an unrelated partial TAIL
+    # into a new global dependency. Project-owned global gates still apply.
+    queues = data.get("queues")
+    members = [q for q in queues if isinstance(q, dict) and q.get("id") == queue_id] if isinstance(queues, list) else []
+    if not queue_id or len(members) != 1 or members[0].get("membership_complete") is not True:
+        return "incomplete queue membership"
+    if profile.get("health_check"):
+        diagnostics = data.get("diagnostics")
+        if not isinstance(diagnostics, dict):
+            return "checker unavailable"
+        if diagnostics.get("checker_failed") or diagnostics.get("errors"):
+            return "checker failed"
+    return None
+
+
 def dispatch_gate(task) -> dict | None:
     """Evaluate an optional user-owned, token-free gate for a series task.
 
@@ -2302,53 +2718,76 @@ def dispatch_gate(task) -> dict | None:
             config = queue_config.get("dispatch_gate")
             if not marker or marker not in title or not isinstance(config, dict):
                 continue
+            require_snapshot = config.get("require_fresh_snapshot", False)
+            if not isinstance(require_snapshot, bool):
+                return _required_snapshot_defer(
+                    profile_id, queue_config["id"],
+                    "dispatch_gate.require_fresh_snapshot must be a boolean")
+            profile_hash = _profile_fingerprint(profile) if require_snapshot else None
             # Dispatch only decides whether starting an agent is useful; every
             # mutation is still protected by the project's own fresh gate.
             # Reuse the five-minute snapshot so several due stages cannot each
             # spend hundreds of GitHub requests on the same queue state.
-            data = read_cached(profile_id, db.list_series())
-            cache = data.get("cache") or {}
-            if (isinstance(config.get("backpressure"), dict)
-                    and (cache.get("stale") or not cache.get("complete"))):
+            try:
+                data = read_cached(profile_id, db.list_series())
+            except Exception:
+                if require_snapshot:
+                    return _required_snapshot_defer(
+                        profile_id, queue_config["id"], "cached read failed")
+                raise
+            cache = data.get("cache") or {} if isinstance(data, dict) else {}
+            if ((require_snapshot and _required_snapshot_state(data, profile, queue_config["id"]) is not None)
+                    or (isinstance(config.get("backpressure"), dict)
+                        and (cache.get("stale") or not cache.get("complete")))):
                 # Intake cannot rely on stale state indefinitely. Refresh via
                 # the existing shared scan lease/budget and cache, never via an
                 # agent or an unbudgeted direct GitHub request.
                 try:
                     data = analyze(profile_id, db.list_series(), use_cache=False,
-                                   refresh_diagnostics=True)
+                                   refresh_diagnostics=True,
+                                   **({"reuse_fresh": True, "snapshot_queue_id": queue_config["id"]}
+                                      if require_snapshot else {}))
                 except Exception:
-                    return {
-                        "action": "defer", "defer_for": config.get("defer_for", "10m"),
-                        "reason": "WIP: обновление снимка не удалось; новые задачи отложены",
-                        "profile_id": profile_id, "queue_id": queue_config["id"],
-                    }
-                cache = data.get("cache") or {}
+                    if require_snapshot:
+                        return _required_snapshot_defer(profile_id, queue_config["id"], "refresh failed")
+                    return _intake_snapshot_defer(config, data, profile_id,
+                                                   queue_config["id"], refresh_failed=True)
+                cache = data.get("cache") or {} if isinstance(data, dict) else {}
+            if require_snapshot:
+                try:
+                    current = _profiles().get(profile_id)
+                    state = ("worker paused" if db.is_paused() else "profile changed"
+                             if not isinstance(current, dict) or _profile_fingerprint(current) != profile_hash
+                             else _required_snapshot_state(data, current, queue_config["id"]))
+                except Exception:
+                    state = "snapshot revalidation failed"
+                if state is not None:
+                    return _required_snapshot_defer(profile_id, queue_config["id"], state)
             # A stale/partial empty snapshot must never complete a live stage as
             # empty, and stale diagnostics must not defer it. The project-owned
             # preflight remains the authoritative fallback.
             if (cache.get("refresh_blocked") or cache.get("stale")
                     or not cache.get("complete")):
                 if isinstance(config.get("backpressure"), dict):
-                    return {
-                        "action": "defer", "defer_for": config.get("defer_for", "10m"),
-                        "reason": "WIP: свежий полный снимок недоступен; приём новых задач отложен",
-                        "profile_id": profile_id, "queue_id": queue_config["id"],
-                    }
+                    return _intake_snapshot_defer(config, data, profile_id, queue_config["id"])
                 return None
-            pressure = _backpressure_gate(config, data)
+            from .pipeline_item_holds import complete_members, prepare
+            from .merge_progress_probe import measurements
+            progress = measurements(sys.modules[__name__], task, profile_id, profile, queue_config, data)
+            exclusions = prepare(task, queue_config, data, verified_progress=progress)
+            pressure = _backpressure_gate(config, data, excluded_numbers=exclusions)
             if pressure:
-                return {**pressure, "profile_id": profile_id, "queue_id": queue_config["id"]}
+                return {**pressure, "profile_id": profile_id, "queue_id": queue_config["id"],
+                        "wip_diagnostics": backpressure_details(config["backpressure"], data)}
             queue = next((item for item in data["queues"]
                           if item["id"] == queue_config["id"]), None)
-            from .pipeline_item_holds import complete_members, prepare
-            exclusions = prepare(task, queue_config, data)
             admission_members = complete_members(queue)
             if exclusions and admission_members is not None:
                 members = {item.get("number") for item in admission_members
                            if isinstance(item, dict)}
                 if members and members.issubset(set(exclusions)):
                     return {"action": "defer", "defer_for": "30m",
-                            "reason": "неизменные задачи ожидают решения: " + ", ".join(f"#{n}" for n in exclusions),
+                            "reason": "локальное ограничение допуска неизменных задач: " + ", ".join(f"#{n}" for n in exclusions),
                             "profile_id": profile_id, "queue_id": queue_config["id"]}
             if config.get("skip_when_empty") and queue and queue["backlog"] == 0:
                 return {
@@ -2944,10 +3383,18 @@ def _tool_available(execution: dict, command: list[str], working_dir: str | None
             return False, "probe_command должен быть непустым массивом строк"
         try:
             _ensure_github_scan_lease(renew=True)
-            result = subprocess.run(
+            runner=subprocess.run
+            probe_kwargs={}
+            if execution.get('_owned_control') is True:
+                from .review_routing_control import run as run_control
+                runner=run_control
+                probe_kwargs['env']=_tool_environment(execution.get('_owned_control_env'))
+            result = runner(
                 probe_command, cwd=str(root), capture_output=True, text=True,
                 timeout=max(1, min(int(execution.get("probe_timeout_seconds", 30)), 120)),
                 encoding="utf-8", errors="replace",
+                **({"creationflags":subprocess.CREATE_NO_WINDOW} if os.name=="nt" else {}),
+                **probe_kwargs,
             )
             _ensure_github_scan_lease()
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -2977,9 +3424,7 @@ def _lease_argument(task, token: str, purpose: str) -> list[str]:
     return ["--lease-file", str(path)]
 
 
-def _tool_preflight(execution: dict, command: list[str], working_dir: str | None,
-                    *, env_extra: dict[str, str] | None = None) -> dict:
-    root = Path(working_dir or os.getcwd())
+def _tool_environment(env_extra=None):
     environment = os.environ.copy()
     # Replica identity is per claimed task, never process-global operator
     # configuration. A stale shell variable must not opt a legacy queue into
@@ -2990,14 +3435,27 @@ def _tool_preflight(execution: dict, command: list[str], working_dir: str | None
     environment.pop("PP_PROVIDER_OWNERSHIP_KIND", None)
     environment.pop("PP_PIPELINE_TARGET_TOKEN", None)
     environment.pop("PP_PIPELINE_EXCLUDED_NUMBERS", None)
+    environment.pop("PP_TECHNICAL_EXECUTION_NONCE",None)
     if env_extra:
         environment.update(env_extra)
+    return environment
+
+
+def _tool_preflight(execution: dict, command: list[str], working_dir: str | None,
+                    *, env_extra: dict[str, str] | None = None) -> dict:
+    root = Path(working_dir or os.getcwd())
+    environment=_tool_environment(env_extra)
     try:
         _ensure_github_scan_lease(renew=True)
-        result = subprocess.run(
+        runner=subprocess.run
+        if execution.get('_owned_control') is True:
+            from .review_routing_control import run as run_control
+            runner=run_control
+        result = runner(
             command, cwd=str(root), capture_output=True, text=True,
             timeout=max(1, min(int(execution.get("timeout_seconds", 180)), 900)),
             encoding="utf-8", errors="replace", env=environment,
+            **({"creationflags":subprocess.CREATE_NO_WINDOW} if os.name=="nt" else {}),
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise RuntimeError(f"pipeline preflight не выполнен: {exc}") from exc
@@ -3083,7 +3541,8 @@ def _budget_defer_route(admission: dict, profile_id: str, profile: dict,
                         queue: dict,
                         *, mode: str = "tool", phase: str | None = None,
                         preflight: dict | None = None) -> dict:
-    _record_refresh_blocked(profile_id, profile, admission)
+    # This refusal belongs to the task route. Only an actual queue scan may
+    # publish or clear the shared profile refresh status.
     reason = str(admission.get("reason") or "GitHub scan отложен")
     context = None
     if phase:
@@ -3124,6 +3583,46 @@ def _budget_defer_route(admission: dict, profile_id: str, profile: dict,
     return result
 
 
+def _validate_targeted_handoff(preflight: dict, stage: str) -> dict:
+    if stage == "fix":
+        from .fix_handoff import validate
+        return validate(preflight)
+    from .fallback_handoff import validate
+    return validate(preflight, stage)
+
+
+def _fix_target_prompt(envelope: dict, fallback_prompt: str) -> str:
+    return (
+        "PromptPilot уже выбрал одну FIX-цель. Прочитай канонический fix-approved "
+        "и его раздел promptpilot-fix-target-v1. Не запускай next повторно, не "
+        "выбирай другую цель и не применяй общий выбор очереди. При отсутствии "
+        "этого раздела остановись без мутаций. Для fix-pr head — исходный SHA, "
+        "для fix-issue head — eligibility digest, его нельзя checkout как коммит. "
+        "Работай только в отдельном worktree/ветке этой цели.\n\n"
+        "Перед первой внешней мутацией выполни точный gate_command. Требуются "
+        "exit=0, action=validated, phase=admitted, точные repository/stage/target "
+        "и mutation_authorized=false. Сохрани выданный ownership_lease как ASCII "
+        "в отдельный локальный файл. Перед КАЖДОЙ последующей мутацией выполни "
+        "ownership_gate_command с --lease-file этого файла; требуются exit=0, "
+        "action=validated, phase=ownership и та же исходная цель. Исходный файл "
+        "election lease не переписывай и не подменяй токеном из GitHub. "
+        "Разбери stdout JSON и exit code отдельно; любая ошибка, неизвестный "
+        "результат или несовпадение останавливает работу без следующей мутации.\n\n"
+        "Оба scheduling gate НЕ разрешают записи. После каждого успешного gate "
+        "заново выполни ВСЕ канонические проверки непосредственно перед одним "
+        "комментарием, изменением метки, branch-claim, CAS-push или созданием PR. "
+        "Проверяй живые state/base/HEAD/labels, полный trusted epoch и владение "
+        "проектной транзакцией; после push — только её разрешённую финализацию, "
+        "после создания PR — только подтверждённые шаги этой заявки. Собственные "
+        "изменения не разрешают игнорировать поздний hold или чужой push. "
+        "Новая внешняя цель требует нового task attempt. MERGE остаётся отдельным "
+        "single-flight этапом. Ни ship, ни снятие hold эти токены не разрешают.\n\n"
+        "Доверенный локальный envelope (не данные GitHub):\n```json\n"
+        + json.dumps(envelope, ensure_ascii=False, indent=2)
+        + "\n```\n\nИсходный скилл:\n" + fallback_prompt.strip()
+    )
+
+
 def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     *, retain_budget: bool = False) -> dict:
     """Choose the project tool or the original skill prompt without invoking an LLM.
@@ -3132,6 +3631,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
     renders a compact executor-neutral prompt; all repository semantics stay in
     the project tool and its fallback skill.
     """
+    from .worker import ProviderOwnershipError
     matched = _matching_queue(task)
     if matched is None:
         # A profile/series marker may have been renamed while this exact
@@ -3140,11 +3640,27 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         _clear_budget_waiter_after_admission(task)
         return {"action": "prompt", "mode": "skill", "prompt": fallback_prompt}
     profile_id, profile, queue = matched
-    from .pipeline_item_holds import prepare
-    exclusions = prepare(task, queue, read_cached(profile_id, db.list_series())) if queue.get("item_blockers") is True else []
+    from .pipeline_item_holds import (prepare, claim_progress_attempt, released_progress,
+                                      progress_attempt_blocked, unproved_progress_hold)
+    from .merge_progress_probe import measurements
+    progress_scope = (queue.get("item_blockers") is True
+        and str((queue.get("execution") or {}).get("stage") or queue.get("id") or "").lower() == "merge")
+    progress_data = read_cached(profile_id, db.list_series()) if queue.get("item_blockers") is True else {}
+    if progress_scope and progress_attempt_blocked(task, progress_data):
+        return {"action": "defer", "mode": "tool", "defer_for": "30m",
+                "reason": "canonical recovery progress was consumed by another occurrence",
+                "profile_id": profile_id, "queue_id": queue.get("id")}
+    progress = measurements(sys.modules[__name__], task, profile_id, profile, queue, progress_data,
+                            working_dir) if progress_scope else {}
+    if progress_scope and unproved_progress_hold(task, progress_data, progress):
+        return {"action": "defer", "mode": "tool", "defer_for": "30m",
+                "reason": "held canonical recovery has no verified unused progress",
+                "profile_id": profile_id, "queue_id": queue.get("id")}
+    exclusions = prepare(task, queue, progress_data, verified_progress=progress) if queue.get("item_blockers") is True else []
+    progress_releases = released_progress(task) if progress else {}
     if exclusions:
         fallback_prompt += ("\n\nЛокальное ограничение приёма: не брать неизменные "
-                            "задачи, ранее переданные человеку: "
+                            "задачи с зарегистрированным блокером: "
                             + ", ".join(f"#{number}" for number in exclusions)
                             + ". Новые задачи обслуживать по прежней процедуре. "
                             "Нельзя обходить интеграционного владельца или расширять полномочия.")
@@ -3162,8 +3678,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         stage_name = str((queue.get("execution") or {}).get("stage")
                          or queue.get("id") or "").lower()
         issues = list(replica_status["issues"])
-        if stage_name != "review":
-            issues.append("replicas > 1 сейчас поддерживаются только для REVIEW")
+        if stage_name not in {"review", "fix"}:
+            issues.append("replicas > 1 поддерживаются только для REVIEW или opt-in FIX")
         if getattr(task, "machine", None):
             issues.append("реплицированная REVIEW-задача должна выполняться локально")
         if getattr(task, "worktree", False):
@@ -3223,6 +3739,15 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             "profile_id": profile_id, "queue_id": queue.get("id"),
         }
 
+    typed_queue = execution.get("review_routing_protocol") == "review-routing-v1"
+    if execution.get("review_routing_protocol") is not None and not typed_queue:
+        return {"action": "block", "mode": "tool", "reason": "unsupported REVIEW routing transport version"}
+    owned_preflight = replicated or typed_queue
+    if typed_queue and (getattr(task, "machine", None) or getattr(task, "detached", False)
+                        or getattr(task, "worktree", False)
+                        or getattr(task, "herdr_target", None)):
+        return {"action": "block", "mode": "tool",
+                "reason": "typed REVIEW requires a local scheduler-owned task process"}
     mode = str(execution.get("mode", "auto")).lower()
     if mode not in {"auto", "tool", "skill"}:
         return {
@@ -3231,7 +3756,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             "profile_id": profile_id, "queue_id": queue.get("id"),
         }
     if mode == "skill":
-        if replicated:
+        if owned_preflight:
             return {
                 "action": "block", "mode": "skill",
                 "reason": "replicas > 1 несовместимы с execution.mode=skill",
@@ -3256,7 +3781,25 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         }
 
     stage = str(execution.get("stage") or queue.get("id") or "").lower()
+    if typed_queue and stage=='fix':
+        started=getattr(task,'started_at',None)
+        if not isinstance(started,datetime):
+            return {'action':'block','mode':'tool','reason':'typed FIX probe requires its claimed task occurrence'}
+        if started.tzinfo is None:started=started.astimezone()
+        execution=dict(execution,_owned_control=True,_owned_control_env={
+            'PP_TASK_ID':str(task.id),'PP_TASK_STARTED_AT':started.astimezone(timezone.utc).isoformat(),
+            'PP_PROVIDER_OWNERSHIP_KIND':'headless','PP_DATA_DIR':str(Path(db.DB_PATH).resolve().parent)})
     command = _tool_command(execution, stage)
+    if typed_queue and (stage not in {"review", "fix"} or not command or command[-2:] != ["next", stage]):
+        return {"action": "block", "mode": "tool", "reason": "typed routing requires its exact next stage command"}
+    if (stage == "merge" and queue.get("id") == "merge" and mode == "auto"
+            and queue.get("item_blockers") is True and not owned_preflight and not progress_releases):
+        from . import merge_checkpoint
+        from .config import PIPELINE_SNAPSHOT_INTERVAL
+        if PIPELINE_SNAPSHOT_INTERVAL:
+            waiting = merge_checkpoint.prepare_source(task, profile_id, profile)
+            if waiting is not None:
+                return waiting
     with _github_scan_admission(
             profile, f"pipeline preflight {profile_id}/{stage}",
             profile_id=profile_id, budget_route="tool_preflight",
@@ -3278,7 +3821,10 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 profile_id,
                 profile, queue)
         if not available:
-            if mode == "auto" and not replicated:
+            if progress_releases:
+                return {"action": "block", "mode": "tool", "reason": "recovery proof tool unavailable: " + reason,
+                        "profile_id": profile_id, "queue_id": queue.get("id")}
+            if mode == "auto" and not owned_preflight:
                 admission = _reserve_execution_admission(
                     task, profile_id, profile, queue, admission, "skill",
                     retain_budget=retain_budget)
@@ -3294,8 +3840,12 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 "action": "block", "mode": "tool", "reason": reason,
                 "profile_id": profile_id, "queue_id": queue.get("id"),
             }
+        if not claim_progress_attempt(task, progress, progress_releases):
+            return {"action": "defer", "mode": "tool", "defer_for": "30m",
+                    "reason": "canonical recovery progress already consumed or attempt not running",
+                    "profile_id": profile_id, "queue_id": queue.get("id")}
         try:
-            if replicated:
+            if owned_preflight:
                 # Both worktrees must reserve in the scheduler's actual DB.
                 # Do not let a project-local .env silently select one DB per
                 # checkout and destroy cross-replica atomicity.
@@ -3317,9 +3867,9 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 provider_ownership_kind = (
                     "herdr" if provider_cfg.get("executor") == "herdr"
                     else "headless")
-                preflight = _tool_preflight(
-                    execution, command, working_dir,
-                    env_extra={
+                if typed_queue and stage == "fix" and provider_ownership_kind != "headless":
+                    raise RuntimeError("claimed FIX does not support the herdr transport")
+                attempt_env = {
                         "PP_TASK_ID": str(task.id),
                         "PP_TASK_STARTED_AT": scheduler_task_started_at,
                         "PP_PIPELINE_REPLICAS": str(replica_count),
@@ -3327,8 +3877,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "PP_DATA_DIR": scheduler_data_dir,
                         "PP_PIPELINE_LEASE_KEY_FILE": scheduler_lease_key,
                         **({"PP_PIPELINE_EXCLUDED_NUMBERS": json.dumps(exclusions)} if exclusions else {}),
-                    },
-                )
+                    }
+                preflight = _tool_preflight(execution, command, working_dir, env_extra=attempt_env)
             else:
                 preflight = (_tool_preflight(execution, command, working_dir,
                     env_extra={"PP_PIPELINE_EXCLUDED_NUMBERS": json.dumps(exclusions)})
@@ -3339,9 +3889,14 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     admission, profile, exc),
                 profile_id,
                 profile, queue)
+        except ProviderOwnershipError:
+            raise
         except RuntimeError as exc:
             reason = str(exc)
-            if mode == "auto" and not replicated:
+            if progress_releases:
+                return {"action": "block", "mode": "tool", "reason": reason,
+                        "profile_id": profile_id, "queue_id": queue.get("id")}
+            if mode == "auto" and not owned_preflight:
                 admission = _reserve_execution_admission(
                     task, profile_id, profile, queue, admission, "skill",
                     retain_budget=retain_budget)
@@ -3359,14 +3914,191 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             }
 
         preflight_action = preflight["action"].lower()
+        if progress_releases:
+            try:
+                lease = _validate_targeted_handoff(preflight, stage)
+                target = lease["target"]
+                fact = progress[target["number"]].facts
+                if (preflight_action != "fallback" or len(progress_releases) != 1
+                        or str(target["number"]) not in progress_releases
+                        or target["stage"] != "integration-merge-recovery" or target["head"] != fact["head"]
+                        or lease["config_sha256"] != fact["config_sha256"]):
+                    raise RuntimeError("recovery next changed its proven target/config")
+            except (RuntimeError, KeyError, ValueError, TypeError) as exc:
+                return {"action": "block", "mode": "tool", "reason": str(exc),
+                        "profile_id": profile_id, "queue_id": queue.get("id")}
+        typed_response = preflight.get("protocol") == "review-routing-v1"
+        routing_request = None
+        token = preflight.get("lease")
+        passive_typed = (typed_queue and typed_response and stage in {"review", "fix"}
+                         and preflight_action in {"empty", "wait", "error"} and token is None)
+        signed_routing_claim = False
+        advertised_purpose = None
+        advertised = None
+        positive_merge_request = None
+        if isinstance(token, str) and "." in token:
+            from . import project_pipeline
+            try:
+                advertised_request = project_pipeline.decode_lease(token.split(".", 1)[0])
+                advertised = advertised_request.get("protocol")
+                advertised_purpose = advertised_request.get("purpose")
+            except project_pipeline.PipelineError:
+                advertised = None
+            signed_routing_claim = isinstance(advertised, str) and advertised.startswith("review-routing-")
+        positive_claim = (isinstance(advertised, str) and advertised.startswith('positive-review-')
+                          or isinstance(preflight.get('protocol'), str) and preflight['protocol'].startswith('positive-review-')
+                          or advertised_purpose == 'typed-clean-merge-v1')
+        if positive_claim:
+            from . import project_pipeline
+            from .review_routing_merge import CONTRACT, PURPOSE
+            try:
+                positive_merge_request = project_pipeline.decode_signed_lease(str(token or ''))
+                target = preflight.get('target') or {}
+                if (stage != 'merge' or execution.get('direct_complete') is not True
+                        or preflight_action != 'merge' or preflight.get('protocol') != CONTRACT
+                        or positive_merge_request.get('protocol') != CONTRACT
+                        or positive_merge_request.get('purpose') != PURPOSE
+                        or positive_merge_request.get('stage') != 'merge'
+                        or positive_merge_request.get('repository') != str(profile.get('repository') or '')
+                        or any(target.get(name) != positive_merge_request.get(name) for name in ('number', 'head'))
+                        or command[-2:] != ['next', 'merge']):
+                    raise project_pipeline.PipelineError('positive typed MERGE requires its exact signed target and explicit direct completion; no model fallback')
+            except (project_pipeline.PipelineError, TypeError, ValueError) as exc:
+                return {'action': 'block', 'mode': 'tool', 'reason': str(exc)}
+        from . import review_routing_fix_request as fix_requests
+        from . import review_routing_settlement_request as settlement_requests
+        if preflight_action=='settlement' or advertised_purpose==settlement_requests.PURPOSE:
+            try:
+                request=settlement_requests.decode(str(token or ''))
+                identity=request['identity'];reservation=request['target_reservation']
+                target=dict(stage='fix-pr',number=identity['pr_number'],head=identity['head_sha'],
+                            source=request['attempt']['source'],attempt_id=request['attempt_id'])
+                if (not typed_queue or not typed_response or stage!='fix' or preflight_action!='settlement'
+                        or request['repository']!=str(profile.get('repository') or '')
+                        or reservation['task_id']!=task.id or reservation['task_started_at']!=scheduler_task_started_at
+                        or provider_ownership_kind!='headless' or request['pipeline_replicas']!=replica_count
+                        or preflight.get('target')!=target):
+                    raise settlement_requests.PipelineError('administrative settlement changed its signed task, target or transport')
+                completion=_tool_preflight(dict(execution,_owned_control=True),[*command[:-2],'complete-fix-settlement','fix',
+                    *_lease_argument(task,token,'settlement')],working_dir,env_extra=attempt_env)
+                if (completion.get('action') not in {'resumed','wait'} or completion.get('provider_started') is not False
+                        or completion.get('stage')!='fix' or completion.get('protocol')!='review-routing-v1'):
+                    raise settlement_requests.PipelineError('administrative settlement was not independently confirmed')
+                done=completion['action']=='resumed'
+                if done and (completion.get('source')!=request['attempt']['source']
+                        or completion.get('executor')!=request['attempt']['executor']
+                        or completion.get('attempt_id')!=request['attempt_id'] or completion.get('new_head')!=identity['head_sha']):
+                    raise settlement_requests.PipelineError('settlement completion substituted its old executor or current HEAD')
+                return dict(action='complete_empty',mode='tool',profile_id=profile_id,queue_id=queue.get('id'),
+                    verdict='\u0413\u041e\u0422\u041e\u0412\u041e' if done else '\u041f\u0423\u0421\u0422\u041e',
+                    reason='old executor settled; independent exact-current-HEAD REVIEW resumed' if done else completion.get('reason','settlement waits'),
+                    preflight=preflight,completion=completion)
+            except ProviderOwnershipError:raise
+            except (settlement_requests.PipelineError,RuntimeError,TypeError,ValueError) as exc:
+                return dict(action='block',mode='tool',reason=str(exc),profile_id=profile_id,queue_id=queue.get('id'))
+        if preflight_action=='pipeline-fix' or advertised_purpose==fix_requests.PIPELINE_ADMISSION:
+            from . import review_routing_worker as technical
+            try:
+                request=technical.admission(preflight,task,repository=str(profile.get('repository') or ''),
+                    replicas=replica_count,started_at=scheduler_task_started_at,
+                    ownership_kind=provider_ownership_kind,typed=typed_queue and stage=='fix')
+                priority=db.restore_running_attempt_priority(task.id,task.started_at)
+                if priority is None:raise RuntimeError('technical FIX task changed before provider admission')
+                admission=_reserve_execution_admission(task,profile_id,profile,queue,admission,'tool',
+                    retain_budget=retain_budget,admission_priority=priority)
+                if not admission.get('allowed'):
+                    return _budget_defer_route(admission,profile_id,profile,queue,mode='tool',
+                        phase='post_preflight',preflight=preflight)
+                return technical.prepare_route(task,request,preflight,execution=execution,command=command,
+                    working_dir=working_dir,attempt_env=attempt_env,profile_id=profile_id,
+                    queue_id=queue.get('id'),fallback_prompt=fallback_prompt)
+            except ProviderOwnershipError:raise
+            except (fix_requests.PipelineError,RuntimeError,TypeError,ValueError,sqlite3.Error) as exc:
+                return dict(action='block',mode='tool',reason=str(exc),profile_id=profile_id,queue_id=queue.get('id'))
+        fix_claim = isinstance(advertised_purpose, str) and advertised_purpose.startswith("review-routing-v1-fix-")
+        if (typed_queue and stage == "fix" and not fix_claim and not typed_response
+                and preflight_action not in {"empty", "wait", "error"}):
+            return {"action": "block", "mode": "tool", "reason": "claimed FIX requires a signed exact author handoff; no generic fallback"}
+        if fix_claim or typed_response and stage == "fix" and not passive_typed:
+            is_progress = preflight_action == "author-progress"
+            try:
+                if is_progress:
+                    from . import review_routing_progress_request as progress_requests
+                    request = progress_requests.decode(str(token or ""))
+                else:
+                    request = fix_requests.decode(str(token or ""))
+                reservation = request["target_reservation"]
+                expected_action = "author-progress" if is_progress else "author-handoff"
+                expected_purpose = fix_requests.PROGRESS if is_progress else fix_requests.ADMISSION
+                expected_target = {"stage": "fix-pr", "number": request["number"],
+                    "head": request["head"], "source": request["attempt"]["source"]}
+                if is_progress:
+                    expected_target.update(attempt_id=request["attempt_id"], new_head=request["new_head"])
+                if (not typed_queue or not typed_response or stage != "fix" or preflight_action != expected_action
+                        or request["purpose"] != expected_purpose
+                        or request["repository"] != str(profile.get("repository") or "")
+                        or reservation["task_id"] != task.id
+                        or reservation["task_started_at"] != scheduler_task_started_at
+                        or reservation["ownership_kind"] != provider_ownership_kind
+                        or request["pipeline_replicas"] != replica_count
+                        or preflight.get("target") != expected_target):
+                    raise fix_requests.PipelineError("claimed FIX signed purpose contradicts its outer envelope, task or transport")
+                complete_command = [*command[:-2], "complete", "fix",
+                                    *_lease_argument(task, token, expected_action)]
+                completion = _tool_preflight(execution, complete_command, working_dir, env_extra=attempt_env)
+                allowed = {"fixed", "wait"} if is_progress else {"handed-off"}
+                if (completion.get("action") not in allowed or completion.get("provider_started") is not False
+                        or completion.get("source") != request["attempt"]["source"]
+                        or completion.get("executor") != request["attempt"]["executor"]):
+                    raise fix_requests.PipelineError("author FIX delivery/progress was not verified; no provider fallback")
+                if is_progress and (completion.get("stage") != "fix"
+                        or completion.get("protocol") != "review-routing-v1"
+                        or completion["action"] == "fixed" and (
+                            completion.get("attempt_id") != request["attempt_id"]
+                            or completion.get("new_head") != request["new_head"])):
+                    raise fix_requests.PipelineError("author progress completion changed its signed exact source")
+            except ProviderOwnershipError:
+                raise
+            except (fix_requests.PipelineError, RuntimeError, TypeError, ValueError) as exc:
+                return {"action": "block", "mode": "tool", "reason": str(exc)}
+            if is_progress:
+                done = completion["action"] == "fixed"
+                return {"action": "complete_empty", "mode": "tool",
+                        "verdict": "\u0413\u041e\u0422\u041e\u0412\u041e" if done else "\u041f\u0423\u0421\u0422\u041e",
+                        "reason": ("author post-push source verified; independent REVIEW may inspect the new HEAD"
+                                   if done else "author progress waits for its canonical owner lease"),
+                        "profile_id": profile_id, "queue_id": queue.get("id"),
+                        "preflight": preflight, "completion": completion}
+            # Assignment alone is not successful FIX and must not wake REVIEW.
+            return {"action": "complete_empty", "mode": "tool", "verdict": "\u041f\u0415\u0420\u0415\u0414\u0410\u041d\u041e \u0410\u0412\u0422\u041e\u0420\u0423",
+                    "reason": "author assignment verified; awaiting post-push FIX proof",
+                    "profile_id": profile_id, "queue_id": queue.get("id"),
+                    "preflight": preflight, "completion": completion}
+        if typed_response and not passive_typed or signed_routing_claim:
+            from . import project_pipeline
+            try:
+                from .review_routing_request import decode as decode_routing_request
+                routing_request = decode_routing_request(str(token or ""))
+                if (not typed_queue or not typed_response
+                        or preflight_action not in {"audit", "recover"}
+                        or (preflight_action == "recover") != (routing_request["recovery"] is not None)):
+                    raise project_pipeline.PipelineError("typed REVIEW signed protocol/purpose contradicts its outer envelope or transport")
+            except (project_pipeline.PipelineError, TypeError, ValueError) as exc:
+                return {"action": "block", "mode": "tool", "reason": str(exc)}
+        if typed_response and not typed_queue:
+            return {"action": "block", "mode": "tool",
+                    "reason": "typed REVIEW requires the scheduler's explicit versioned transport"}
         target_reservation = None
         validated_target_stage = None
         fallback_lease = None
-        if replicated and preflight_action in {"audit", "fallback"}:
+        merge_checkpoint_hint = None
+        if owned_preflight and preflight_action in {"audit", "fallback", "recover"}:
             try:
                 from . import project_pipeline
 
-                if preflight_action == "audit":
+                if routing_request is not None:
+                    lease = routing_request
+                elif preflight_action == "audit":
                     lease = project_pipeline.decode_signed_lease(
                         str(preflight.get("lease") or ""))
                 else:
@@ -3382,6 +4114,11 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                               "number": lease.get("number"), "head": lease.get("head"),
                           })
                 preflight_target = preflight.get("target") or {}
+                if stage == "fix" and (
+                        preflight_action != "fallback"
+                        or target_stage not in {"fix-pr", "fix-issue"}):
+                    raise project_pipeline.PipelineError(
+                        "replicated FIX requires a signed exact FIX fallback target")
                 if (owner_task != int(task.id)
                         or reservation.get("task_started_at") != scheduler_task_started_at
                         or reservation.get("ownership_kind") != provider_ownership_kind
@@ -3405,17 +4142,17 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             except (project_pipeline.PipelineError, TypeError, ValueError) as exc:
                 return {
                     "action": "block", "mode": "tool",
-                    "reason": f"replicated REVIEW preflight has no valid reservation: {exc}",
+                    "reason": f"replicated pipeline preflight has no valid reservation: {exc}",
                     "profile_id": profile_id, "queue_id": queue.get("id"),
                     "preflight": preflight,
                 }
         if (preflight_action == "fallback" and "handoff" in preflight
-                and target_reservation is not None):
-            from .fallback_handoff import validate
+                and (target_reservation is not None or (stage == "merge" and mode == "auto"
+                     and queue.get("item_blockers") is True))):
             from .project_pipeline import PipelineError
 
             try:
-                fallback_lease = validate(preflight, stage)
+                fallback_lease = _validate_targeted_handoff(preflight, stage)
                 if command[-2:] != ["next", stage]:
                     raise PipelineError(
                         "fallback handoff command must end with next and the exact stage")
@@ -3440,14 +4177,51 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 }
             validated_target_stage = str(
                 (fallback_lease.get("target") or {}).get("stage") or "").lower()
+            if (target_reservation is None and validated_target_stage == "integration-merge-recovery"
+                    and fallback_lease["repository"] == profile.get("repository")):
+                from . import merge_checkpoint
+                from .config import PIPELINE_SNAPSHOT_INTERVAL
+
+                merge_checkpoint_hint = merge_checkpoint.recovery_hint(profile_id, fallback_lease)
+                if merge_checkpoint_hint is not None:
+                    # Re-read after next. Its signed election and this cached observation
+                    # must independently point at the completed branch update.
+                    current = read_cached(profile_id, db.list_series())
+                    state = _required_snapshot_state(current, profile, queue["id"])
+                    # A verified hold transition has already consumed its single occurrence.
+                    # Preserve its normal provider-assisted Source retry instead of stranding the hold.
+                    if state is not None and PIPELINE_SNAPSHOT_INTERVAL and not progress_releases:
+                        merge_checkpoint.remember_source_wait(task, _profile_fingerprint(profile), merge_checkpoint_hint)
+                        waiting = _required_snapshot_defer(profile_id, queue["id"], state)
+                        retry = datetime.now(timezone.utc) + timedelta(seconds=max(30, PIPELINE_SNAPSHOT_INTERVAL))
+                        until = _parse_time((current.get("cache") or {}).get("refresh_deferred_until"))
+                        waiting["defer_until"] = max(until or retry, retry).isoformat()
+                        waiting["reason"] = "MERGE post-update confirmation awaits fresh Source: " + state
+                        return waiting
+                    if state or not merge_checkpoint.agrees_with_source(current, fallback_lease, merge_checkpoint_hint):
+                        merge_checkpoint_hint = None
         provider_route = None
         if preflight_action == "fallback" and mode == "auto":
             provider_route = ("fallback_targeted" if "handoff" in preflight
                               else "skill")
-        elif preflight_action in {"audit", "merge", "cleanup"}:
+        elif preflight_action in {"audit", "merge", "cleanup", "recover"}:
             provider_route = "tool"
         elif preflight_action not in {"empty", "wait", "error"} and mode == "auto":
             provider_route = "skill"
+        bounded_confirmation = (merge_checkpoint_hint is not None
+                                and execution.get("merge_confirmation") == "bounded-v1"
+                                and profile.get("github_budget", {}).get("source_cost_protocol") == "source-graphql-cost-v1")
+        if (stage == "merge" and retain_budget and not bounded_confirmation
+                and (preflight_action in ("wait", "empty") or provider_route in ("skill", "fallback_targeted"))):
+            from .merge_checkpoint import blocks_fallback
+            receipt_target = fallback_lease["target"] if fallback_lease else None
+            if blocks_fallback(profile.get("repository"), receipt_target):
+                from .merge_confirmation_receipt import reconcile
+                repaired = reconcile(task, profile_id, profile, queue, admission, preflight, receipt_target)
+                if repaired is not None:
+                    return repaired
+        if bounded_confirmation:
+            provider_route = "merge_confirmation"
         routed_priority = _post_preflight_admission_priority(
             profile, profile_series, stage, provider_route,
             validated_target_stage, admission.get("priority_one_headroom"))
@@ -3495,17 +4269,56 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             admission = _reserve_execution_admission(
                 task, profile_id, profile, queue, admission, provider_route,
                 retain_budget=retain_budget,
-                admission_priority=admission_priority)
+                admission_priority=admission_priority,
+                fallback_target=fallback_lease["target"] if fallback_lease else None)
             if not admission.get("allowed"):
                 return _budget_defer_route(
                     admission, profile_id, profile, queue,
                     mode=("tool" if provider_route == "tool" else "skill"),
                     phase="post_preflight", preflight=preflight)
 
+        if bounded_confirmation:
+            if not retain_budget:
+                return {"action":"defer", "mode":"tool", "defer_for":"1m",
+                        "reason":"bounded MERGE confirmation requires retained Native admission"}
+            from . import merge_confirmation
+            finished = merge_confirmation.execute(task, profile_id, profile, queue, admission, command,
+                                               working_dir, preflight, merge_checkpoint_hint)
+            if finished is not None:
+                return finished
+            # The deterministic proof recognized an unsupported shape before an
+            # attempted send. Release its finite reservation and require a fresh
+            # full-price admission before giving the provider its signed handoff.
+            release_execution_admission()
+            admission["_budget_reservation_revision"] = db.pipeline_github_budget_reservations(
+                _GITHUB_SCAN_LEASE_SCOPE)["revision"]
+            admission = _reserve_execution_admission(
+                task, profile_id, profile, queue, admission, "fallback_targeted",
+                retain_budget=retain_budget, admission_priority=admission_priority, fallback_target=fallback_lease["target"])
+            if not admission.get("allowed"):
+                return _budget_defer_route(admission, profile_id, profile, queue, mode="skill",
+                                           phase="post_preflight", preflight=preflight)
+
         # Explicit operator opt-in: an already-reviewed MERGE/cleanup has no
         # content audit left for a model. The same adapter owns every fresh
         # authorization/CI/CAS/recovery gate; never use this for REVIEW or a
         # fallback. Keep completion inside the admitted GitHub scan scope.
+        if preflight_action == "recover":
+            if not (typed_queue and typed_response and target_reservation is not None):
+                return {"action": "block", "mode": "tool", "reason": "unsigned or unreserved REVIEW recovery"}
+            complete_command = [*command[:-2], "complete", "review",
+                                *_lease_argument(task, preflight["lease"], "recover")]
+            try:
+                completion = _tool_preflight(execution, complete_command, working_dir, env_extra=attempt_env)
+            except RuntimeError as exc:
+                return {"action": "defer", "mode": "tool", "defer_for": "10m", "reason": str(exc)}
+            if completion.get("action") != "completed":
+                return {"action": "defer", "mode": "tool", "defer_for": "10m",
+                        "reason": "typed REVIEW recovery deferred", "completion": completion}
+            return {"action": "complete_empty", "mode": "tool", "verdict": "ГОТОВО",
+                    "reason": "typed REVIEW publication recovered without a provider",
+                    "profile_id": profile_id, "queue_id": queue.get("id"),
+                    "preflight": preflight, "completion": completion}
         if (stage == "merge" and execution.get("direct_complete") is True
                 and preflight_action in {"merge", "cleanup"}
                 and command[-2:] == ["next", stage]):
@@ -3526,6 +4339,11 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "reason": "direct MERGE refused: " + str(
                             completion.get("error") or completion.get("reason")
                             or completion.get("action")), "completion": completion}
+            if positive_merge_request is not None and (
+                    completion.get('stage') != 'merge-cleanup'
+                    or any(completion.get(name) != positive_merge_request[name] for name in ('number', 'head'))):
+                return {'action': 'block', 'mode': 'tool',
+                        'reason': 'positive typed MERGE completion changed the signed target', 'completion': completion}
             return {"action": "complete_empty", "mode": "tool", "verdict": "ГОТОВО",
                     "reason": f"pipelinectl {complete_stage} completed for PR #"
                               f"{(preflight.get('target') or {}).get('number')}",
@@ -3560,11 +4378,10 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
     if preflight_action == "fallback":
         if "handoff" in preflight:
             if fallback_lease is None:
-                from .fallback_handoff import validate
                 from .project_pipeline import PipelineError
 
                 try:
-                    fallback_lease = validate(preflight, stage)
+                    fallback_lease = _validate_targeted_handoff(preflight, stage)
                     if command[-2:] != ["next", stage]:
                         raise PipelineError(
                             "fallback handoff command must end with next and the exact stage")
@@ -3575,6 +4392,14 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "preflight": preflight,
                     }
             if mode == "auto":
+                if stage == "merge" and queue.get("item_blockers") is True:
+                    from .pipeline_item_holds import register_target
+                    target = fallback_lease["target"]
+                    register_target(task, target["number"], target["head"], "merge",
+                                    config_sha256=fallback_lease["config_sha256"])
+                    if target_reservation is None:
+                        from .merge_checkpoint import bind_election
+                        bind_election(task, preflight["handoff"]["lease"])
                 gate_command = [*command[:-2], "gate-fallback", stage,
                                 *_lease_argument(task, preflight["handoff"]["lease"], "gate")]
                 envelope = {"protocol": "promptpilot-fallback-target-v1",
@@ -3590,6 +4415,18 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "Не оставляй разрешённую передачу незавершённой ради одной "
                         "диагностики. Отказ scheduling gate не разрешает никаких мутаций. "
                         "Повторное ship не заменяет обязательный source proof.\n\n"
+                    )
+                if merge_checkpoint_hint is not None:
+                    envelope["merge_checkpoint"] = merge_checkpoint_hint
+                    pre_review_guard = (
+                        "This signed recovery claim is for post-update confirmation only. "
+                        "The local checkpoint records an observed branch update. Reconcile its "
+                        "trusted intent, exact live PR, parents, tree and existing done against "
+                        "the canonical MERGE procedure. Resume at post-update proof and confirm "
+                        "or publish done once using all required Source and publication gates. "
+                        "Do not reconstruct or repeat the branch write, rerun the pre-update "
+                        "build, or issue another intent. If proof differs, stop for canonical "
+                        "reconciliation. The checkpoint itself authorizes no mutation.\n\n"
                     )
                 if fallback_lease["target"]["stage"] == "pre-review-validation":
                     pre_review_guard = (
@@ -3645,24 +4482,31 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     f"```json\n{json.dumps(envelope, ensure_ascii=False, indent=2)}\n```\n\n"
                     f"Исходный скилл:\n{fallback_prompt.strip()}"
                 )
+                if stage == "fix":
+                    envelope["protocol"] = "promptpilot-fix-target-v1"
+                    envelope["ownership_gate_command"] = [
+                        *command[:-2], "gate-fix-owner",
+                    ]
+                    prompt = _fix_target_prompt(envelope, fallback_prompt)
                 return {
                     "action": "prompt", "mode": "skill", "prompt": prompt,
                     "next_already_run": True, "command": command,
                     "gate_command": gate_command, "target": preflight["target"],
                     "fallback_reason": preflight_reason, "profile_id": profile_id,
                     "queue_id": queue.get("id"), "preflight": preflight,
-                    **({"pipeline_replicas": replica_count} if replicated else {}),
-                    **({"pipeline_data_dir": scheduler_data_dir} if replicated else {}),
+                    **({"review_routing_protocol": "review-routing-v1"} if typed_queue else {}),
+                    **({"pipeline_replicas": replica_count} if owned_preflight else {}),
+                    **({"pipeline_data_dir": scheduler_data_dir} if owned_preflight else {}),
                     **({"pipeline_lease_key_file": scheduler_lease_key}
-                       if replicated else {}),
+                       if owned_preflight else {}),
                     **({"pipeline_target_reservation": target_reservation}
-                       if replicated else {}),
+                       if owned_preflight else {}),
                     **({"pipeline_task_started_at": scheduler_task_started_at}
-                       if replicated else {}),
+                       if owned_preflight else {}),
                     **({"pipeline_provider_ownership_kind": provider_ownership_kind}
-                       if replicated else {}),
+                       if owned_preflight else {}),
                 }
-        if mode == "auto" and not replicated:
+        if mode == "auto" and not owned_preflight:
             return {
                 "action": "prompt", "mode": "skill", "prompt": fallback_prompt,
                 "fallback_reason": preflight_reason, "profile_id": profile_id,
@@ -3675,7 +4519,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         }
     if preflight_action not in {"audit", "merge", "cleanup"}:
         reason = f"pipeline preflight вернул неподдерживаемое action={preflight_action}"
-        if mode == "auto" and not replicated:
+        if mode == "auto" and not owned_preflight:
             return {
                 "action": "prompt", "mode": "skill", "prompt": fallback_prompt,
                 "fallback_reason": reason, "profile_id": profile_id,
@@ -3720,16 +4564,17 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         "action": "prompt", "mode": "tool", "prompt": prompt,
         "command": command, "preflight": preflight,
         "profile_id": profile_id, "queue_id": queue.get("id"),
-        **({"pipeline_replicas": replica_count} if replicated else {}),
-        **({"pipeline_data_dir": scheduler_data_dir} if replicated else {}),
+        **({"review_routing_protocol": "review-routing-v1"} if typed_queue else {}),
+        **({"pipeline_replicas": replica_count} if owned_preflight else {}),
+        **({"pipeline_data_dir": scheduler_data_dir} if owned_preflight else {}),
         **({"pipeline_lease_key_file": scheduler_lease_key}
-           if replicated else {}),
+           if owned_preflight else {}),
         **({"pipeline_target_reservation": target_reservation}
-           if replicated else {}),
+           if owned_preflight else {}),
         **({"pipeline_task_started_at": scheduler_task_started_at}
-           if replicated else {}),
+           if owned_preflight else {}),
         **({"pipeline_provider_ownership_kind": provider_ownership_kind}
-           if replicated else {}),
+           if owned_preflight else {}),
     }
 
 
@@ -3777,6 +4622,12 @@ def _run_profile_health_check(profile: dict) -> dict | None:
             env["PATH"] = gh_dir + os.pathsep + env.get("PATH", "")
     try:
         _ensure_github_scan_lease(renew=True)
+        lease = getattr(_scan_lease_context, "lease", None)
+        meter = getattr(lease, "search_budget", None)
+        context = getattr(meter, "health_context", None)
+        if context is not None:
+            command = list(command) + ["-source-graphql-budget", str(context["allowance"]),
+                                       "-source-graphql-nonce", context["nonce"]]
         run = subprocess.run(
             command, cwd=config.get("working_dir") or None, env=env,
             capture_output=True, text=True,
@@ -3784,10 +4635,18 @@ def _run_profile_health_check(profile: dict) -> dict | None:
             encoding="utf-8", errors="replace",
         )
         _ensure_github_scan_lease()
-        payload = json.loads(run.stdout)
+        if context is not None:
+            from .source_graphql_cost import unique_object
+            payload = json.loads(run.stdout, object_pairs_hook=unique_object)
+        else:
+            payload = json.loads(run.stdout)
+        if context is not None and run.returncode == 75:
+            meter.refuse_health(payload, profile)
         if not isinstance(payload, dict) or payload.get("state") not in (
                 "green", "yellow", "red"):
             raise ValueError("ожидался JSON со state green/yellow/red")
+        if context is not None and (type(run.returncode) is not int or run.returncode not in (0, 1)):
+            raise ValueError(f"Source checker technical exit {run.returncode}")
         payload.setdefault("findings", [])
         payload["exit_code"] = run.returncode
         return payload
@@ -3998,7 +4857,10 @@ def _queue_replica_status(queue: dict, series: list[dict]) -> dict:
             "task_id": item.get("next_task_id"),
             "task_status": item.get("next_status"),
             "task_error": (item.get("next_error")
-                           if item.get("next_status") == "pending" else None),
+                           if item.get("next_status") in {"pending", "rate_limited"} else None),
+            "task_next_run_at": (item.get("next_run_at")
+                                 if item.get("next_status") in {"pending", "rate_limited"}
+                                 else None),
             "interval": item.get("effective_recurrence"),
             "paused": bool(item.get("paused")),
             "broken": bool(item.get("broken")),
@@ -4174,8 +5036,11 @@ def _refresh_local_state(result: dict, profile: dict, series: list[dict], *,
             "task_id": matching.get("next_task_id") if matching else None,
             "task_status": matching.get("next_status") if matching else None,
             "task_error": (matching.get("next_error")
-                           if matching and matching.get("next_status") == "pending"
+                           if matching and matching.get("next_status") in {"pending", "rate_limited"}
                            else None),
+            "task_next_run_at": (matching.get("next_run_at")
+                                 if matching and matching.get("next_status") in {"pending", "rate_limited"}
+                                 else None),
             **projection,
         })
         backlog = queue.get("backlog")
@@ -4283,15 +5148,26 @@ def _refresh_local_state(result: dict, profile: dict, series: list[dict], *,
         }
     data["runtime"] = runtime
     data["health"] = health
+    from .routing_observation import build_routing_observation
+    routing_cache = _cache_metadata(
+        source, generated_at, entry_epoch, entry_revision, current_epoch,
+        _profile_fingerprint(profile))
+    data["routing"] = build_routing_observation(
+        diagnostics or {}, available=(not routing_cache["stale"]
+            and routing_cache.get("complete") is True
+            and not (diagnostics or {}).get("checker_failed")),
+        tool_errors=db.pipeline_operational_errors(
+            series_ids, now - timedelta(hours=24)))
     data["target_clear_hours"] = target_hours
     data["priority_control"] = ({
         "levels": list(_PRIORITY_LEVELS),
         "aging_hours": priority_settings["aging_hours"],
         "manual_labels": priority_settings["manual_labels"],
     } if priority_settings else None)
-    data["cache"] = _cache_metadata(
-        source, generated_at, entry_epoch, entry_revision, current_epoch,
-        _profile_fingerprint(profile))
+    data["cache"] = routing_cache
+    from . import delivery_flow
+    data["delivery_flow"] = delivery_flow.summarize(
+        data, matching_series, now, paused=db.is_paused())
     return data
 
 
@@ -4407,6 +5283,28 @@ def _empty_cached_result(profile_id: str, profile: dict) -> dict:
     }
 
 
+def _source_checker_failure_revision(event, profile):
+    if event is None:
+        return 0
+    markers = event.get("source_checker_failure_revisions")
+    if markers is None:
+        return 0
+    if (not isinstance(markers,dict) or any(
+            not isinstance(pin,str) or re.fullmatch(r"[0-9a-f]{64}",pin) is None
+            or type(revision)is not int or not 0<revision<=event["revision"]
+            for pin,revision in markers.items())):
+        raise ValueError("invalid causal Source checker failure watermark")
+    return markers.get(_profile_fingerprint(profile),0)
+
+
+def _source_checker_verified_revision(result, event):
+    value=result.get("source_checker_verified_failure_revision",0)
+    if (type(value)is not int or value<0
+            or value>0 and (event is None or value>event["revision"])):
+        raise ValueError("invalid Source checker recovery acknowledgement")
+    return value
+
+
 def _with_persisted_refresh_status(result: dict, profile_id: str,
                                    profile: dict) -> dict:
     """Overlay a still-actionable denial on a quota-free cached response."""
@@ -4417,9 +5315,22 @@ def _with_persisted_refresh_status(result: dict, profile_id: str,
         # Invalid opt-in configuration is itself an admission blocker and its
         # persisted explanation remains useful until the profile is corrected.
         pass
+    raw_budget=profile.get("github_budget")
+    modern=isinstance(raw_budget,dict) and raw_budget.get("source_cost_protocol")=="source-graphql-cost-v1"
     try:
-        event = db.get_pipeline_refresh_status(profile_id)
+        event = db.get_pipeline_refresh_status(profile_id,**({"strict":True} if modern else {}))
+        failure_revision=_source_checker_failure_revision(event,profile) if modern else 0
+        verified_revision=_source_checker_verified_revision(result,event) if modern else 0
+        if failure_revision and verified_revision<failure_revision:
+            data=copy.deepcopy(result)
+            data.setdefault("cache",{}).update(refresh_blocked="checker_failed",
+                refresh_blocked_reason="latest genuine checker failure requires a fresh checker and complete Source publication")
+            return data
     except (OSError, sqlite3.Error, TypeError, ValueError):
+        if modern:
+            data=copy.deepcopy(result)
+            data.setdefault("cache",{}).update(refresh_blocked="checker_state_unavailable")
+            return data
         return result
     if (not isinstance(event, dict)
             or event.get("repository") != str(profile.get("repository", ""))):
@@ -4427,13 +5338,16 @@ def _with_persisted_refresh_status(result: dict, profile_id: str,
     status = event.get("status")
     if not isinstance(status, dict):
         return result
-    # An execution admission denial is not a failed queue refresh. TAIL/FIX
-    # budget contention must not poison a fresh shared snapshot for every
-    # other stage. Unknown legacy routes remain conservative.
+    if modern and event.get("source_checker_failure_revisions") is not None and status.get("refresh_blocked")=="checker_failed":
+        # A complete publication has acknowledged this exact failure, or the
+        # failure belongs to a different immutable checker/profile namespace.
+        return result
+    # An execution admission denial is not a queue-refresh outcome, even if
+    # the last snapshot was independently invalidated. Ignore old task-status
+    # rows without changing the real cache stale/epoch/profile/lease guards.
+    # Unknown legacy routes remain conservative.
     route = (status.get("github_budget") or {}).get("budget_route")
-    cache = result.get("cache") or {}
-    if (route in {"skill", "tool_preflight", "tool", "fallback_targeted"}
-            and cache.get("complete") is True and cache.get("stale") is False):
+    if route in {"skill", "tool_preflight", "tool", "fallback_targeted", "merge_confirmation", "merge_receipt"}:
         return result
     raw_defer_until = status.get("refresh_deferred_until")
     defer_until = _parse_time(raw_defer_until)
@@ -4450,6 +5364,7 @@ def _with_persisted_refresh_status(result: dict, profile_id: str,
         data["github_rate_limit"] = copy.deepcopy(status["github_rate_limit"])
     if isinstance(status.get("github_budget"), dict):
         data["github_budget"] = copy.deepcopy(status["github_budget"])
+        cache["refresh_budget"] = refresh_budget_diagnostic(status["github_budget"])
     return data
 
 
@@ -4650,12 +5565,15 @@ def _budget_blocked_cached(profile_id: str, profile: dict, series: list[dict],
     cache["refresh_blocked_reason"] = str(
         admission.get("reason") or "GitHub scan запрещён")
     cache["refresh_deferred_until"] = admission.get("defer_until")
+    cache["refresh_budget"] = refresh_budget_diagnostic(admission)
     return result
 
 
 def _analyze_without_budget(profile_id: str, series: list[dict], *,
                             use_cache: bool = True,
-                            refresh_diagnostics: bool = False) -> dict:
+                            refresh_diagnostics: bool = False,
+                            reuse_fresh: bool = False,
+                            snapshot_queue_id: str | None = None, minimum_remaining_seconds: int = 0) -> dict:
     profiles = _profiles()
     if profile_id not in profiles:
         raise KeyError(profile_id)
@@ -4674,6 +5592,13 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
         if profile_id not in profiles:
             raise KeyError(profile_id)
         profile = profiles[profile_id]
+        if reuse_fresh:
+            # A due task may have observed the old cache before another scan
+            # won this lock. Reuse its complete publication, not another scan.
+            fresh = read_cached(profile_id, series)
+            if (_required_snapshot_state(fresh, profile, snapshot_queue_id) is None
+                    and _snapshot_has_remaining_ttl(fresh, minimum_remaining_seconds)):
+                return fresh
         cached, _source, cache_epoch = _cached_entry(profile_id, profile)
         _unused, cache_generation = _cache_snapshot(profile_id)
         refresh_revision = db.increment_int_setting(
@@ -4682,6 +5607,22 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
             return _paused_cached(profile_id, series)
         priority_settings = _priority_settings(profile)
         health_config = profile.get("health_check") or {}
+        lease = getattr(_scan_lease_context, "lease", None)
+        search_budget = getattr(lease, "search_budget", None)
+        modern_budget = search_budget if isinstance(search_budget,_GraphQLSearchBudget) else None
+        if modern_budget is not None and health_config and not health_config.get("source_graphql_cost"):
+            modern_budget._deny("budgeted GraphQL Source health_check requires an artifact-bound Source cost protocol",
+                                "invalid_config")
+        if modern_budget is not None:
+            modern_budget.activate()
+        checker_failure_revision=0
+        checker_verified_revision=0
+        if modern_budget is not None:
+            checker_event=db.get_pipeline_refresh_status(profile_id,strict=True)
+            checker_failure_revision=_source_checker_failure_revision(checker_event,profile)
+            checker_verified_revision=_source_checker_verified_revision(cached[1],checker_event) if cached else 0
+            if checker_failure_revision>checker_verified_revision:
+                refresh_diagnostics=True
         health_cache_seconds = max(0, int(health_config.get("cache_seconds", 1800)))
         diagnostics = None
         diagnostics_generated_at = None
@@ -4691,12 +5632,34 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
             effective_health_ttl = min(60, health_cache_seconds) if (
                 isinstance(cached_diagnostics, dict)
                 and cached_diagnostics.get("checker_failed")) else health_cache_seconds
-            if (diagnostics_generated_at is not None
-                    and time.time() - float(diagnostics_generated_at) < effective_health_ttl):
+            diagnostics_age = (time.time() - float(diagnostics_generated_at)
+                               if diagnostics_generated_at is not None else None)
+            if (diagnostics_age is not None and diagnostics_age < effective_health_ttl
+                    and (modern_budget is None or math.isfinite(diagnostics_age) and diagnostics_age >= 0)):
                 diagnostics = cached_diagnostics
         if diagnostics is None:
+            if modern_budget is not None and health_config.get("source_graphql_cost"):
+                modern_budget.prepare_health(profile)
             diagnostics = _run_profile_health_check(profile)
             diagnostics_generated_at = time.time()
+            if modern_budget is not None and health_config.get("source_graphql_cost"):
+                if not (isinstance(diagnostics,dict) and diagnostics.get("checker_failed")):
+                    try:
+                        search_budget.consume_health(diagnostics, profile)
+                    except ValueError as exc:
+                        diagnostics=dict(diagnostics or {}, checker_failed=True, summary=str(exc))
+                if isinstance(diagnostics, dict) and diagnostics.get("checker_failed"):
+                    search_budget.failed_request()
+                    search_budget._record_denial(diagnostics.get("summary") or "Source checker failed",
+                                                 "checker_failed")
+                    search_budget.admission["source_checker_failure_profile_hash"]=_profile_fingerprint(profile)
+                    failed = read_cached(profile_id, series)
+                    failed["diagnostics"] = diagnostics
+                    failed.setdefault("cache", {}).update(refresh_blocked="checker_failed", stale=True)
+                    return failed
+        elif modern_budget is not None and health_config:
+            if health_config.get("source_graphql_cost"):
+                search_budget.reuse_health(diagnostics, profile, time.time() - float(diagnostics_generated_at))
         if db.is_paused():
             return _paused_cached(profile_id, series)
         target_hours = float(profile.get("target_clear_hours", 8))
@@ -4779,6 +5742,7 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
                 "task_status": matching.get("next_status") if matching else None,
                 **projection,
                 "membership_complete": membership_complete, "age": age,
+                "search_usage": [search["usage"] for search in searches if "usage" in search],
                 "admission_items": ordered_members,
                 "items": ordered_members[:priority_settings["max_items"]]
                 if priority_settings else [],
@@ -4836,12 +5800,24 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
             and isinstance(queue.get("replica_status"), dict)
             and not queue["replica_status"].get("valid", True)
         ]
+        lease = getattr(_scan_lease_context, "lease", None)
+        search_budget = getattr(lease, "search_budget", None)
+        if search_budget is not None and not search_budget.used:
+            # Other observation transports retain their existing semantics.
+            # This allowance accounts requests made by GraphQL search only.
+            search_budget = None
         if db.is_paused():
             github_rate_limit = (cached[1].get("github_rate_limit")
                                  if cached else None)
         else:
             try:
-                github_rate_limit = _github_rate_limits()
+                if search_budget is not None:
+                    # Reserve and charge the final metadata request to the same
+                    # whole-operation allowance before either cache/history CAS.
+                    search_budget.metadata()
+                    github_rate_limit = copy.deepcopy(search_budget.last_limits)
+                else:
+                    github_rate_limit = _github_rate_limits()
             except _GitHubRateLimitUnavailable:
                 # Without an admission policy this is optional UI telemetry,
                 # not a safety gate. Budget-enabled profiles still propagate
@@ -4870,18 +5846,45 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
             "bottleneck": bottleneck["id"] if bottleneck and bottleneck["backlog"] else None,
             "generated_at": now.timestamp(),
         }
+        if isinstance(search_budget,_GraphQLSearchBudget):
+            if (search_budget.health_provenance and not search_budget.health_provenance["reused"]
+                    and all(queue.get("membership_complete") is True for queue in queues)):
+                checker_verified_revision=max(checker_verified_revision,checker_failure_revision)
+            result["source_checker_verified_failure_revision"]=checker_verified_revision
+            result["source_search_usage"] = {
+                "graphql_allowance": search_budget.policy["requested_cost"]["graphql"],
+                "conservative_graphql_spend": search_budget.observed_spend + search_budget.pending_cost,
+                "health_cost_provenance": search_budget.health_provenance,
+                "uncertain_cost": search_budget.cost.uncertain,
+                "successful_observation_cost_proved": (search_budget.used
+                    and not search_budget.cost.uncertain and not search_budget.cost.escrow),
+                "scope": "whole leased Source operation including health, metadata, previews and data",
+                "admission_granted": False,
+            }
+        elif search_budget is not None:
+            result["source_search_usage"] = {
+                "graphql_allowance": search_budget.policy["requested_cost"]["graphql"],
+                "conservative_graphql_spend": search_budget.observed_spend + search_budget.pending_cost,
+                "scope": "legacy strict counter-window Source accounting",
+                "admission_granted": False,
+            }
         _ensure_github_scan_lease()
+        continuation = getattr(_scan_lease_context, "continuation", None)
+        atomic_snapshot = ({"profile_id": profile_id, "repository": profile["repository"],
+                            "captured_at": now.isoformat(), "payload": snapshot}
+                           if continuation is not None else None)
         published = _publish_cache(
             profile_id, profile, cache_generation, cache_epoch,
-            refresh_revision, result)
+            refresh_revision, result,
+            **({"pipeline_snapshot": atomic_snapshot} if atomic_snapshot is not None else {}))
         if not published:
             return read_cached(profile_id, series)
         # Raw trend history records only observations that won the same CAS as
         # the full cache. A rejected/stale writer must not poison later charts.
         lease = getattr(_scan_lease_context, "lease", None)
-        saved_snapshot = db.add_pipeline_snapshot(
+        saved_snapshot = True if continuation is not None else db.add_pipeline_snapshot(
             profile_id, profile["repository"], snapshot, now,
-            lease_guard=({"scope": lease.scope, "token": lease.token}
+            lease_guard=(lease.guard
                          if lease is not None else None),
         )
         if lease is not None and saved_snapshot is None:
@@ -4922,7 +5925,8 @@ def _analyze_without_budget(profile_id: str, series: list[dict], *,
 
 
 def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
-            refresh_diagnostics: bool = False) -> dict:
+            refresh_diagnostics: bool = False, reuse_fresh: bool = False,
+            snapshot_queue_id: str | None = None, minimum_remaining_seconds: int = 0) -> dict:
     """Read cached insights or run one budgeted, cross-process live scan."""
     if use_cache:
         return read_cached(profile_id, series)
@@ -4941,13 +5945,17 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
         try:
             result = _analyze_without_budget(
                 profile_id, series, use_cache=False,
-                refresh_diagnostics=refresh_diagnostics)
+                refresh_diagnostics=refresh_diagnostics,
+                **({"reuse_fresh": True, "snapshot_queue_id": snapshot_queue_id} if reuse_fresh else {}),
+                **({"minimum_remaining_seconds": minimum_remaining_seconds} if minimum_remaining_seconds else {}))
             _ensure_github_scan_lease(renew=True)
         except _GitHubScanLeaseFailure as exc:
             return _budget_blocked_cached(
                 profile_id, profile, series,
                 _replace_admission_with_lease_failure(
                     admission, profile, exc))
+        except _GitHubSearchBudgetDenied as exc:
+            return _budget_blocked_cached(profile_id, profile, series, exc.decision)
         except _GitHubRateLimitUnavailable as exc:
             return _budget_blocked_cached(
                 profile_id, profile, series,
@@ -4956,10 +5964,14 @@ def analyze(profile_id: str, series: list[dict], *, use_cache: bool = True,
     if admission.get("enabled"):
         result["github_budget"] = _public_budget_decision(admission)
     cache = result.get("cache")
-    if isinstance(cache, dict) and cache.get("refresh_blocked") != "worker_paused":
+    if (admission.get("allowed") and isinstance(cache, dict)
+            and cache.get("refresh_blocked") != "worker_paused"):
         cache.pop("refresh_blocked", None)
         cache.pop("refresh_blocked_reason", None)
         cache.pop("refresh_deferred_until", None)
+        cache.pop("refresh_budget", None)
+    if (profile.get("github_budget") or {}).get("source_cost_protocol")=="source-graphql-cost-v1":
+        result=_with_persisted_refresh_status(result,profile_id,profile)
     return _with_live_github_budget_state(result, profile)
 
 
@@ -5461,7 +6473,7 @@ def build_period_report(profile_id: str, series: list[dict], *, hours: int = 24,
         "task_id": item.get("next_task_id"), "title": item.get("title"),
         "status": item.get("next_status"),
         "error": (item.get("next_error")
-                  if item.get("next_status") == "pending" else None),
+                  if item.get("next_status") in {"pending", "rate_limited"} else None),
         "started_at": item.get("next_started_at"),
         "scheduled_at": item.get("next_run_at"),
         "paused": bool(item.get("paused")),
@@ -5471,8 +6483,10 @@ def build_period_report(profile_id: str, series: list[dict], *, hours: int = 24,
     board = build_board(
         delivery, diagnostics, current_tasks,
         available=(fresh and cache.get("complete") is True
+                   and cache.get("stale") is False
                    and bool(diagnostics) and not diagnostics.get("checker_failed")),
-        classifications=profile.get("delivery_classifications"))
+        classifications=profile.get("delivery_classifications"),
+        tool_errors=db.pipeline_operational_errors(series_ids, start))
     report = {
         "profile_id": profile_id, "title": profile["title"],
         "repository": profile["repository"], "hours": hours,
@@ -5641,15 +6655,37 @@ def render_period_report_markdown(report: dict) -> str:
                 "- Полного снимка состава нет; среди доступных элементов "
                 "не найдено `ship`, `needs-decision` или `hold`.")
 
+    routing = (report.get("board") or {}).get("routing") or {}
+    lines.extend(["", "## Причины остановок", ""])
+    if not routing.get("complete"):
+        lines.append("- Полная свежая классификация недоступна; отсутствие строк не означает ноль.")
+    for group in routing.get("groups", []):
+        for item in group.get("items", []):
+            identity = (f"PR #{item['number']} HEAD {item.get('head', 'неизвестен')}"
+                        if item.get("number") else f"Task #{item.get('task_id')}")
+            detail = json.dumps(item, ensure_ascii=False, sort_keys=True)
+            lines.append(f"- {_routing_markdown_text(group['title'])}: "
+                         f"{_routing_markdown_text(identity)} — {_routing_markdown_text(detail)}")
+        if group.get("truncated"):
+            lines.append(f"- {_routing_markdown_text(group['title'])}: вывод сокращён; "
+                         "полные подробности доступны в исходных задачах/REVIEW.")
     return "\n".join(lines) + "\n"
 
 
-def sample_active_profiles(series: list[dict]) -> dict[str, str]:
+def _routing_markdown_text(value):
+    """Literal untrusted details: neutralize HTML and Markdown operators."""
+    text = html.escape(str(value), quote=False).replace("\r", " ").replace("\n", " ")
+    return re.sub(r"([\\`*_{}\[\]()#+\-.!|>~])", r"\\\1", text)
+
+
+def sample_active_profiles(series: list[dict], *, profile_ids=None) -> dict[str, str]:
     """Refresh every configured pipeline that has a matching live series."""
     if db.is_paused():
         return {}
     outcomes = {}
     for profile_id, profile in _profiles().items():
+        if profile_ids is not None and profile_id not in profile_ids:
+            continue
         if not _profile_active(profile, series):
             continue
         try:
@@ -5657,8 +6693,14 @@ def sample_active_profiles(series: list[dict]) -> dict[str, str]:
             if (profile.get("github_budget") or {}).get("essential_snapshot_headroom") is True:
                 candidate = read_cached(profile_id, series)
                 cache = candidate.get("cache") or {}
+                from .pipeline_sampling import refresh_ahead_seconds
+                lead = refresh_ahead_seconds(profile)
+                age = cache.get("age_seconds")
+                early_due = bool(lead) and (
+                    not isinstance(age, (int, float)) or isinstance(age, bool)
+                    or not math.isfinite(age) or age >= _CACHE_TTL_SECONDS - lead)
                 if (cache.get("complete") is True and cache.get("stale") is False
-                        and not cache.get("refresh_blocked")):
+                        and not cache.get("refresh_blocked") and not early_due):
                     data = candidate
             if data is None:
                 data = analyze(profile_id, series, use_cache=False)

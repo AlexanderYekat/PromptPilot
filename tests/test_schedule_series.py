@@ -96,6 +96,51 @@ def test_fresh_install_has_no_project_specific_pipeline_profiles(tmp_path, monke
     assert pipeline_insights.list_profiles() == []
 
 
+def test_recurrence_keeps_new_series_prompt_without_rewriting_running_attempt(
+        isolated_db):
+    original = "ExampleProject - FIX\nOriginal instructions\r\n"
+    updated = "ExampleProject - FIX\nCurrent operator instructions\r\n"
+    created = isolated_db.create_task(TaskCreate(prompt=original, recurrence="30m"))
+    running = isolated_db.get_next_runnable()
+    assert running.id == created.id
+    with isolated_db._connect() as connection:
+        connection.execute("UPDATE task_series SET prompt=? WHERE id=?",
+                           (updated, created.series_id))
+    # The dispatched copy can also carry a transient note; neither old text
+    # nor that note should replace the current template in the successor.
+    running.prompt += "\nOne-off note for this attempt"
+    assert isolated_db.mark_completed(running.id, "Done", verdict="ГОТОВО",
+                                     expected_started_at=running.started_at)
+    worker._recur_after_run(running)
+    series = isolated_db.get_series(created.series_id)
+    successor = isolated_db.get_task(series["next_task_id"])
+    assert successor.prompt == updated
+    assert isolated_db.get_task(created.id).prompt == original
+    assert series["prompt"] == updated
+
+
+def test_failed_occurrence_also_uses_current_series_prompt(isolated_db):
+    created = isolated_db.create_task(TaskCreate(
+        prompt="ExampleProject - FIX\nOld", recurrence="30m"))
+    running = isolated_db.get_next_runnable()
+    with isolated_db._connect() as connection:
+        connection.execute("UPDATE task_series SET prompt=? WHERE id=?",
+                           ("ExampleProject - FIX\nNew", created.series_id))
+    worker._maybe_recur(running, failed=True)
+    successor = isolated_db.get_task(
+        isolated_db.get_series(created.series_id)["next_task_id"])
+    # A live occurrence still blocks duplicate scheduling. Complete it and
+    # confirm the failure path preserves the template in its one successor.
+    assert successor.id == running.id
+    assert isolated_db.mark_failed(running.id, "Failure",
+                                  expected_started_at=running.started_at)
+    worker._maybe_recur(running, failed=True)
+    successor = isolated_db.get_task(
+        isolated_db.get_series(created.series_id)["next_task_id"])
+    assert successor.id != running.id
+    assert successor.prompt == "ExampleProject - FIX\nNew"
+
+
 def test_first_valid_stale_verdict_reselects_immediately(isolated_db):
     task = isolated_db.create_task(TaskCreate(
         prompt="ExampleProject - REVIEW", recurrence="4h"))
@@ -784,6 +829,7 @@ def test_project_health_check_is_immediate_and_accepts_red_json(monkeypatch):
 
 
 def test_profile_health_exposes_configured_gh_to_nested_checker(monkeypatch):
+    monkeypatch.delenv('GH_EXE', raising=False)
     calls = []
     gh = os.path.join("tools", "github", "gh.exe")
     monkeypatch.setenv("PP_GH_EXE", gh)
@@ -1114,8 +1160,10 @@ def test_list_series_preserves_occurrence_and_health_semantics(isolated_db):
     assert series["broken"] is False
 
 
+@pytest.mark.parametrize('legacy_index',[False,True])
+@pytest.mark.parametrize('targeted',[False,True])
 def test_list_series_uses_constant_lightweight_queries(
-        isolated_db, monkeypatch):
+        isolated_db, monkeypatch,legacy_index,targeted):
     large_result = "x" * (1024 * 1024)
     expected_ids = []
     for index in range(6):
@@ -1128,6 +1176,13 @@ def test_list_series_uses_constant_lightweight_queries(
             series_id=historical.series_id,
         ))
         expected_ids.append(active.series_id)
+
+    # An older auxiliary client can import its own schema after our startup
+    # migration and recreate this narrower index. The read must remain light
+    # until the next migration, for both dashboard and one-series controls.
+    if legacy_index:
+        with isolated_db._connect() as conn:
+            conn.execute('CREATE INDEX idx_tasks_series ON tasks(series_id,id)')
 
     statements = []
     prohibited_reads = []
@@ -1149,16 +1204,29 @@ def test_list_series_uses_constant_lightweight_queries(
 
     monkeypatch.setattr(isolated_db, "_connect", traced_connect)
 
-    listed = isolated_db.list_series()
+    listed = ([isolated_db.get_series(expected_ids[0])] if targeted
+              else isolated_db.list_series())
 
     selects = [statement for statement in statements
                if statement.lstrip().upper().startswith(("SELECT", "WITH"))]
-    assert {item["id"] for item in listed} == set(expected_ids)
+    assert {item["id"] for item in listed} == set(expected_ids[:1] if targeted else expected_ids)
     assert len(selects) == 3
     assert sum("pipeline_repeat_blocker_pause:v1:" in statement
                for statement in selects) == 1
     assert prohibited_reads == []
     assert all("SELECT *" not in statement.upper() for statement in selects)
+    # Selecting few columns is not enough: a non-covering scan still visits
+    # every task table page, including rows with large off-page payloads.
+    with real_connect() as conn:
+        history_plan = [row[3] for row in conn.execute(
+            "EXPLAIN QUERY PLAN " + selects[1])]
+        picked_plan = [row[3] for row in conn.execute(
+            "EXPLAIN QUERY PLAN " + selects[2])]
+    operation='SEARCH t ' if targeted else 'SCAN t '
+    assert any("COVERING INDEX" in step and operation in step
+               for step in history_plan), history_plan
+    assert any("COVERING INDEX" in step and "tasks" in step
+               for step in picked_plan), picked_plan
 
 
 def test_series_settings_persist_and_update_pending_occurrence(isolated_db):
@@ -2127,6 +2195,16 @@ def test_pause_during_first_search_stops_all_subsequent_github_io(
     assert isolated_db.list_pipeline_snapshots("mid-pause") == []
 
 
+def _graphql_pause_page(total, number=42):
+    item = {"__typename": "Issue", "id": "node-" + str(number), "number": number,
+        "title": "Ready", "createdAt": "2026-09-01T00:00:00Z", "updatedAt": "2026-09-02T00:00:00Z",
+        "closedAt": None, "url": "https://example.test/" + str(number),
+        "repository": {"nameWithOwner": "owner/example"},
+        "labels": {"totalCount": 0, "nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}}
+    return {"data": {"rateLimit": {"cost": 1}, "search": {"issueCount": total, "nodes": [item],
+        "pageInfo": {"hasNextPage": total > 1, "endCursor": "next" if total > 1 else None}}}}
+
+
 def test_github_search_does_not_start_page_two_after_pause(
         isolated_db, monkeypatch):
     calls = []
@@ -2136,7 +2214,7 @@ def test_github_search_does_not_start_page_two_after_pause(
         isolated_db.set_setting("worker_paused", "1")
         return SimpleNamespace(
             returncode=0, stderr="",
-            stdout=json.dumps({"total_count": 250, "items": [{}] * 100}),
+            stdout=json.dumps(_graphql_pause_page(250)),
         )
 
     monkeypatch.setattr(pipeline_insights, "_gh_executable", lambda: "gh")
@@ -2148,7 +2226,7 @@ def test_github_search_does_not_start_page_two_after_pause(
         pipeline_insights._github_search("owner/example", "is:pr")
 
     assert len(calls) == 1
-    assert "page=1" in calls[0]
+    assert calls[0] == ["gh", "api", "graphql", "--input", "-"]
 
 
 def test_interrupted_pagination_never_publishes_partial_snapshot(
@@ -2167,7 +2245,7 @@ def test_interrupted_pagination_never_publishes_partial_snapshot(
         isolated_db.set_setting("worker_paused", "1")
         return SimpleNamespace(
             returncode=0, stderr="",
-            stdout=json.dumps({"total_count": 250, "items": [{}] * 100}),
+            stdout=json.dumps(_graphql_pause_page(250)),
         )
 
     monkeypatch.setattr(pipeline_insights, "_profiles", lambda: {"pagination": profile})
@@ -2190,12 +2268,6 @@ def test_interrupted_pagination_never_publishes_partial_snapshot(
 
 def test_completed_first_page_remains_a_valid_snapshot_when_pause_arrives(
         isolated_db, monkeypatch):
-    item = {
-        "number": 42, "title": "Ready", "labels": [],
-        "created_at": "2026-09-01T00:00:00Z",
-        "updated_at": "2026-09-02T00:00:00Z",
-        "html_url": "https://example.test/42",
-    }
     calls = []
 
     def run(command, **_kwargs):
@@ -2203,7 +2275,7 @@ def test_completed_first_page_remains_a_valid_snapshot_when_pause_arrives(
         isolated_db.set_setting("worker_paused", "1")
         return SimpleNamespace(
             returncode=0, stderr="",
-            stdout=json.dumps({"total_count": 1, "items": [item]}),
+            stdout=json.dumps(_graphql_pause_page(1)),
         )
 
     monkeypatch.setattr(pipeline_insights, "_gh_executable", lambda: "gh")

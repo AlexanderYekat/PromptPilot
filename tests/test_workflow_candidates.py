@@ -313,7 +313,9 @@ def test_external_handoff_uses_same_candidate_contract(isolated_db, repo):
     assert 'CANDIDATE_JSON' in assignment.assignment
     assert not isolated_db.list_tasks()
     text = 'CANDIDATE_JSON: ' + json.dumps({'candidate_revision': git(repo, 'rev-parse', 'HEAD'), 'no_changes': True})
-    handed = workflows.submit_external_result(wf.id, WorkflowExternalResult(expected_version=waiting.state_version, result=text))
+    handed = workflows.submit_external_result(wf.id, WorkflowExternalResult(
+        expected_version=waiting.state_version, run_id=assignment.run_id,
+        input_sha256=assignment.input_sha256, result=text))
     assert handed.status.value == 'gating'
     candidate = candidates.list_candidates(wf.id)[0]
     assert candidate['executor_task_id'] is None
@@ -403,22 +405,36 @@ def test_plan_candidate_variable_requires_opt_in_before_approval(isolated_db, re
     assert isolated_db.get_workflow(wf.id).status.value == 'awaiting_plan_approval'
 
 
-def test_candidate_api_exports_and_manual_gate(isolated_db, repo):
+@pytest.mark.parametrize("declared", [False, True])
+def test_candidate_api_exports_and_manual_gate(isolated_db, repo, declared):
     from promptpilot.api import app
 
     def request(method, path, **kwargs):
         async def send():
-            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://testserver') as client:
+            async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url='http://localhost') as client:
                 return await client.request(method, path, **kwargs)
         return asyncio.run(send())
 
-    wf = create(isolated_db, repo)
+    config = {}
+    if declared:
+        config["gate"] = {"commands": [{
+            "argv": [sys.executable, "-c", 'import os; print(os.environ["PROMPTPILOT_CANDIDATE_SHA"])'],
+            "inputs": ["test_code.py"],
+            "repeat": "per-attempt",
+        }]}
+    wf = create(isolated_db, repo, **config)
     _, candidate = handoff(isolated_db, wf, repo)
     assert request('GET', f'/api/workflows/{wf.id}/candidates').json() == [candidate]
     assert request('GET', f'/api/workflows/{wf.id}/candidate-readiness').json()['ready']
     response = request('POST', f'/api/workflows/{wf.id}/gate/run', json={'expected_version': isolated_db.get_workflow(wf.id).state_version})
     assert response.status_code == 200, response.text
     assert response.json()['status'] == 'reviewing'
+    events = isolated_db.list_workflow_events(wf.id)
+    gate_pass = next(event.payload for event in events if event.event_type == 'gate.passed')
+    assert gate_pass['candidate_id'] == candidate['candidate_id']
+    assert gate_pass['execution_id'] and gate_pass['receipt_id']
+    if declared:
+        assert candidate['candidate_revision'] in gate_pass['evidence'][0]
     assert request('GET', '/api/workflows/missing/candidates').status_code == 404
 
 

@@ -7,6 +7,7 @@ const calls = [];
 const messages = [];
 let confirmed = true;
 const context = vm.createContext({
+  window:{},
   selectedWorkflowId:'wf-test', selectedWorkflowData:{state_version:13}, API:'/api',
   sessionStorage:{getItem:()=>null, setItem:()=>{}, removeItem:()=>{}},
   document:{getElementById:()=>null},

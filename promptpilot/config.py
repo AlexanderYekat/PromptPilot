@@ -1,7 +1,10 @@
 """Configuration settings."""
 
 import json
+import functools
+import threading
 import os
+import time
 import sys
 from pathlib import Path
 
@@ -332,6 +335,8 @@ BUILTIN_PROVIDERS = {
 
 
 def _providers_file() -> Path:
+    # DB_DIR is resolved from PP_DATA_DIR at startup and is the shared config
+    # boundary for readers and atomic writers; do not redirect reads alone.
     return DB_DIR / "providers.json"
 
 
@@ -344,8 +349,24 @@ def load_providers() -> dict:
     providers = dict(BUILTIN_PROVIDERS)
     user_file = _providers_file()
     if user_file.exists():
-        try:
-            custom = _read_json_file(user_file)
+        # U14: внешний редактор может писать файл неатомарно (open("w") —
+        # усечение на лету). Один повтор чтения закрывает гонку: воркер,
+        # прочитавший обрывок, не терял кастомных провайдеров на задачу
+        # (инцидент 2026-10-03: ревью-ступень goose-zi падала «CLI not found»).
+        custom = None
+        for attempt in (1, 2):
+            try:
+                custom = _read_json_file(user_file)
+                break
+            except ValueError as e:
+                if attempt == 2:
+                    _warn_once("providers.json",
+                               f"⚠ {user_file} не читается ({e}) — кастомные провайдеры игнорируются")
+                else:
+                    time.sleep(0.25)
+            except OSError:
+                break
+        if isinstance(custom, dict):
             for name, info in custom.items():
                 if name in providers:
                     providers[name] = {**providers[name], **info}
@@ -355,54 +376,28 @@ def load_providers() -> dict:
                         providers[name]["prompt_stdin"] = False
                 else:
                     providers[name] = info
-        except ValueError as e:
-            _warn_once("providers.json",
-                       f"⚠ {user_file} не читается ({e}) — кастомные провайдеры игнорируются")
-        except OSError:
-            pass
     return providers
 
 
 def load_providers_detailed() -> dict:
-    """Load providers with source tracking.
+    """Use exactly the same partial-override semantics as worker dispatch."""
+    custom = _load_custom_providers()
+    return {name: {**info,
+                   "_source": ("builtin + providers.json" if name in BUILTIN_PROVIDERS else "providers.json")
+                              if name in custom else "builtin",
+                   "_source_path": str(_providers_file()) if name in custom else None}
+            for name, info in load_providers().items()}
 
-    Each provider entry gets extra fields:
-      _source: "builtin", "providers.json", or "builtin + providers.json"
-      _source_path: path to providers.json (if applicable)
-    """
-    providers = {}
 
-    for name, info in BUILTIN_PROVIDERS.items():
-        entry = dict(info)
-        entry["_source"] = "builtin"
-        entry["_source_path"] = None
-        providers[name] = entry
+_PROVIDER_WRITE_LOCK = threading.RLock()
 
-    user_file = _providers_file()
-    custom_names = set()
-    if user_file.exists():
-        try:
-            custom = _read_json_file(user_file)
-            for name, info in custom.items():
-                custom_names.add(name)
-                entry = dict(info)
-                if name in providers:
-                    if "supports_skills" not in entry:
-                        entry["supports_skills"] = providers[name].get("supports_skills", False)
-                    if "supports_effort" not in entry:
-                        entry["supports_effort"] = providers[name].get("supports_effort", False)
-                    entry["_source"] = "builtin + providers.json"
-                else:
-                    entry["_source"] = "providers.json"
-                entry["_source_path"] = str(user_file)
-                providers[name] = entry
-        except ValueError as e:
-            _warn_once("providers.json",
-                       f"⚠ {user_file} не читается ({e}) — кастомные провайдеры игнорируются")
-        except OSError:
-            pass
 
-    return providers
+def _provider_write(function):
+    @functools.wraps(function)
+    def locked(*args, **kwargs):
+        with _PROVIDER_WRITE_LOCK:
+            return function(*args, **kwargs)
+    return locked
 
 
 def _load_custom_providers() -> dict:
@@ -422,12 +417,58 @@ def _write_custom_providers(custom: dict):
     _atomic_write_json(_providers_file(), custom)
 
 
-def save_provider(name: str, cmd: str = None, description: str = "", env: dict = None,
-                  executor: str = None, kind: str = None, keep_pane: bool = False,
-                  models: list = None, args: list = None, effort: str = None):
-    """Save a custom provider (cmd-template or executor-based) to providers.json."""
+@_provider_write
+def set_providers_ui_order(names: list) -> bool:
+    """Persist the helper-card order chosen by drag&drop in the UI.
+
+    Stored as a per-provider `ui_order` field (partial-override friendly:
+    missing entries keep their default alphabetical tail).
+    """
+    known = set(load_providers())
     custom = _load_custom_providers()
+    for idx, name in enumerate(names):
+        if name not in known:
+            continue
+        entry = custom.get(name, {})
+        entry["ui_order"] = idx
+        custom[name] = entry
+    _write_custom_providers(custom)
+    return True
+
+
+@_provider_write
+def save_catalog_provider(name: str, prov: dict) -> None:
+    """Normalize through the common save path, then add catalog-only metadata."""
+    prov = dict(prov)
+    model_config = prov.pop("catalog_models_config", None)
+    if model_config is not None:
+        folder = DB_DIR / "catalog-configs" / name
+        folder.mkdir(parents=True, exist_ok=True)
+        if os.name != "nt":
+            folder.chmod(0o700)
+        _atomic_write_json(folder / "models.json", model_config)
+        prov["env"] = {**prov.get("env", {}), "PI_CODING_AGENT_DIR": str(folder)}
+    custom = _load_custom_providers()
+    entry = _provider_entry(name, custom, prov["cmd"], prov["description"],
+                            env=prov.get("env"), models=prov["models"])
+    entry.update(prov)
+    custom[name] = entry
+    _write_custom_providers(custom)
+
+
+def _provider_entry(name: str, custom: dict, cmd: str = None, description: str = "", env: dict = None,
+                  executor: str = None, kind: str = None, keep_pane: bool = False,
+                  models: list = None, args: list = None, effort: str = None,
+                  prompt_stdin: bool = False):
+    """Pure normalization shared by advanced form and atomic catalog creation."""
     entry = {"description": description}
+    previous = custom.get(name) or {}
+    if previous.get("cmd") == cmd:
+        for key in ("human", "catalog_id", "ui_order", "hidden", "prompt_stdin"):
+            if key in previous:
+                entry[key] = previous[key]
+    if prompt_stdin:
+        entry["prompt_stdin"] = True
     if models:
         entry["models"] = models
     if args:
@@ -459,10 +500,21 @@ def save_provider(name: str, cmd: str = None, description: str = "", env: dict =
             entry["supports_effort"] = True
     if env:
         entry["env"] = env
-    custom[name] = entry
+    return entry
+
+
+@_provider_write
+def save_provider(name: str, cmd: str = None, description: str = "", env: dict = None,
+                  executor: str = None, kind: str = None, keep_pane: bool = False,
+                  models: list = None, args: list = None, effort: str = None,
+                  prompt_stdin: bool = False):
+    custom = _load_custom_providers()
+    custom[name] = _provider_entry(name, custom, cmd, description, env, executor,
+                                  kind, keep_pane, models, args, effort, prompt_stdin)
     _write_custom_providers(custom)
 
 
+@_provider_write
 def set_provider_hidden(name: str, hidden: bool) -> bool:
     """Hide/unhide a provider in pickers (partial override, keeps built-in cmd)."""
     if name not in load_providers():
@@ -602,8 +654,49 @@ def pickable_providers() -> dict:
     }
 
 
+def herdr_launch_kind(name: str, info: dict) -> str:
+    """Interactive kind for a provider that can open a new Herdr pane."""
+    if info.get("session_target"):
+        return ""
+    if info.get("executor"):
+        return (info.get("kind") or "claude") if info["executor"] == "herdr" else ""
+    kind = info.get("kind") or {"claude": "claude", "claude-z": "claude",
+                               "codex": "codex", "opencode": "opencode"}.get(name)
+    return kind if kind in {"claude", "codex", "opencode"} else ""
+
+
+@_provider_write
+def ensure_herdr_launch_provider(source: str) -> str:
+    """Register a hidden interactive route, also visible to an existing worker.
+
+    Headless command templates/arguments cannot be reused by an interactive
+    agent. Keep only its environment, models and capability settings.
+    """
+    info = load_providers().get(source, {})
+    kind = herdr_launch_kind(source, info)
+    if not kind:
+        raise ValueError("Этот агент не поддерживает новое окно Herdr")
+    if info.get("executor") == "herdr":
+        return source
+    name = f"__herdr_window_{source}"
+    custom = _load_custom_providers()
+    if name in custom and custom[name].get("herdr_source") != source:
+        raise ValueError("Имя запуска Herdr уже занято другим провайдером")
+    entry = {k: info[k] for k in ("env", "models", "effort", "supports_skills",
+                                  "supports_effort") if k in info}
+    entry.update(executor="herdr", kind=kind, hidden=True, herdr_source=source,
+                 description=f"{source} — новое окно Herdr")
+    if custom.get(name) != entry:
+        custom[name] = entry
+        _write_custom_providers(custom)
+    return name
+
+
+@_provider_write
 def remove_provider(name: str) -> bool:
     """Remove a custom provider from providers.json."""
+    if name in BUILTIN_PROVIDERS:
+        return False
     user_file = _providers_file()
     if not user_file.exists():
         return False
@@ -670,28 +763,60 @@ RIGHTS_LEVELS = ("none", "read", "write", "full")
 # How each rights level (models.TaskRights) is spelled by the CLIs PromptPilot
 # knows. Claude Code: --tools names the built-in tools the run may use, and
 # --restricted also confines file tools to the working directories and
-# refuses bypassPermissions. Codex: its OS sandbox via the sandbox_mode config
-# override, which `exec` and `exec resume` both accept. A provider can declare
-# its own map as "rights" in providers.json; without one, only "full" (the
-# command exactly as configured) is available and narrower levels fail closed.
+# refuses bypassPermissions. Codex's local sandbox does not also confine
+# external MCP/apps, so it cannot provide this universal narrow contract.
+# Narrow rights require
+# a direct supported CLI; a wrapper's own "rights" declaration is not proof.
 CLAUDE_RIGHTS = {
-    "none": ["--tools", ""],
-    "read": ["--restricted", "--tools", "Read,Glob,Grep"],
+    "none": ["--restricted", "--tools", "", "--disallowedTools", "mcp__*"],
+    "read": ["--restricted", "--tools", "Read,Glob,Grep", "--disallowedTools", "mcp__*"],
     "write": ["--restricted", "--tools", "Read,Glob,Grep,Edit,Write",
-              "--permission-mode", "acceptEdits"],
+              "--permission-mode", "acceptEdits", "--disallowedTools", "mcp__*"],
     "full": ["--dangerously-skip-permissions"],
 }
 CODEX_RIGHTS = {
-    # Codex has no "no tools" mode: a read-only sandbox can still run
-    # read-only commands, so "none" is not offered unless declared.
-    "read": ["-c", 'sandbox_mode="read-only"'],
-    "write": ["-c", 'sandbox_mode="workspace-write"'],
+    # A separate proven adapter is required for none/read/write, including
+    # external MCP/app tools; local sandbox_mode alone is insufficient.
     "full": ["--dangerously-bypass-approvals-and-sandbox"],
 }
 
 
 class RightsUnsupported(ValueError):
     """The provider has no way to confine a run to the requested rights."""
+
+
+def _narrow_rights_kind(cfg: dict) -> str:
+    """Only a direct known CLI can use the built-in confinement adapter.
+
+    A kind/supports_skills hint or an arbitrary wrapper's advertised flags
+    does not prove that it forwards these restrictions before starting tools.
+    Refuse competing template controls rather than guess their precedence.
+    """
+    parts = _split_cmd((cfg.get("cmd") or "").replace("{prompt}", "PROMPT"))
+    executable = _command_basename(parts[0]) if parts else ""
+    kind = next((name for name in ("claude", "codex")
+                 if executable in (name, name + ".exe", name + ".cmd")), None)
+    if kind is None:
+        raise RightsUnsupported("не умеет доказанно ограничивать права wrapper/неизвестного CLI")
+    if cfg.get("kind") not in (None, kind):
+        raise RightsUnsupported("kind не соответствует запускаемому CLI")
+    forbidden = {
+        "--dangerously-bypass-approvals-and-sandbox", "--dangerously-bypass-hook-trust",
+        "--dangerously-skip-permissions", "--allow-dangerously-skip-permissions",
+        "--permission-mode", "--tools", "--allowedTools", "--allowed-tools",
+        "--disallowedTools", "--disallowed-tools", "--settings", "--setting-sources",
+        "--mcp-config", "--plugin-dir", "--agents", "--agent", "--add-dir",
+        "--sandbox", "--config", "--profile", "--full-auto", "--yolo",
+        "--enable", "--disable", "--remote", "--approve-for-me", "--cd",
+    }
+    for arg in [*parts[1:], *(cfg.get("args") or [])]:
+        option = arg.split("=", 1)[0]
+        short_control = kind == "codex" and any(arg.startswith(prefix) for prefix in ("-c", "-s", "-p", "-C", "-a"))
+        if option in forbidden or short_control or arg == "--":
+            raise RightsUnsupported(f"не умеет ограничивать права: конфликтующий параметр {option}")
+    if kind == "codex" and (len(parts) < 2 or parts[1] != "exec"):
+        raise RightsUnsupported("ограниченные права Codex требуют прямой команды codex exec")
+    return kind
 
 
 def rights_args(cfg: dict, rights: str) -> list:
@@ -702,22 +827,22 @@ def rights_args(cfg: dict, rights: str) -> list:
     """
     if rights not in RIGHTS_LEVELS:
         raise ValueError(f"unknown rights level: {rights!r}")
-    declared = cfg.get("rights")
+    kind = _narrow_rights_kind(cfg) if rights != "full" else None
+    declared = cfg.get("rights") if rights == "full" else None
     if isinstance(declared, dict) and rights in declared:
         value = declared[rights]
         if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
             raise RightsUnsupported(f"rights.{rights} must be a list of arguments")
         return list(value)
-    if provider_is_claude(cfg):
+    if kind == "claude" or (rights == "full" and provider_is_claude(cfg)):
         return list(CLAUDE_RIGHTS[rights])
-    if provider_is_codex(cfg) and rights in CODEX_RIGHTS:
+    if (kind == "codex" or (rights == "full" and provider_is_codex(cfg))) and rights in CODEX_RIGHTS:
         return list(CODEX_RIGHTS[rights])
     if rights == "full":
         return []  # the command as configured is the widest it gets
     raise RightsUnsupported(
-        f"провайдер не умеет ограничивать права до «{rights}»: задайте "
-        f"\"rights\": {{\"{rights}\": [...]}} в providers.json или выберите "
-        "другого провайдера")
+        f"провайдер не умеет ограничивать права до «{rights}»: выберите "
+        "прямой CLI с поддерживаемым уровнем прав")
 
 
 def rights_supported(cfg: dict, rights: str) -> bool:
@@ -730,7 +855,7 @@ def rights_supported(cfg: dict, rights: str) -> bool:
 
 def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, session_id: str = None,
               model: str = None, guard: bool = True, effort: str = None,
-              rights: str = None):
+              rights: str = None, *, provider_snapshot: dict = None):
     """Build the full command list for a provider + prompt.
 
     guard=False for a run that happens on another machine: the settings file
@@ -739,7 +864,7 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
     rights (models.TaskRights) wins over skip_permissions; RightsUnsupported
     when the provider cannot honour it.
     """
-    providers = load_providers()
+    providers = load_providers() if provider_snapshot is None else {provider: provider_snapshot}
     cfg = providers.get(provider, {})
     if provider in providers:
         template = cfg["cmd"]
@@ -757,7 +882,16 @@ def build_cmd(provider: str, prompt: str, skip_permissions: bool = False, sessio
     is_codex = provider_is_codex(cfg)
     extras = []
     if model:
-        extras += ["--model", model]
+        # A task override replaces the template choice, never duplicates flags.
+        for i, value in enumerate(cmd):
+            if value == "--model" and i + 1 < len(cmd):
+                cmd[i + 1] = model
+                break
+            if value.startswith("--model="):
+                cmd[i] = "--model=" + model
+                break
+        else:
+            extras += ["--model", model]
     # --effort понимает только Claude Code (у opencode это --variant), а если
     # флаг уже вписан в шаблон руками — второй не добавляем, чтобы не спорить
     # с тем, что человек написал явно.
@@ -843,7 +977,7 @@ def mask_secret_value(name: str, value: str) -> str:
     return "***"
 
 
-def get_provider_env(provider: str) -> dict:
+def get_provider_env(provider: str, *, provider_snapshot: dict = None) -> dict:
     """Environment for a provider's subprocess: current env minus PromptPilot's
     own secrets, plus the provider's declared env on top.
 
@@ -852,7 +986,7 @@ def get_provider_env(provider: str) -> dict:
     by name, so expose configured executables and well-known installations in
     PATH instead of making every agent rediscover them heuristically.
     """
-    providers = load_providers()
+    providers = load_providers() if provider_snapshot is None else {provider: provider_snapshot}
     extra = providers.get(provider, {}).get("env", {})
     env = os.environ.copy()
     for k in _SECRET_ENV:
@@ -1214,6 +1348,26 @@ def is_loopback_host(host: str) -> bool:
 # browser — native Basic-auth prompt (any username, token as password);
 # scripts — "Authorization: Bearer <token>" or curl -u x:<token>.
 API_TOKEN = os.environ.get("PP_API_TOKEN", "")
+
+# Without a token the server answers only to Host names a hostile web page
+# cannot make the browser send: localhost names and IP literals. Names used by
+# a reverse proxy or a tunnel go here (comma-separated); "*" turns the Host
+# check off entirely.
+ALLOWED_HOSTS = [
+    host.strip().lower().rstrip(".")
+    for host in os.environ.get("PP_ALLOWED_HOSTS", "").split(",")
+    if host.strip()
+]
+
+# Full browser origins (scheme://host[:port]) that may send state-changing
+# requests without a token besides the server's own origin: the public URL of
+# a reverse proxy or tunnel, e.g. https://pp.example.com. Matched exactly — a
+# name in PP_ALLOWED_HOSTS admits no other scheme or port of that name.
+ALLOWED_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get("PP_ALLOWED_ORIGINS", "").split(",")
+    if origin.strip()
+]
 
 # Escape hatch for the loopback guard on `pp server`: inside a container binding
 # 0.0.0.0 is normal (the security boundary is the host port publish, not the

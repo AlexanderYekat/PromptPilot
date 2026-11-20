@@ -18,6 +18,7 @@ function load(from, until) {
   assert.ok(start >= 0 && end > start);
   vm.runInContext(html.slice(start, end), context);
 }
+load('function workflowNeedsHuman(', 'function workflowOwnerInfo(');
 load('function workflowStopReason(', 'function workflowStageEditorCard(');
 load('function workflowPlannerFailure(', 'async function wfProviderChanged(');
 const wf = {status: 'awaiting_human', current_round: 0, config: {planning: {enabled: true}}};
