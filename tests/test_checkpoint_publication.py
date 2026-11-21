@@ -160,7 +160,9 @@ def test_cancellation_during_preparation_is_responsive_and_prevents_publication(
     thread = threading.Thread(target=resume)
     thread.start()
     try:
-        assert prepared.wait(10)
+        # Git preparation runs several subprocesses before the synchronization
+        # point. A slow Windows host can take longer to reach that point.
+        assert prepared.wait(60)
         # Another real task and cancellation both acquire the SQLite writer
         # while Git objects are prepared; neither waits on the checkpoint.
         from promptpilot.models import TaskCreate
