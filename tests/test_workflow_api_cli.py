@@ -332,6 +332,8 @@ def test_paused_series_rejects_run_now_and_bot_hides_control(isolated_db):
 def test_workflow_setup_preflight_accepts_repo_provider_and_gate(isolated_db, monkeypatch):
     monkeypatch.setattr("promptpilot.api.load_providers", lambda: {"test-provider": {"cmd": "test"}})
     monkeypatch.setattr("promptpilot.api.provider_available", lambda info: True)
+    # Exercise real probes without depending on cold process startup latency.
+    monkeypatch.setattr("promptpilot.api._PROBE_TIMEOUT", 90)
     response = request(
         "POST", "/api/workflows/validate-setup", json={
             "repository_path": str(Path(__file__).parents[1]),
@@ -419,6 +421,7 @@ def test_workflow_setup_preflight_stays_ready_without_gate_commands(isolated_db,
     workflow that deliberately runs without a functional gate.
     """
     preflight_providers(monkeypatch)
+    monkeypatch.setattr("promptpilot.api._PROBE_TIMEOUT", 90)
 
     result = preflight([]).json()
 
@@ -432,6 +435,7 @@ def test_workflow_setup_preflight_still_rejects_broken_gate_syntax(isolated_db, 
     """A parser that answered «no» is a real error — warning must not swallow it."""
     monkeypatch.setattr("promptpilot.api.load_providers", lambda: {"test-provider": {"cmd": "test"}})
     monkeypatch.setattr("promptpilot.api.provider_available", lambda info: True)
+    monkeypatch.setattr("promptpilot.api._PROBE_TIMEOUT", 90)
     response = request(
         "POST", "/api/workflows/validate-setup", json={
             "repository_path": str(Path(__file__).parents[1]),

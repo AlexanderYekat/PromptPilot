@@ -166,17 +166,19 @@ def test_crash_windows_through_public_advance(isolated_db, tmp_path, phase, init
     if phase == "live_effects":
         source += "; import time; time.sleep(2)"
     item = gating(isolated_db, tmp_path, commands=[command(source)])
-    unrelated = subprocess.Popen(
-        [sys.executable, "-c", "import time; time.sleep(15)"],
+    # Hold the unrelated process until testing the gate's cleanup is finished.
+    with subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read()"],
+        stdin=subprocess.PIPE,
         **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}),
-    )
-    try:
-        finish(launch(isolated_db, item, phase, marker), expected=17)
-        assert unrelated.poll() is None
-    finally:
-        if unrelated.poll() is None:
-            unrelated.kill()
-        unrelated.wait(timeout=5)
+    ) as unrelated:
+        try:
+            finish(launch(isolated_db, item, phase, marker), expected=17)
+            assert unrelated.poll() is None
+        finally:
+            if unrelated.poll() is None:
+                unrelated.kill()
+            unrelated.wait(timeout=5)
     rows = journal(isolated_db, item.id)
     assert (rows[0]["state"] if rows else None) == initial
     assert (len(marker.read_text()) if marker.exists() else 0) == effects
