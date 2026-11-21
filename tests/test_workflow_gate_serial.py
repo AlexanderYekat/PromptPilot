@@ -111,11 +111,14 @@ def assert_fenced(db, item):
 
 def test_two_process_public_advance_and_unrelated_primary_writes(isolated_db, tmp_path):
     marker, release = tmp_path / "effects", tmp_path / "release"
+    # Keep the gate held through the reader and writer assertions. The deadline
+    # only bounds cleanup if the test cannot signal release.
+    release_timeout = 60 if os.name == "nt" else 12
     source = (
         "from pathlib import Path; import time; "
         f"p=Path({str(marker)!r}); stream=p.open('a'); stream.write('x'); stream.close(); "
         f"release=Path({str(release)!r}); "
-        "deadline=time.monotonic()+12\n"
+        f"deadline=time.monotonic()+{release_timeout}\n"
         "while not release.exists() and time.monotonic()<deadline: time.sleep(.05)\n"
     )
     item = gating(isolated_db, tmp_path, commands=[command(source)])
@@ -435,7 +438,8 @@ def test_old_generation_fences_new_version_round_and_disabled_automation(isolate
 def test_public_outcomes_settle_with_honest_cleanup(isolated_db, tmp_path, monkeypatch, outcome):
     from promptpilot.models import WorkflowUpdate
 
-    item = gating(isolated_db, tmp_path, timeout_seconds=1, commands=[command(
+    timeout_seconds = 1 if outcome == "timeout" else 15
+    item = gating(isolated_db, tmp_path, timeout_seconds=timeout_seconds, commands=[command(
         "import time; time.sleep(2)" if outcome == "timeout" else
         "raise SystemExit(7)" if outcome == "fail" else "print('ok')")])
     if outcome in {"disabled", "empty"}:

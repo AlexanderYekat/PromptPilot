@@ -24,19 +24,23 @@ def gate_command(source):
 @pytest.mark.parametrize('inherit_output', [True, False])
 def test_real_gate_owns_descendants_after_wrapper_exit(isolated_db, tmp_path, inherit_output):
     pid_file = tmp_path/'gate-child.pid'
+    # Leave room for PowerShell and Python to start on Windows. The fixture
+    # processes must still outlive the gate and its cleanup allowance.
+    gate_timeout = 10 if os.name == 'nt' else 2
+    child_lifetime = 30 if os.name == 'nt' else 10
     output = '' if inherit_output else ', stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL'
     source = (
         'import subprocess, sys; from pathlib import Path; '
-        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)']"
+        f"child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep({child_lifetime})']"
         + output + '); '
         + f'Path({str(pid_file)!r}).write_text(str(child.pid), encoding="ascii")'
     )
     workflow = isolated_db.create_workflow(WorkflowCreate(
         slug='gate-process-lifetime', objective='Bound the real gate process tree',
         repository_path=str(tmp_path), candidate_branch='feature/gate-lifetime',
-        config={'gate': {'enabled': True, 'timeout_seconds': 2,
+        config={'gate': {'enabled': True, 'timeout_seconds': gate_timeout,
                          'commands': [gate_command(source)]}}))
-    unrelated = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+    unrelated = subprocess.Popen([sys.executable, '-c', f'import time; time.sleep({child_lifetime + 20})'])
     descendant = None
     try:
         started = time.monotonic()
@@ -44,7 +48,7 @@ def test_real_gate_owns_descendants_after_wrapper_exit(isolated_db, tmp_path, in
         elapsed = time.monotonic() - started
         assert pid_file.exists(), 'gate wrapper did not start the fixture child'
         descendant = int(pid_file.read_text(encoding='ascii'))
-        assert elapsed < 7, f'gate timeout exceeded its process-tree bound: {elapsed}'
+        assert elapsed < gate_timeout + 5, f'gate timeout exceeded its process-tree bound: {elapsed}'
         assert decision.verdict == (GateVerdict.FAIL if inherit_output else GateVerdict.PASS)
         assert _wait_not_running(descendant, timeout=3), 'gate descendant survived wrapper completion'
         assert unrelated.poll() is None, 'gate cleanup selected an unrelated process'
@@ -55,6 +59,6 @@ def test_real_gate_owns_descendants_after_wrapper_exit(isolated_db, tmp_path, in
             if descendant is None and pid_file.exists():
                 descendant = int(pid_file.read_text(encoding='ascii'))
             if descendant is not None:
-                assert _wait_not_running(descendant, timeout=12)
+                assert _wait_not_running(descendant, timeout=child_lifetime + 2)
         finally:
             _stop_unrelated(unrelated)
