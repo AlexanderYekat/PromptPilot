@@ -90,8 +90,11 @@ def cli_peer(tmp_path):
                        PYTHONIOENCODING='utf-8',
                        ROUTING_FAKE_PYTHON=sys.executable,ROUTING_FAKE_SCRIPT=str(script))
     def run(*args):
+        # Each command can launch the executable peer repeatedly. Slow Windows
+        # process startup can exceed the 90-second harness deadline.
+        timeout = 240 if os.name == 'nt' else 90
         result=subprocess.run([sys.executable,'-X','utf8','-m','promptpilot.project_pipeline','--config',str(path),*args],
-            cwd=Path(__file__).resolve().parents[1],env=environment,capture_output=True,text=True,encoding='utf-8',timeout=90,
+            cwd=Path(__file__).resolve().parents[1],env=environment,capture_output=True,text=True,encoding='utf-8',timeout=timeout,
             **({'creationflags':subprocess.CREATE_NO_WINDOW} if os.name=='nt' else {}))
         return result.returncode,json.loads(result.stdout)
     run.environment=environment
