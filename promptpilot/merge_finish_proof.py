@@ -11,6 +11,7 @@ import re
 import subprocess
 
 from . import base_sync_carry, project_pipeline as pp
+from .merge_ship_authorization import intent_line
 from .review_routing_policy import require_legacy
 
 
@@ -225,9 +226,10 @@ def _history(gh, config, checkpoint):
     if len(intents) != 1 or len(dones) > 1:
         raise OutsideScope("terminal route requires a unique first-hop intent and at most one done")
     saved = intents[0]
+    marker = intent_line(saved["body"])
     _need(
         pp.comment_id(saved) == intent
-        and saved["body"] == intent_body
+        and marker and marker[0] == intent_body
         and saved["lastEditedAt"] is None
         and saved["author"]["login"] == TRUSTED,
         "checkpoint differs from canonical intent",
@@ -285,7 +287,12 @@ def _check_addressed(gh, config, number, snap, ids):
     _need(pp.canonical(verified) == pp.canonical(snap), "full timeline changed during addressed proof")
 
 
-def observe_receipt(gh, record, *, config):
+def observe_receipt(gh, record, *, config, expected_node_id=None):
+    receipt = observe_delivery(gh, record, config=config, expected_node_id=expected_node_id)
+    return receipt[0] if receipt else None
+
+
+def observe_delivery(gh, record, *, config, expected_node_id=None):
     """Look up an uncertain send for just its recorded PR, including after REVIEW/merge.
 
     This only settles the local send journal. The original immutable intent and
@@ -332,18 +339,16 @@ def observe_receipt(gh, record, *, config):
         or hashlib.sha256(done["body"].encode("utf-8")).hexdigest() != record["body_sha256"]
     ):
         return None
-    match = re.fullmatch(
-        rf"<!-- pp:base-sync-intent from={old} base={base} review-comment=[1-9][0-9]* "
-        r"claim=[1-9][0-9]* completion=[1-9][0-9]* ship-event=([A-Za-z0-9_=-]+) previous=none -->",
-        saved["body"],
-    )
-    if not match:
+    general = record.get("proof_kind") == "legacy-general-done-v1"
+    marker = intent_line(saved["body"])
+    if not marker or marker[1] != old or (not general and (marker[2] != base or marker[7] != "none")):
         return None
-    ship = match[1]
-    expected = f"{prefix}from={old} to={head} base={base} previous=none ship-event={ship} -->"
+    ship, previous = marker[6], marker[7]
+    expected = f"{prefix}from={old} to={head} base={base} previous={previous} ship-event={ship} -->"
     order = [n.get("id") for n in nodes]
     if (
         done["body"] != expected
+        or expected_node_id is not None and done["id"] != expected_node_id
         or not all(isinstance(i, str) and i for i in order)
         or len(set(order)) != len(order)
         or not 0 < (pp.comment_id(done) or 0) < 2**63
@@ -362,7 +367,10 @@ def observe_receipt(gh, record, *, config):
     _comment_readback(gh, number, saved, saved["body"])
     _comment_readback(gh, number, done, expected)
     _check_addressed(gh, config, number, snap, [ship, saved["id"], done["id"]])
-    return pp.comment_id(done)
+    state, current_head = snap.get("state"), snap.get("headRefOid")
+    _need(state in {"OPEN", "CLOSED", "MERGED"} and isinstance(current_head, str)
+          and re.fullmatch("[0-9a-f]{40}", current_head), "incomplete receipt PR state")
+    return pp.comment_id(done), state == "OPEN" and current_head == head
 
 
 def _observe(gh, config, checkpoint, working_dir, *, verify_tree):

@@ -75,6 +75,56 @@ def agrees_with_source(data, lease, checkpoint):
             and all(candidate.get(k) == checkpoint[k] for k in ("from", "base", "to")))
 
 
+def confirmation_source(data, profile_id, profile, admission):
+    """A busy sampler can coexist with this election's still-current publication."""
+    from . import db, pipeline_insights as pi
+
+    cache = data.get("cache") or {}
+    if cache.get("refresh_blocked") != "scan_in_progress":
+        return data
+    lease = admission.get("_lease")
+    if (admission.get("allowed") is not True or lease is None
+            or getattr(pi._scan_lease_context, "lease", None) is not lease
+            or lease.scope != pi._GITHUB_SCAN_LEASE_SCOPE or lease.lost or lease.unavailable
+            or type(lease.status_revision) is not int or lease.status_revision <= 0):
+        return data
+    guard = pi._wake_cache_guard(profile_id, profile, cache)
+    if not guard or not 0 <= time.time() - guard["generated_at"] < pi._CACHE_TTL_SECONDS:
+        return data
+    try:
+        with db._connect() as conn:
+            conn.execute("BEGIN")
+            if (not db._pipeline_scan_lease_guard_matches(conn, lease.guard)
+                    or not db._pipeline_cache_guard_matches(conn, guard)):
+                return data
+            row = conn.execute("SELECT value FROM settings WHERE key=?",
+                               (db._pipeline_refresh_status_key(profile_id),)).fetchone()
+            if not row:
+                return data
+            event = json.loads(row[0])
+            status = event["status"]
+            budget = status["github_budget"]
+            # Successful acquisitions and busy observations receive unique,
+            # ordered revisions in the same SQLite writer transaction. A busy
+            # decision newer than this still-owned lease observed this owner.
+            if (event["version"] != 1 or event["repository"] != profile["repository"]
+                    or type(event["revision"]) is not int or event["revision"] <= lease.status_revision
+                    or status["refresh_blocked"] != "scan_in_progress"
+                    or status["refresh_deferred_until"] != cache.get("refresh_deferred_until")
+                    or budget["state"] != "scan_in_progress" or budget["allowed"] is not False
+                    or budget["budget_route"] != "insights" or budget["lease_scope"] != lease.scope
+                    or pi._source_checker_failure_revision(event, profile) >
+                       pi._source_checker_verified_revision(data, event)):
+                return data
+    except (OSError, sqlite3.Error, KeyError, AttributeError, TypeError, ValueError):
+        return data
+    # The caller still checks complete/current queue, checker, owner and graph.
+    # Leave the shared cache and the dashboard's explanation unchanged.
+    result_cache = dict(cache)
+    result_cache.pop("refresh_blocked")
+    return dict(data, cache=result_cache)
+
+
 def _wait_key(task):
     # One bounded observation per ordinary series, never a cross-task gate.
     return f"pipeline_merge_source_wait:v1:{task.series_id}"
@@ -218,6 +268,94 @@ def _gate_file(task_id, path):
     return lease, token
 
 
+def _passive_source_state(conn, lease, profile_id, profile, data):
+    from . import pipeline_insights as pi, pipeline_item_holds as holds
+
+    target = lease["target"]
+    if not isinstance(data, dict):
+        raise ValueError("passive Source read unavailable")
+    health = data.get("diagnostics") or {}
+    cache = data.get("cache") or {}
+    token = cache.get("token") or {}
+    if not isinstance(token, dict) or not isinstance(health, dict):
+        raise ValueError("malformed cached MERGE observation")
+    owner = health.get("integration_owner") or {}
+    if (not isinstance(owner, dict) or target["stage"] not in {"merge", RECOVERY}
+            or owner.get("base_sync_candidate") is not None
+            or _load(conn, profile_id, lease, target["number"], target["head"]) is not None
+            or conn.execute("SELECT 1 FROM settings WHERE key=?",
+                            (pending_key(lease["repository"], target),)).fetchone()):
+        raise ValueError("post-update or unresolved MERGE send requires canonical reconciliation")
+    expected = dict(target)
+    if owner.get("stage") == RECOVERY:
+        expected["stage"] = RECOVERY
+    fallback_handoff.health_gate(health, "merge", expected, election=True)
+    queues = [q for q in data.get("queues", []) if q.get("id") == "merge"]
+    if (data.get("profile_id") != profile_id or data.get("repository") != lease["repository"]
+            or health.get("errors") or health.get("checker_failed")
+            or cache.get("complete") is not True or cache.get("available") is not True
+            or len(queues) != 1 or queues[0].get("membership_complete") is not True
+            or token.get("profile_hash") != pi._profile_fingerprint(profile)
+            or type(token.get("revision")) is not int or type(token.get("epoch")) is not int):
+        raise ValueError("passive MERGE observation requires a complete same-profile Source")
+    blocked = cache.get("refresh_blocked")
+    if blocked and blocked not in holds._SOURCE_WAITS:
+        raise ValueError("unrecognized Source refusal")
+    if blocked:
+        state = blocked
+    elif cache.get("invalidated") is True:
+        state = "invalidated"
+    elif cache.get("stale") is True:
+        state = "stale"
+    elif pi._required_snapshot_state(data, profile, "merge") is None:
+        state = None
+    else:
+        raise ValueError("unclear Source state")
+
+    return state, token
+
+
+def _pre_send_wait(conn, task, lease, gate, profile_id, profile, data):
+    from . import pipeline_item_holds as holds
+
+    target = lease["target"]
+    # Collect this election's exact records, never a successor's baseline.
+    records = {}
+    for key in (holds._attempt_key(task.id), holds.BASELINE + str(task.series_id)):
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        if row:
+            baseline = json.loads(row["value"])
+            proof = baseline.get("merge_source_election") or {}
+            if (baseline.get("task_id") == task.id and proof.get("started_at") == task.started_at.isoformat()
+                    and proof.get("gate") == gate and proof.get("number") == target["number"]
+                    and proof.get("head") == target["head"]):
+                records[key] = baseline
+    if not records:
+        raise ValueError("ordinary MERGE election baseline is absent")
+    state, error = None, None
+    try:
+        state, token = _passive_source_state(conn, lease, profile_id, profile, data)
+        for baseline in records.values():
+            initial = baseline["merge_source_election"].get("source_token") or {}
+            if (initial.get("profile_hash") != token["profile_hash"]
+                    or type(initial.get("revision")) is not int or initial["revision"] > token["revision"]
+                    or type(initial.get("epoch")) is not int or initial["epoch"] > token["epoch"]):
+                raise ValueError("Source is outside this ordinary election")
+    except (pp.PipelineError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        state, error = None, str(exc)
+    # An authenticated later refusal also invalidates an earlier wait receipt.
+    for key, baseline in records.items():
+        baseline["merge_source_election"]["wait"] = state
+        conn.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(baseline), key))
+    if error is not None:
+        return {"state": "refused", "reason": error, "product_mutation_authorized": False}
+    result = {"state": "wait" if state else "observed", "reason": state,
+              "number": target["number"], "head": target["head"], "product_mutation_authorized": False}
+    if state:
+        result["result_line"] = f"ИТОГ: ПУСТО — нет допуска: {state}"
+    return result
+
+
 def _apply(args, env):
     raw = env.get("PP_TASK_ID", "")
     marker = env.get("PP_TASK_STARTED_AT")
@@ -236,11 +374,19 @@ def _apply(args, env):
         raise ValueError("MERGE checkpoint requires costed Native admission")
     lease, token = _gate_file(task_id, args.lease_file)
     target = lease["target"]
+    passive = args.operation == "source-wait"
     if (lease.get("target_reservation") or lease["repository"] != profile.get("repository")
-            or target["number"] != args.number or not SHA.fullmatch(args.to)):
+            or target["number"] != args.number or not SHA.fullmatch(args.old if passive else args.to)):
         raise ValueError("MERGE checkpoint target differs from the signed ordinary election")
+    data = None
+    if passive:
+        try:
+            data = pi.read_cached(args.profile, db.list_series())
+        except (OSError, sqlite3.Error, TypeError, ValueError, KeyError, RuntimeError):
+            # Still invalidate any previous observation after fencing the exact attempt.
+            pass
     reading = args.operation == "read"
-    recovery = target["stage"] == RECOVERY and target["head"] == args.to
+    recovery = not passive and target["stage"] == RECOVERY and target["head"] == args.to
     # Any validated MERGE stage can update its elected old HEAD if the base advances.
     # Only recovery elected at the new HEAD can read or reconstruct that transition.
     if not recovery and (reading or target["head"] != args.old):
@@ -254,6 +400,8 @@ def _apply(args, env):
         if (guard["route"] != "fallback_targeted" or guard["started_at"] != marker
                 or row["merge_checkpoint_gate"] != pp.digest([marker, token])):
             raise ValueError("checkpoint requires this attempt's admitted gate lease")
+        if passive:
+            return _pre_send_wait(conn, task, lease, row["merge_checkpoint_gate"], args.profile, profile, data)
         saved = _load(conn, args.profile, lease, args.number, args.to)
         if reading:
             state = "found" if saved else "missing"
@@ -266,19 +414,64 @@ def _apply(args, env):
                 key = _key(args.profile, lease["repository"], args.number, args.to, lease["config_sha256"])
                 conn.execute("INSERT INTO settings (key,value) VALUES (?,?)", (key, json.dumps(facts)))
             saved, state = facts, "recorded"
-    return {"state": state, "checkpoint": saved, "product_mutation_authorized": False}
+            transferred = _handoff(conn, task, lease, row["merge_checkpoint_gate"], facts)
+    result = {"state": state, "checkpoint": saved, "product_mutation_authorized": False}
+    if not reading and transferred:
+        result.update(next_step="native-confirmation", result_line="ИТОГ: ПУСТО — ожидание подтверждения обновления ветки")
+    return result
+
+
+def _handoff(conn, task, lease, gate, facts):
+    """Transfer only the managed ordinary attempt. A new native election re-proves every fact."""
+    from . import pipeline_item_holds as holds
+    target = lease["target"]
+    transferred = False
+    for key in (holds._attempt_key(task.id), holds.BASELINE + str(task.series_id)):
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        if row is None:
+            continue
+        measured = json.loads(row["value"])
+        election = measured.get("merge_source_election") or {}
+        if (measured.get("task_id") != task.id or election.get("native_done") is not True
+                or election.get("started_at") != task.started_at.isoformat() or election.get("gate") != gate
+                or (election.get("number"), election.get("head")) != (target["number"], target["head"])):
+            continue
+        election["handoff"] = facts
+        conn.execute("UPDATE settings SET value=? WHERE key=?", (json.dumps(measured), key))
+        transferred = True
+    return transferred
+
+
+def handed_off(conn, series_id, task_id, raw):
+    """Only this attempt's recorded transfer may skip creation of a failure hold."""
+    try:
+        measured = json.loads(raw)
+        election = measured["merge_source_election"]
+        checkpoint = election["handoff"]
+        target = measured["review_target"]
+        task = conn.execute("SELECT series_id,started_at,merge_checkpoint_gate FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return bool(task and task["series_id"] == series_id and measured["task_id"] == task_id
+                    and election["native_done"] is True and task["started_at"] == election["started_at"]
+                    and task["merge_checkpoint_gate"] and task["merge_checkpoint_gate"] == election["gate"]
+                    and target == {"stage": "merge", "number": checkpoint["number"], "head": election["head"]}
+                    and election["number"] == checkpoint["number"] and election["head"] in (checkpoint["from"], checkpoint["to"])
+                    and _load(conn, checkpoint["profile"], checkpoint, checkpoint["number"], checkpoint["to"]) == checkpoint)
+    except (ValueError, TypeError, KeyError):
+        return False
 
 
 def add_arguments(parser):
     operations = parser.add_subparsers(dest="operation", required=True)
-    for name in ("record", "read"):
+    for name in ("record", "read", "source-wait"):
         op = operations.add_parser(name)
         op.add_argument("--profile", required=True)
         op.add_argument("--number", required=True, type=int)
-        op.add_argument("--to", required=True)
         op.add_argument("--lease-file", required=True)
-        if name == "record":
+        if name != "source-wait":
+            op.add_argument("--to", required=True)
+        if name != "read":
             op.add_argument("--from", dest="old", required=True)
+        if name == "record":
             op.add_argument("--base", required=True)
             op.add_argument("--tree", required=True)
             op.add_argument("--intent", required=True, type=int)

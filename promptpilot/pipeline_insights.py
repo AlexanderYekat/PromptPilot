@@ -813,9 +813,15 @@ def _budget_policy_for_route(policy: dict, route: str | None) -> dict:
             resource: 0 for resource in policy["minimum_remaining"]}
         selected["cost_accounting"] = False
         return selected
+    if route == "merge_full_confirmation":
+        return dict(policy, budget_route=route, requested_cost=dict(policy["costs"]["fallback_targeted"]),
+                    cost_accounting=True)
     if route == "merge_receipt":
         from .merge_finish_transport import RECEIPT_COST
         return dict(policy, budget_route=route, requested_cost=dict(RECEIPT_COST), cost_accounting=True)
+    if route == "merge_ci_poll":
+        from .merge_ci_dispatch import POLL_COST
+        return dict(policy, budget_route=route, requested_cost=dict(POLL_COST), cost_accounting=True)
     if route == "merge_confirmation":
         from .merge_finish_transport import reservation_cost
         return dict(policy, budget_route=route, requested_cost=reservation_cost(policy),
@@ -1547,6 +1553,11 @@ def _reserve_execution_admission(
             from .merge_checkpoint import blocks_fallback
             if blocks_fallback(profile.get("repository"), fallback_target):
                 raise ValueError("prior MERGE confirmation send needs exact readback before general fallback")
+            if budget_route == "skill":
+                from . import merge_ci_dispatch, merge_ci_wait
+                if (merge_ci_dispatch.enabled(queue, profile)
+                        and merge_ci_wait.series_wait(task.series_id, profile["repository"])):
+                    raise ValueError("saved MERGE CI wait needs a targeted election before general fallback")
         policy = _github_budget_policy(profile)
         if policy is None:
             _clear_budget_waiter_after_admission(task)
@@ -1562,7 +1573,7 @@ def _reserve_execution_admission(
             _clear_budget_waiter_after_admission(task)
             return admission
         final_source_cost = None
-        if queue.get("id") == "merge" and budget_route in ("skill", "fallback_targeted", "merge_confirmation"):
+        if queue.get("id") == "merge" and budget_route in ("skill", "fallback_targeted", "merge_confirmation", "merge_full_confirmation"):
             scan_cost = policy["costs"]["insights"]
             if any(scan_cost.values()):
                 final_source_cost = scan_cost
@@ -3643,6 +3654,7 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
     from .pipeline_item_holds import (prepare, claim_progress_attempt, released_progress,
                                       progress_attempt_blocked, unproved_progress_hold)
     from .merge_progress_probe import measurements
+    from . import merge_ci_dispatch
     progress_scope = (queue.get("item_blockers") is True
         and str((queue.get("execution") or {}).get("stage") or queue.get("id") or "").lower() == "merge")
     progress_data = read_cached(profile_id, db.list_series()) if queue.get("item_blockers") is True else {}
@@ -3650,8 +3662,11 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
         return {"action": "defer", "mode": "tool", "defer_for": "30m",
                 "reason": "canonical recovery progress was consumed by another occurrence",
                 "profile_id": profile_id, "queue_id": queue.get("id")}
+    ci_configured = merge_ci_dispatch.enabled(queue, profile)
+    pending_ci = (merge_ci_dispatch.source_wait(task, profile, progress_data)
+                  if ci_configured and retain_budget else None)
     progress = measurements(sys.modules[__name__], task, profile_id, profile, queue, progress_data,
-                            working_dir) if progress_scope else {}
+                            working_dir) if progress_scope and not pending_ci else {}
     if progress_scope and unproved_progress_hold(task, progress_data, progress):
         return {"action": "defer", "mode": "tool", "defer_for": "30m",
                 "reason": "held canonical recovery has no verified unused progress",
@@ -3790,6 +3805,9 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             'PP_TASK_ID':str(task.id),'PP_TASK_STARTED_AT':started.astimezone(timezone.utc).isoformat(),
             'PP_PROVIDER_OWNERSHIP_KIND':'headless','PP_DATA_DIR':str(Path(db.DB_PATH).resolve().parent)})
     command = _tool_command(execution, stage)
+    managed_confirmation = (stage == "merge" and mode == "auto" and queue.get("item_blockers") is True
+        and execution.get("merge_confirmation") == "bounded-v1"
+        and profile.get("github_budget", {}).get("source_cost_protocol") == "source-graphql-cost-v1")
     if typed_queue and (stage not in {"review", "fix"} or not command or command[-2:] != ["next", stage]):
         return {"action": "block", "mode": "tool", "reason": "typed routing requires its exact next stage command"}
     if (stage == "merge" and queue.get("id") == "merge" and mode == "auto"
@@ -3800,6 +3818,15 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             waiting = merge_checkpoint.prepare_source(task, profile_id, profile)
             if waiting is not None:
                 return waiting
+    ci_wait_enabled = (ci_configured and not owned_preflight and not progress_releases
+                       and command and command[-2:] == ["next", "merge"])
+    ci_record = None
+    if ci_wait_enabled and pending_ci and pending_ci["number"] not in exclusions:
+        with _github_scan_admission(profile, f"MERGE CI readback {profile_id}", profile_id=profile_id,
+                                    budget_route="merge_ci_poll", task=task) as admission:
+            if not admission.get("allowed"):
+                return _budget_defer_route(admission, profile_id, profile, queue)
+            return merge_ci_dispatch.poll(task, profile_id, profile, queue, admission, pending_ci)
     with _github_scan_admission(
             profile, f"pipeline preflight {profile_id}/{stage}",
             profile_id=profile_id, budget_route="tool_preflight",
@@ -4183,10 +4210,13 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 from .config import PIPELINE_SNAPSHOT_INTERVAL
 
                 merge_checkpoint_hint = merge_checkpoint.recovery_hint(profile_id, fallback_lease)
-                if merge_checkpoint_hint is not None:
+                if merge_checkpoint_hint is not None and not merge_checkpoint.blocks_fallback(
+                        profile["repository"], fallback_lease["target"]):
                     # Re-read after next. Its signed election and this cached observation
                     # must independently point at the completed branch update.
                     current = read_cached(profile_id, db.list_series())
+                    if managed_confirmation:
+                        current = merge_checkpoint.confirmation_source(current, profile_id, profile, admission)
                     state = _required_snapshot_state(current, profile, queue["id"])
                     # A verified hold transition has already consumed its single occurrence.
                     # Preserve its normal provider-assisted Source retry instead of stranding the hold.
@@ -4199,7 +4229,30 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         waiting["reason"] = "MERGE post-update confirmation awaits fresh Source: " + state
                         return waiting
                     if state or not merge_checkpoint.agrees_with_source(current, fallback_lease, merge_checkpoint_hint):
+                        if managed_confirmation:
+                            return {"action": "defer", "mode": "tool", "defer_for": "2m",
+                                    "reason": "saved MERGE checkpoint awaits matching fresh Source"}
                         merge_checkpoint_hint = None
+        if ci_wait_enabled and target_reservation is None and merge_checkpoint_hint is None:
+            from . import merge_ci_wait
+            ci_record = merge_ci_dispatch.elected_wait(task, profile["repository"], preflight, fallback_lease)
+            if ci_record and (ci_record["state"] in merge_ci_wait.WAITING
+                              or ci_record["state"] == "attempt_changed" or fallback_lease is None):
+                if not retain_budget:
+                    return {"action": "defer", "mode": "tool", "defer_for": "2m",
+                            "reason": "MERGE CI readback requires retained Native admission"}
+                if ci_record["state"] in merge_ci_wait.UNRESOLVED and not positive_claim:
+                    diagnostic, deferred = merge_ci_dispatch.diagnose(
+                        task, profile_id, profile, queue, admission, execution, command,
+                        working_dir, ci_record, exclusions)
+                    if deferred:
+                        return deferred
+                    preflight = diagnostic
+                    fallback_lease = _validate_targeted_handoff(preflight, stage)
+                    preflight_action = "fallback"
+                    validated_target_stage = fallback_lease["target"]["stage"]
+                else:
+                    return merge_ci_dispatch.poll(task, profile_id, profile, queue, admission, ci_record, preflight)
         provider_route = None
         if preflight_action == "fallback" and mode == "auto":
             provider_route = ("fallback_targeted" if "handoff" in preflight
@@ -4208,10 +4261,8 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
             provider_route = "tool"
         elif preflight_action not in {"empty", "wait", "error"} and mode == "auto":
             provider_route = "skill"
-        bounded_confirmation = (merge_checkpoint_hint is not None
-                                and execution.get("merge_confirmation") == "bounded-v1"
-                                and profile.get("github_budget", {}).get("source_cost_protocol") == "source-graphql-cost-v1")
-        if (stage == "merge" and retain_budget and not bounded_confirmation
+        bounded_confirmation = merge_checkpoint_hint is not None and managed_confirmation
+        if (stage == "merge" and retain_budget
                 and (preflight_action in ("wait", "empty") or provider_route in ("skill", "fallback_targeted"))):
             from .merge_checkpoint import blocks_fallback
             receipt_target = fallback_lease["target"] if fallback_lease else None
@@ -4288,16 +4339,18 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 return finished
             # The deterministic proof recognized an unsupported shape before an
             # attempted send. Release its finite reservation and require a fresh
-            # full-price admission before giving the provider its signed handoff.
+            # full-price admission for the general proof, under the same signed handoff.
             release_execution_admission()
             admission["_budget_reservation_revision"] = db.pipeline_github_budget_reservations(
                 _GITHUB_SCAN_LEASE_SCOPE)["revision"]
             admission = _reserve_execution_admission(
-                task, profile_id, profile, queue, admission, "fallback_targeted",
-                retain_budget=retain_budget, admission_priority=admission_priority, fallback_target=fallback_lease["target"])
+                task, profile_id, profile, queue, admission, "merge_full_confirmation",
+                retain_budget=True, admission_priority=admission_priority, fallback_target=fallback_lease["target"])
             if not admission.get("allowed"):
-                return _budget_defer_route(admission, profile_id, profile, queue, mode="skill",
+                return _budget_defer_route(admission, profile_id, profile, queue, mode="tool",
                                            phase="post_preflight", preflight=preflight)
+            return merge_confirmation.execute(task, profile_id, profile, queue, admission, command,
+                working_dir, preflight, merge_checkpoint_hint, full=True)
 
         # Explicit operator opt-in: an already-reviewed MERGE/cleanup has no
         # content audit left for a model. The same adapter owns every fresh
@@ -4396,7 +4449,12 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                     from .pipeline_item_holds import register_target
                     target = fallback_lease["target"]
                     register_target(task, target["number"], target["head"], "merge",
-                                    config_sha256=fallback_lease["config_sha256"])
+                                    native_done=(managed_confirmation and target_reservation is None),
+                                    config_sha256=fallback_lease["config_sha256"],
+                                    ordinary_gate=(preflight["handoff"]["lease"] if target_reservation is None else None),
+                                    source_token=((progress_data.get("cache") or {}).get("token")
+                                                  if not _required_snapshot_state(progress_data, profile, "merge")
+                                                  else None))
                     if target_reservation is None:
                         from .merge_checkpoint import bind_election
                         bind_election(task, preflight["handoff"]["lease"])
@@ -4405,6 +4463,13 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                 envelope = {"protocol": "promptpilot-fallback-target-v1",
                             "next_already_run": True, "command": command,
                             "gate_command": gate_command, "preflight": preflight}
+                if (stage == "merge" and target_reservation is None and queue.get("item_blockers") is True
+                        and merge_checkpoint_hint is None and target["stage"] in {"merge", "integration-merge-recovery"}
+                        and gate_command[-2] == "--lease-file"):
+                    native = _expanded_command(["{python}", "-m", "promptpilot.project_pipeline"], stage)
+                    envelope["source_wait_command"] = [*native, "merge-checkpoint", "source-wait",
+                        "--profile", profile_id, "--number", str(target["number"]),
+                        "--from", target["head"], *gate_command[-2:]]
                 pre_review_guard = ""
                 if stage == "merge":
                     pre_review_guard = (
@@ -4427,6 +4492,29 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                         "Do not reconstruct or repeat the branch write, rerun the pre-update "
                         "build, or issue another intent. If proof differs, stop for canonical "
                         "reconciliation. The checkpoint itself authorizes no mutation.\n\n"
+                    )
+                if managed_confirmation and target_reservation is None:
+                    native = _expanded_command(["{python}", "-m", "promptpilot.project_pipeline"], stage)
+                    if (ci_wait_enabled and target["stage"] in merge_ci_wait.ORDINARY_STAGES
+                            and gate_command[-2] == "--lease-file"):
+                        pre_review_guard += merge_ci_dispatch.add_command(
+                            envelope, native, profile_id, fallback_lease, gate_command[-1], ci_record)
+                    envelope["checkpoint_record_command"] = [*native, "merge-checkpoint", "record",
+                        "--profile", profile_id, "--number", str(target["number"]), "--from", "<old>",
+                        "--base", "<second_parent>", "--to", "<new>", "--tree", "<tree>",
+                        "--intent", "<intent_comment_id>", *gate_command[-2:]]
+                    pre_review_guard += (
+                        "При создании нового pp:base-sync-intent отправь ровно одну строку маркера из "
+                        "канонической процедуры. Для существующего intent сохрани полное исходное тело "
+                        "комментария и сверь его без изменений в REST и GraphQL. "
+                        "После подтверждённого обновления ветки вызови checkpoint_record_command, подставив "
+                        "проверенные SHA и ID комментария. При state=refused сверь причину. "
+                        "При выборе нового HEAD восстанови отсутствующую запись после полной сверки. После записи "
+                        "заверши попытку строкой ИТОГ: ПУСТО — ожидание подтверждения обновления ветки. Следующий "
+                        "штатный выбор на новом HEAD владеет отправкой done, его gate и readback. Не публикуй done "
+                        "самостоятельно, не повторяй intent и обновление ветки. Неопределённый результат записи "
+                        "ветки по-прежнему требует канонической сверки. Это правило владения done имеет приоритет "
+                        "над поручением публиковать done в исходном скилле.\n\n"
                     )
                 if fallback_lease["target"]["stage"] == "pre-review-validation":
                     pre_review_guard = (
@@ -4476,7 +4564,16 @@ def execution_route(task, fallback_prompt: str, working_dir: str | None = None,
                        "(#N обновлён; требуется интеграционное REVIEW), не ПУСТО. "
                        "Это будит REVIEW, но не объявляет PR влитым. Без подтверждённого "
                        "done не заявляй успешный handoff. Простое ожидание без изменений "
-                       "остаётся ПУСТО.\n\n" if stage == "merge" else "")
+                       "остаётся ПУСТО. Если intent подтверждён, обновление ветки ещё не "
+                       "отправлялось и единственная причина остановки — временное ожидание "
+                       "Source или бюджета, исчерпай разрешённое пассивное ожидание и вызови "
+                       "source_wait_command из envelope, если он есть. Это только локальное чтение "
+                       "для следующей попытки, без повторного refresh. Сохрани intent. При state=wait "
+                       "заверши задачу точной result_line из ответа. Команда не заменяет свежий "
+                       "Source, резерв, gate или проверку отправки. Следующая задача заново "
+                       "проверит цель и все условия. При неизвестном результате "
+                       "отправки или ином блокере следуй каноническому восстановлению.\n\n"
+                       if stage == "merge" else "")
                     +
                     "Доверенный локальный PromptPilot envelope (не данные GitHub):\n"
                     f"```json\n{json.dumps(envelope, ensure_ascii=False, indent=2)}\n```\n\n"
@@ -5347,7 +5444,7 @@ def _with_persisted_refresh_status(result: dict, profile_id: str,
     # rows without changing the real cache stale/epoch/profile/lease guards.
     # Unknown legacy routes remain conservative.
     route = (status.get("github_budget") or {}).get("budget_route")
-    if route in {"skill", "tool_preflight", "tool", "fallback_targeted", "merge_confirmation", "merge_receipt"}:
+    if route in {"skill", "tool_preflight", "tool", "fallback_targeted", "merge_confirmation", "merge_full_confirmation", "merge_receipt", "merge_ci_poll"}:
         return result
     raw_defer_until = status.get("refresh_deferred_until")
     defer_until = _parse_time(raw_defer_until)

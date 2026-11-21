@@ -430,7 +430,8 @@ def register_review_target(task, number, head):
     register_target(task, number, head, "review")
 
 
-def register_target(task, number, head, stage, *, config_sha256=None):
+def register_target(task, number, head, stage, *, config_sha256=None, ordinary_gate=None, source_token=None,
+                    native_done=False):
     """Remember a validated tool election, never an executor's claimed target."""
     if (stage not in {"review", "merge"}
             or not getattr(task, "series_id", None) or type(number) is not int or number <= 0
@@ -449,6 +450,15 @@ def register_target(task, number, head, stage, *, config_sha256=None):
                 or measured.get("config_sha256") != config_sha256):
             baseline["canonical_progress"] = {}
     baseline["review_target"] = {"number": number, "head": head.lower(), "stage": stage}
+    baseline.pop("merge_source_election", None)
+    if stage == "merge" and ordinary_gate and (started := _running_attempt(task)) is not None:
+        from .project_pipeline import digest
+        baseline["merge_source_election"] = {
+            "head": head.lower(), "number": number, "started_at": started,
+            "gate": digest([started, ordinary_gate]), "source_token": source_token,
+        }
+        if native_done:
+            baseline["merge_source_election"]["native_done"] = True
     db.set_setting(MODE + str(task.series_id), "1")
     db.set_setting(key, json.dumps(baseline))
     if db.get_setting(_attempt_key(task.id)):
@@ -459,6 +469,29 @@ def _hold_matches_identity(hold, identity):
     # Older exact REVIEW holds omitted stage; prepare() treats them as review.
     return all(hold.get(key, "review" if key == "stage" else None) == value
                for key, value in identity.items())
+
+
+_SOURCE_WAITS = {"low", "budget_in_flight", "scan_in_progress", "priority_waiter",
+                 "fairness_waiter", "ledger_changed"}
+
+
+def _retryable_merge_wait(conn, measured, target, task_id, result):
+    """Only the Native pre-send observer can attest this exact terminal code."""
+    proof = measured.get("merge_source_election") or {}
+    if (not isinstance(proof, dict) or target.get("stage") != "merge"
+            or proof.get("head") != target.get("head") or proof.get("number") != target.get("number")):
+        return False
+    wait = proof.get("wait")
+    if not isinstance(wait, str) or wait not in _SOURCE_WAITS | {"invalidated", "stale"}:
+        return False
+    task = conn.execute("SELECT started_at,merge_checkpoint_gate FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if (not task or not task["merge_checkpoint_gate"] or task["merge_checkpoint_gate"] != proof.get("gate")
+            or not task["started_at"] or task["started_at"] != proof.get("started_at")):
+        return False
+    lines = str(result or "").partition("--- Meta ---")[0].strip().splitlines()
+    expected = f"ИТОГ: НЕ СМОГ (#{target['number']} — нет допуска: {wait})"
+    return bool(lines and lines[-1].strip() == expected
+                and sum(line.lstrip().startswith("ИТОГ:") for line in lines) == 1)
 
 
 def _baseline_progress(conn, measured, target, task_id, series_id):
@@ -478,8 +511,8 @@ def _baseline_progress(conn, measured, target, task_id, series_id):
     return value
 
 
-def record(conn, series_id, task_id, verdict, result):
-    """Called inside recurrence's existing transaction; return True if held.
+def handle_blocker(conn, series_id, task_id, verdict, result):
+    """Return True if the scoped blocker was parked or is a verified ordinary wait.
 
     Explicit HUMAN targets require measured state. UNABLE requires an exact tool
     election or an opted-in, fresh checker-measured FIX rework. Unscoped failures
@@ -493,6 +526,10 @@ def record(conn, series_id, task_id, verdict, result):
                 or conn.execute("SELECT value FROM settings WHERE key=?", (BASELINE + str(series_id),)).fetchone())
     if not mode or mode["value"] != "1" or not baseline:
         return False
+    if outcome == "НЕ СМОГ":
+        from .merge_checkpoint import handed_off
+        if handed_off(conn, series_id, task_id, baseline["value"]):
+            return True
     details = db._pipeline_blocker_details(verdict, result)
     if not details:
         return False
@@ -531,6 +568,13 @@ def record(conn, series_id, task_id, verdict, result):
             return False
     except (TypeError, ValueError, KeyError):
         return False
+    if outcome == "НЕ СМОГ" and exact_target:
+        existing = holds.get(str(target["number"]))
+        live = (isinstance(existing, dict) and existing.get("head") == target["head"]
+                and existing.get("stage") == target["stage"] and type(existing.get("at")) in (int, float)
+                and 0 <= time.time() - existing["at"] < TTL)
+        if not live and _retryable_merge_wait(conn, measured, target, task_id, result):
+            return True
     progress = _baseline_progress(conn, measured, target, task_id, series_id) if exact_target else None
     if progress:
         number = next(iter(numbers))
