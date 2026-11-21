@@ -44,7 +44,7 @@
     }
   ],
   "schema_version": 1,
-  "accepted_upstream_commit": "e05466e97b1499b1c6734371a1dd770e9de33612",
+  "accepted_upstream_commit": "6f81e6da6ab2b0ef84ec5db625433e4aa4d7b770",
   "runtime_python": "3.12",
-  "checked_at": "2026-11-20"
+  "checked_at": "2026-11-21"
 }
