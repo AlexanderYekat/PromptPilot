@@ -28,11 +28,13 @@ def test_public_pytest_ignores_permanent_user_env(tmp_path, permanent_env):
     env = {k: v for k, v in os.environ.items() if not k.startswith("PP_")}
     env.update(HOME=str(home), USERPROFILE=str(home), TEST_OPERATOR_HOME=str(home),
                PYTHONPATH=str(plugins) + os.pathsep + env.get("PYTHONPATH", ""))
+    # Child pytest collection can start slowly under a full Windows test run.
+    timeout = 240 if os.name == "nt" else 90
     result = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-W", "error", "-p", "pp_home_probe",
          "tests/test_pipeline_replicas.py::test_execution_route_passes_replica_identity_to_preflight"],
         cwd=Path(__file__).resolve().parents[1], env=env, capture_output=True,
-        text=True, encoding="utf-8", timeout=90,
+        text=True, encoding="utf-8", timeout=timeout,
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "1 passed" in result.stdout
