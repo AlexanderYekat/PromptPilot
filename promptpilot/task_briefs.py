@@ -29,25 +29,26 @@ def _review_outcome(task):
     """Describe the audit without rewriting the agent's historical report."""
     if task.status is not TaskStatus.COMPLETED:
         return None
-    decision = workflows.parse_reviewer_report(task.result or "")
+    audit = workflows.read_reviewer_report_tail(task.result or "", allow_legacy_format=True)
     if task.verdict == "НЕ СМОГ":
         return {"label": "АУДИТ НЕ ЗАВЕРШЁН", "icon": "❌",
                 "summary": "Аудит не завершён: блокер указан в отчёте."}
-    if task.verdict == "НУЖЕН ЧЕЛОВЕК" or (decision and decision.verdict is ReviewVerdict.HUMAN_REQUIRED):
+    if task.verdict == "НУЖЕН ЧЕЛОВЕК" or (audit and audit[0] is ReviewVerdict.HUMAN_REQUIRED):
         return {"label": "АУДИТ: НУЖЕН ЧЕЛОВЕК", "icon": "🟡",
                 "summary": "Для завершения аудита требуется решение или доступ человека."}
-    if not decision:
+    if audit is None:
         return {"label": "ИТОГ АУДИТА НЕ РАСПОЗНАН", "icon": "🟡",
                 "summary": "Нет корректного решения AUDIT_VERDICT: проверьте полный отчёт."}
-    if decision.verdict is ReviewVerdict.REVISION_REQUIRED:
+    verdict, findings = audit
+    if verdict is ReviewVerdict.REVISION_REQUIRED:
         return {"label": "ТРЕБУЕТСЯ ДОРАБОТКА", "icon": "🟡",
-                "summary": "АУДИТ ЗАВЕРШЁН: требуется доработка, замечания перечислены в отчёте."}
-    if decision.findings:
+                "summary": "АУДИТ ЗАВЕРШЁН: требуется доработка. Подробности в полном отчёте."}
+    if findings:
         summary = "АУДИТ ЗАВЕРШЁН: аудитор сообщил PASS, замечания перечислены в отчёте."
-    elif re.search(r"(?mi)^AUDIT_FINDINGS_JSON:[ \t]*\[[ \t]*\][ \t]*\r?$", task.result or ""):
-        summary = "АУДИТ ЗАВЕРШЁН: замечаний не найдено"
-    else:
+    elif findings is None:
         summary = "АУДИТ ЗАВЕРШЁН: аудитор сообщил PASS; список замечаний не указан."
+    else:
+        summary = "АУДИТ ЗАВЕРШЁН: замечаний не найдено"
     return {"label": "АУДИТ ЗАВЕРШЁН", "icon": "✅", "summary": summary}
 
 

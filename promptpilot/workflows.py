@@ -3731,15 +3731,10 @@ def _run_gate_commands(workflow: WorkflowInDB, *, snapshot=None) -> WorkflowGate
     )
 
 
-def parse_reviewer_report(report: str) -> WorkflowReviewDecision | None:
-    """Parse the strict reviewer tail while retaining a safe human fallback.
-
-    P24: отчёты ревью цитируют прошлые аудиты и вывод гейта — в них
-    встречаются ЧУЖИЕ строки AUDIT_VERDICT/AUDIT_FINDINGS_JSON. Решающее
-    значение имеет ПОСЛЕДНЯЯ пара строк (финал отчёта), а не первый матч
-    (инциденты 2026-10-04: цитированный PASS порождал ложный
-    «PASS + открытый blocker» и человеческий блокер при фактической
-    REVISION_REQUIRED)."""
+def read_reviewer_report_tail(
+    report: str, *, allow_legacy_format: bool = False,
+) -> tuple[ReviewVerdict, list[ReviewFindingInput] | None] | None:
+    """Read the final audit outside quoted examples. Legacy format is for display only."""
     lines = (report or "").splitlines()
     plain_lines = set()
     fence = None
@@ -3757,14 +3752,20 @@ def parse_reviewer_report(report: str) -> WorkflowReviewDecision | None:
                 if i in plain_lines and re.match(r"(?i)^AUDIT_VERDICT:", line)]
     blocks = [(i, line.split(":", 1)[1].strip()) for i, line in enumerate(lines)
               if i in plain_lines and re.match(r"(?i)^AUDIT_FINDINGS_JSON:", line)]
-    if not verdicts or not blocks:
+    if not verdicts or (not blocks and not allow_legacy_format):
         return None
     verdict_index, verdict_text = verdicts[-1]
-    findings_index, findings_text = blocks[-1]
-    if (findings_index >= verdict_index or any(line.strip() for line in lines[findings_index + 1:verdict_index])
-            or verdict_text not in {verdict.value for verdict in ReviewVerdict}):
+    if verdict_text not in {verdict.value for verdict in ReviewVerdict}:
         return None
-    tail = [line.strip() for line in lines[verdict_index + 1:] if line.strip()]
+    last_index = verdict_index
+    findings_text = None
+    if blocks:
+        findings_index, findings_text = blocks[-1]
+        first_index, last_index = sorted((findings_index, verdict_index))
+        if ((findings_index > verdict_index and not allow_legacy_format)
+                or any(line.strip() for line in lines[first_index + 1:last_index])):
+            return None
+    tail = [line.strip() for line in lines[last_index + 1:] if line.strip()]
     if tail:
         from .herdr_exec import WORKFLOW_CLOSING_VERDICT_RE
 
@@ -3772,7 +3773,9 @@ def parse_reviewer_report(report: str) -> WorkflowReviewDecision | None:
         # a new incomplete audit or a quoted example cannot reuse an old PASS.
         if len(tail) != 1 or not WORKFLOW_CLOSING_VERDICT_RE.fullmatch(tail[0]):
             return None
-    findings: list[ReviewFindingInput] = []
+    verdict = ReviewVerdict(verdict_text)
+    if findings_text is None:
+        return verdict, None
     try:
         raw_findings = json.loads(findings_text)
         if not isinstance(raw_findings, list):
@@ -3780,7 +3783,17 @@ def parse_reviewer_report(report: str) -> WorkflowReviewDecision | None:
         findings = [ReviewFindingInput.model_validate(item) for item in raw_findings]
     except (json.JSONDecodeError, ValueError, TypeError):
         return None
-    verdict = ReviewVerdict(verdict_text)
+    return verdict, findings
+
+
+def parse_reviewer_report(report: str) -> WorkflowReviewDecision | None:
+    """Require the current review contract before applying an automatic decision."""
+    audit = read_reviewer_report_tail(report)
+    if audit is None:
+        return None
+    verdict, findings = audit
+    if findings is None:
+        return None
     if verdict is ReviewVerdict.REVISION_REQUIRED and not findings:
         digest = hashlib.sha256((report or "").encode("utf-8")).hexdigest()[:16]
         findings = [ReviewFindingInput(

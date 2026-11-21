@@ -132,7 +132,7 @@ def test_revised_plan_is_never_auto_approved_by_automation(isolated_db):
 
 
 def test_first_plan_still_auto_approves_when_allowed(isolated_db):
-    workflow = create(isolated_db)
+    workflow = create(isolated_db, gate={"enabled": False})
     settle(plan_task(isolated_db, workflow.id, answer([stage()]), "ГОТОВО"))
     assert isolated_db.get_workflow(workflow.id).status.value == "executing"
 

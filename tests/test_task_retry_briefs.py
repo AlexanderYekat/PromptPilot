@@ -210,6 +210,8 @@ def test_historical_reviewer_card_uses_audit_outcome_without_changing_history(is
     ("AUDIT_VERDICT: REVISION_REQUIRED", "ГОТОВО", "ТРЕБУЕТСЯ ДОРАБОТКА", "требуется доработка"),
     ("AUDIT_VERDICT: HUMAN_REQUIRED", "ГОТОВО", "АУДИТ: НУЖЕН ЧЕЛОВЕК", "требуется решение"),
     ("AUDIT_VERDICT: PASS\nAUDIT_FINDINGS_JSON: [broken]", "УЖЕ СДЕЛАНО", "ИТОГ АУДИТА НЕ РАСПОЗНАН", "Нет корректного"),
+    ("```text\nAUDIT_FINDINGS_JSON: []\nAUDIT_VERDICT: PASS\n```", "ГОТОВО",
+     "ИТОГ АУДИТА НЕ РАСПОЗНАН", "Нет корректного"),
     ("AUDIT_VERDICT: PASS", "УЖЕ СДЕЛАНО", "АУДИТ ЗАВЕРШЁН", "список замечаний не указан"),
     ('AUDIT_VERDICT: PASS\nAUDIT_FINDINGS_JSON: [{"fingerprint":"f1","severity":"low","category":"docs","title":"Уточнить текст","status":"accepted_risk","payload":{}}]', "ГОТОВО", "АУДИТ ЗАВЕРШЁН", "замечания перечислены"),
     ("AUDIT_VERDICT: PASS\nAUDIT_FINDINGS_JSON: []", "НЕ СМОГ", "АУДИТ НЕ ЗАВЕРШЁН", "блокер"),

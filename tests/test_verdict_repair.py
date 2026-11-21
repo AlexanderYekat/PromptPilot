@@ -106,9 +106,15 @@ def test_repair_verdict_keeps_auditor_wording(monkeypatch):
     monkeypatch.setattr(worker.subprocess, "run", run)
     task = SimpleNamespace(**vars(TASK),
                            prompt="Проверь код." + workflows.WORKFLOW_REVIEWER_VERDICT_INSTRUCTION)
-    assert _repair_verdict(task, "codex", {"prompt_stdin": True},
+    assert _repair_verdict(task, "claude", {"prompt_stdin": True},
                            "AUDIT_FINDINGS_JSON: []\nAUDIT_VERDICT: PASS", "/tmp") == "ГОТОВО"
     prompt = calls[0][1]["input"]
     assert "AUDIT_VERDICT: PASS" in prompt
     assert "ИТОГ: ГОТОВО — АУДИТ ЗАВЕРШЁН: замечаний не найдено" in prompt
     assert "ИТОГ: УЖЕ СДЕЛАНО" not in prompt
+
+
+def test_repair_verdict_does_not_start_a_provider_without_tool_free_mode(monkeypatch):
+    monkeypatch.setattr(worker.subprocess, "run", lambda *args, **kwargs: pytest.fail("provider started"))
+
+    assert _repair_verdict(TASK, "codex", {"prompt_stdin": True}, "хвост отчёта", "/tmp") == ""

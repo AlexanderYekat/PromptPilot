@@ -85,7 +85,7 @@ def test_workflow_resumes_same_session_after_repeated_quota_windows(
         candidate_branch="test/quota", config={
             "automation": {"enabled": True},
             "roles": {"executor": {"provider": "claude", "max_retries": 0}},
-            "gate": {"commands": []},
+            "gate": {"enabled": False},
         },
     ))
     workflows.start_workflow(workflow.id, WorkflowStartRequest(expected_version=0))
