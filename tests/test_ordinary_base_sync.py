@@ -317,7 +317,9 @@ def test_two_public_completes_never_send_two_updates(ordinary, monkeypatch):
             assert second.result(timeout=5) == 2
         finally:
             release.set()
-        assert first.result(timeout=10) == 0
+        # Once released, the first operation still has to verify and update the
+        # temporary Git remote. Windows subprocess startup can take longer.
+        assert first.result(timeout=60) == 0
     assert len(puts(server)) == 1
 
 
